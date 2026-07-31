@@ -1,0 +1,30 @@
+name = "moye-a2a-proxy"
+main = "worker.js"
+compatibility_date = "2026-07-01"
+
+# After deploying, go to the Cloudflare dashboard: Workers & Pages -> moye-a2a-proxy ->
+# Settings -> Triggers to add Routes (or declare them here with [[routes]], same effect --
+# kept here for version control convenience):
+[[routes]]
+pattern = "moye.ai/a2a/*"
+zone_name = "moye.ai"
+
+[[routes]]
+pattern = "moye.ai/api/guestbook"
+zone_name = "moye.ai"
+
+[[routes]]
+pattern = "moye.ai/api/count"
+zone_name = "moye.ai"
+
+[[routes]]
+pattern = "moye.ai/.well-known/moye-net"
+zone_name = "moye.ai"
+
+# ADR-0005 direction 5 (Agent Card interop): this is a dynamic backend route (server.js), not a
+# static file -- without this, Cloudflare Pages would 404 it (no matching file under
+# cloudflare-pages/public/). Deliberately narrow (this exact path only), NOT "moye.ai/.well-known/*",
+# so any future static .well-known files added to Pages aren't accidentally captured by the Worker.
+[[routes]]
+pattern = "moye.ai/.well-known/agent.json"
+zone_name = "moye.ai"

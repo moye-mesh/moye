@@ -1,0 +1,76 @@
+# ADR-0006 workstream C3: CI-platform redundancy for Codeberg (Woodpecker CI), mirroring
+# .github/workflows/deploy-vps.yml and .gitlab-ci.yml. If this repo is mirrored to Codeberg (see
+# scripts/add-mirror.sh) and Woodpecker CI is enabled on it, deploys can run from there too,
+# independent of both GitHub and GitLab.
+#
+# Required secrets (repo Settings > Secrets in Woodpecker), matching the other two CI configs:
+#   moye_deploy_ssh_key, seed1_host, node2_host, node3_host
+
+when:
+  event: push
+  branch: main
+  path: "a2a/**"
+
+steps:
+  deploy-seed1:
+    image: alpine:latest
+    secrets: [moye_deploy_ssh_key, seed1_host]
+    commands:
+      - apk add --no-cache openssh-client
+      - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+      - echo "$MOYE_DEPLOY_SSH_KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
+      - ssh-keyscan -H "$SEED1_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+      - |
+        ssh -i ~/.ssh/id_deploy "root@$SEED1_HOST" '
+          set -e
+          cd ~/moye.ai
+          updated=""
+          for remote in $(git remote); do
+            echo "[deploy] trying remote: $remote"
+            if git fetch "$remote" main; then git reset --hard "$remote/main"; updated="$remote"; break; fi
+          done
+          if [ -z "$updated" ]; then echo "[deploy] no configured remote was reachable"; exit 1; fi
+          cd a2a && npm install --omit=dev && systemctl restart moye-a2a && sleep 3 && curl -sf http://localhost:3100/health
+        '
+
+  deploy-node2:
+    image: alpine:latest
+    secrets: [moye_deploy_ssh_key, node2_host]
+    commands:
+      - apk add --no-cache openssh-client
+      - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+      - echo "$MOYE_DEPLOY_SSH_KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
+      - ssh-keyscan -H "$NODE2_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+      - |
+        ssh -i ~/.ssh/id_deploy "ubuntu@$NODE2_HOST" '
+          set -e
+          cd /opt/1panel/apps/openresty/openresty/www/moye.ai
+          updated=""
+          for remote in $(git remote); do
+            echo "[deploy] trying remote: $remote"
+            if git fetch "$remote" main; then git reset --hard "$remote/main"; updated="$remote"; break; fi
+          done
+          if [ -z "$updated" ]; then echo "[deploy] no configured remote was reachable"; exit 1; fi
+          cd a2a && npm install --omit=dev && sudo systemctl restart moye-a2a && sleep 3 && curl -sf http://localhost:3100/health
+        '
+
+  deploy-node3:
+    image: alpine:latest
+    secrets: [moye_deploy_ssh_key, node3_host]
+    commands:
+      - apk add --no-cache openssh-client
+      - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+      - echo "$MOYE_DEPLOY_SSH_KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
+      - ssh-keyscan -H "$NODE3_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+      - |
+        ssh -i ~/.ssh/id_deploy "root@$NODE3_HOST" '
+          set -e
+          cd ~/moye.ai
+          updated=""
+          for remote in $(git remote); do
+            echo "[deploy] trying remote: $remote"
+            if git fetch "$remote" main; then git reset --hard "$remote/main"; updated="$remote"; break; fi
+          done
+          if [ -z "$updated" ]; then echo "[deploy] no configured remote was reachable"; exit 1; fi
+          cd a2a && npm install --omit=dev && systemctl restart moye-a2a && sleep 3 && curl -sf http://localhost:3100/health
+        '

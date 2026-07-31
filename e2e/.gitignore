@@ -1,0 +1,6 @@
+node_modules/
+test-results/
+playwright-report/
+harness/.e2e-runtime.db
+harness/.e2e-runtime.db-wal
+harness/.e2e-runtime.db-shm

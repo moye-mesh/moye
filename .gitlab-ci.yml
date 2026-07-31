@@ -1,0 +1,23 @@
+# Deploys the Cloudflare Worker (cloudflare-worker/, name "moye-a2a-proxy" in wrangler.toml) --
+# previously only deployed manually via `wrangler deploy` from a laptop, no CI automation existed.
+#
+# VPS deployment (a2a/**) is intentionally NOT done here via CI-runner SSH -- a hosted CI runner
+# SSHing out to administer external servers is against most CI providers' acceptable-use terms.
+# Each node pulls its own updates instead (a2a/scripts/self-update.sh via a systemd timer), so this
+# pipeline deliberately does not reintroduce that pattern.
+#
+# Required CI/CD variables (Settings > CI/CD > Variables):
+#   CLOUDFLARE_API_TOKEN    (masked, protected) - scoped to "Edit Cloudflare Workers"
+#   CLOUDFLARE_ACCOUNT_ID   (protected)         - from the Cloudflare dashboard
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == "main"'
+
+deploy-worker:
+  image: node:22-slim
+  rules:
+    - changes:
+        - cloudflare-worker/**/*
+  script:
+    - cd cloudflare-worker
+    - npx --yes wrangler deploy

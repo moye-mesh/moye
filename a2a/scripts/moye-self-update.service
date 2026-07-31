@@ -1,0 +1,16 @@
+[Unit]
+Description=MOYE pull-based self-update (see scripts/self-update.sh)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Adjust both paths below to wherever this checkout actually lives on THIS node -- matches
+# moye-a2a.service's own layout (see DEPLOY.md): seed1/node3 use /root/moye.ai, node2 uses
+# /opt/1panel/apps/openresty/openresty/www/moye.ai. Copy this file per-node and edit, same as the
+# existing moye-a2a.service units already are (no templating magic, deliberately explicit).
+WorkingDirectory=/root/moye.ai
+ExecStart=/usr/bin/bash /root/moye.ai/a2a/scripts/self-update.sh
+# MOYE_MIRRORS (space-separated extra remote names, e.g. "gitlab codeberg") can be set here if this
+# node has mirrors configured via scripts/add-mirror.sh:
+# Environment="MOYE_MIRRORS=gitlab codeberg"

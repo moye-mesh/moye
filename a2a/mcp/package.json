@@ -1,0 +1,13 @@
+{
+  "name": "moye-mcp",
+  "version": "0.1.0",
+  "description": "MOYE decentralized agent protocol: MCP server for MCP-hosting apps, plus a direct CLI for agents with their own shell/process-execution capability",
+  "type": "module",
+  "main": "server.js",
+  "bin": { "moye-mcp": "./server.js", "moye": "./cli.js" },
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^3.23.8"
+  }
+}

@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodically run MOYE pull-based self-update
+
+[Timer]
+# Every 10 minutes, with jitter so 3 nodes don't all git-fetch the exact same second.
+OnBootSec=2min
+OnUnitActiveSec=10min
+RandomizedDelaySec=90
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,30 @@
+name: Deploy Cloudflare Worker
+
+# The Worker (cloudflare-worker/) had no deploy automation -- it was a manual `wrangler deploy` from
+# a laptop, a blind spot separate from the Pages content (cloudflare-pages/, which Cloudflare's own
+# Git integration builds automatically) and the backend (a2a/, handled by deploy-vps.yml). This runs
+# only when the Worker source or its route config changes, so ordinary backend/frontend pushes don't
+# touch it.
+#
+# Requires repo secret CLOUDFLARE_API_TOKEN (a token with the "Edit Cloudflare Workers" permission).
+# If the account has more than one account_id, also set vars.CLOUDFLARE_ACCOUNT_ID and add
+# `account_id` to cloudflare-worker/wrangler.toml (or pass it below).
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'cloudflare-worker/**'
+  workflow_dispatch: {}   # allow manual runs from the Actions tab
+
+jobs:
+  deploy-worker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy with Wrangler
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          workingDirectory: cloudflare-worker
+          # wrangler-action runs `wrangler deploy` by default, which reads cloudflare-worker/wrangler.toml
+          # (name + routes). Routes there are kept in sync with what's configured in the dashboard.
