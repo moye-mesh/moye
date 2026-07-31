@@ -28,3 +28,14 @@ zone_name = "moye.ai"
 [[routes]]
 pattern = "moye.ai/.well-known/agent.json"
 zone_name = "moye.ai"
+
+# SDK/MCP source tarballs + install stubs — served by express.static on the origin (no /a2a
+# prefix), same pattern as /api/guestbook and /api/count. Without these, Pages 404s the bare
+# paths while /api/network still advertises docs.sdk=/sdk-dist and docs.mcp=/mcp-dist.
+[[routes]]
+pattern = "moye.ai/sdk-dist/*"
+zone_name = "moye.ai"
+
+[[routes]]
+pattern = "moye.ai/mcp-dist/*"
+zone_name = "moye.ai"

@@ -11,6 +11,8 @@
  *   moye.ai/api/count
  *   moye.ai/.well-known/moye-net
  *   moye.ai/.well-known/agent.json  (ADR-0005 direction 5: Agent Card interop, dynamic backend route)
+ *   moye.ai/sdk-dist/*              (express.static SDK tarballs; no /a2a prefix)
+ *   moye.ai/mcp-dist/*              (express.static MCP install stubs; no /a2a prefix)
  *
  * ORIGIN must match the public hostname configured in Cloudflare Tunnel (see the Cloudflare
  * migration section in docs/DEPLOY.md -- the Tunnel maps origin.moye.ai -> localhost:3100).
@@ -21,8 +23,9 @@
  * New backend endpoints added since (protocol adoption, seeds governance, contributions,
  * DHT-based DID resolution, A2A JSON-RPC bridge, credentials, firehose /api/stream, etc.) all
  * live under the existing /a2a/* wildcard above -- none of them need a new Worker route binding
- * here, only the two /.well-known/* paths ever needed their own explicit route (Cloudflare Pages
- * would otherwise 404 them as missing static files instead of reaching this Worker at all).
+ * here. Explicit routes are only needed for bare paths that are not under /a2a/* and would
+ * otherwise be answered by Pages as missing static files (/.well-known/*, /api/guestbook,
+ * /api/count, /sdk-dist/*, /mcp-dist/*).
  *
  * Note on SSE/NDJSON firehose (ADR-0013): long-lived streaming responses go through this Worker
  * as ordinary proxied HTTP. Cloudflare may idle-timeout very quiet connections; clients should
