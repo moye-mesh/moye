@@ -95,6 +95,9 @@ function runExec(m) {
       from_agent: m.from_agent,
       type: m.type || null,
       awaiting: m.awaiting || null,
+      by: m.by != null ? m.by : null,
+      schema: m.schema || null,
+      payload: m.payload != null ? m.payload : null,
       text,
       encrypted: !!m.encrypted,
       ref: m.ref || null,
@@ -107,6 +110,8 @@ function runExec(m) {
       MOYE_MSG_ID: m.id || '',
       MOYE_FROM: m.from_agent || '',
       MOYE_MATCH: matchNeedle || matchRegexSrc || '',
+      MOYE_MSG_BY: m.by != null ? String(m.by) : '',
+      MOYE_MSG_SCHEMA: m.schema || '',
     };
     const child = spawn(execCmd, {
       shell: true,

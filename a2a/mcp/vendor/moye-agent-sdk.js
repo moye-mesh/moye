@@ -105,7 +105,9 @@ class Agent {
     const pathOnly = String(path || '').split('?')[0];
     const ts = Date.now();
     const sig = this._sign({ method: 'GET', path: pathOnly, ts });
-    return { 'X-Moye-Did': this.did, 'X-Moye-Sig': sig, 'X-Moye-Ts': String(ts) };
+    const h = { 'X-Moye-Did': this.did, 'X-Moye-Sig': sig, 'X-Moye-Ts': String(ts) };
+    if (this._sessionDid) h['X-Moye-Session'] = this._sessionDid;
+    return h;
   }
 
   // Deterministic JSON (recursively sorted keys) -- the shared canonical form for sender_sig, so
@@ -150,7 +152,9 @@ class Agent {
     // the signature and the server can reject stale or already-spent signatures. Servers running
     // with ALLOW_UNSIGNED_TS=1 still accept bodies without it during a migration window.
     if (payload && typeof payload === 'object' && payload.ts === undefined) payload.ts = Date.now();
-    return { 'X-Moye-Did': this.did, 'X-Moye-Sig': this._sign(payload) };
+    const h = { 'X-Moye-Did': this.did, 'X-Moye-Sig': this._sign(payload) };
+    if (this._sessionDid) h['X-Moye-Session'] = this._sessionDid;
+    return h;
   }
 
   _headers(extra) {
@@ -404,7 +408,8 @@ class Agent {
   // `type`/`ref` (2026-07-24, scenario 5): structured task-broadcast/task-claim/task-accept
   // convention layered on the chat log -- see the matching comment in server.js. Plain chat messages
   // omit both.
-  async sendRoomMessage(roomId, content, { encrypt, type, ref } = {}) {
+  // ADR-0027: optional `awaiting` (ask), `schema`+`payload` (R9), `by` deadline ms (R11, ask only).
+  async sendRoomMessage(roomId, content, { encrypt, type, ref, awaiting, schema, payload, by } = {}) {
     if (!this.agentId) throw new MoyeError('agent not registered');
     const secret = this._roomSecrets && this._roomSecrets[roomId];
     const shouldEncrypt = encrypt !== false && !!secret;
@@ -412,6 +417,10 @@ class Agent {
     const body = { content: wireContent, encrypted: shouldEncrypt };
     if (type) body.type = type;
     if (ref) body.ref = ref;
+    if (awaiting) body.awaiting = awaiting;
+    if (schema != null) body.schema = schema;
+    if (payload != null) body.payload = payload;
+    if (by != null) body.by = by;
     if (this._priv) { const s = this._senderSig(this.agentId, roomId, wireContent); if (s) body.sender_sig = s; }
     const r = await request(this.baseUrl, 'POST', `/api/rooms/${roomId}/messages`, body, this._headers(this._didHeaders(body)));
     return r.message_id;
@@ -464,10 +473,63 @@ class Agent {
   // the server-side endpoint existed but no client could call it without hand-rolling this signing.
   async issueCredential(subjectDid, claim, { expiresAt = null } = {}) {
     if (!this.did || !this._priv) throw new MoyeError('issuing a credential requires a DID identity');
+    if (this._sessionDid) throw new MoyeError('session keys cannot issue credentials');
     const vc = { type: 'moye/vc', issuer: this.did, subject: subjectDid, claim, issued_at: Date.now(), expires_at: expiresAt };
     vc.sig = crypto.sign(null, Buffer.from(this._canonical(vc)), crypto.createPrivateKey(this._priv)).toString('base64');
     const body = { credential: vc };
     return request(this.baseUrl, 'POST', '/api/credentials', body, this._headers(this._didHeaders(body)));
+  }
+
+  // ADR-0014 §2.4: mint a scoped/expiring session key. Returns the hot private key once —
+  // the network only ever sees the session pubkey inside the VC claim.
+  async createSession({ scope = ['send', 'inbox', 'room.post', 'room.read'], expiresInMs = 7 * 24 * 3600 * 1000 } = {}) {
+    if (!this.did || !this._priv || !this.agentId) throw new MoyeError('createSession requires a registered DID identity');
+    if (this._sessionDid) throw new MoyeError('a session key cannot mint further sessions');
+    const { privateKey, publicKey } = crypto.generateKeyPairSync('ed25519');
+    const privPem = privateKey.export({ type: 'pkcs8', format: 'pem' });
+    const pubPem = publicKey.export({ type: 'spki', format: 'pem' });
+    const der = publicKey.export({ type: 'spki', format: 'der' });
+    const sessionDid = 'did:moye:f1220' + crypto.createHash('sha256').update(der).digest('hex');
+    const expires = Date.now() + Math.max(60_000, Number(expiresInMs) || 0);
+    const claim = {
+      type: 'session-key',
+      session_did: sessionDid,
+      pubkey: pubPem,
+      scope: Array.isArray(scope) ? scope.slice() : ['*'],
+      expires,
+    };
+    await this.issueCredential(sessionDid, claim, { expiresAt: expires });
+    return {
+      master_did: this.did,
+      agent_id: this.agentId,
+      session_did: sessionDid,
+      private_key: privPem,
+      pubkey: pubPem,
+      scope: claim.scope,
+      expires,
+    };
+  }
+
+  // Build an Agent that signs with a session key while acting as the master DID.
+  static fromSession({ masterDid, agentId, privateKey, baseUrl = 'https://moye.ai/a2a', name = 'session' } = {}) {
+    if (!masterDid || !agentId || !privateKey) throw new MoyeError('fromSession requires masterDid, agentId, privateKey');
+    const a = new Agent({ name, agentId, baseUrl });
+    a._priv = privateKey;
+    const pub = crypto.createPublicKey(privateKey).export({ type: 'spki', format: 'pem' });
+    const der = crypto.createPublicKey(privateKey).export({ type: 'spki', format: 'der' });
+    a._sessionDid = 'did:moye:f1220' + crypto.createHash('sha256').update(der).digest('hex');
+    a.did = masterDid; // act as master; X-Moye-Session carries the session DID
+    a._sessionPub = pub;
+    return a;
+  }
+
+  async revokeSession(sessionDid, { refSig = null } = {}) {
+    if (!this.did || !this._priv) throw new MoyeError('revokeSession requires a DID identity');
+    if (this._sessionDid) throw new MoyeError('session keys cannot revoke');
+    if (!sessionDid) throw new MoyeError('sessionDid required');
+    const claim = { type: 'session-key-revoke', session_did: sessionDid };
+    if (refSig) claim.ref_sig = refSig;
+    return this.issueCredential(sessionDid, claim);
   }
 
   // Lists credentials received by `agentId` (defaults to self), each already re-verified

@@ -53,6 +53,18 @@
     'dereg-go': 'Deregister permanently',
     'dereg-ok': 'Deregistered',
     'dereg-mismatch': 'That does not match your agent id',
+    'passkey-enable': 'Enable Passkey unlock',
+    'passkey-disable': 'Remove Passkey unlock',
+    'passkey-unlock': 'Unlock with Passkey',
+    'passkey-ok': 'Passkey unlock enabled',
+    'passkey-off': 'Passkey unlock removed',
+    'passkey-unlocked': 'Unlocked',
+    'passkey-hint': 'Uses your device fingerprint / Face ID via WebAuthn PRF. Passphrase backup stays as the recovery path.',
+    'locked-title': 'Identity locked on this device',
+    'locked-sub': 'Unlock with Passkey, or sign in again with your backup file.',
+    'forget-device': 'Forget this device',
+    'forget-ok': 'Removed from this device',
+    'lock-ok': 'Signed out (recoverable on this device)',
   };
   const t = (k) => STR[k] || k;
   const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({
@@ -100,6 +112,36 @@
       host.querySelector('#acct-register').onclick = () => openRegister();
       return;
     }
+    if (s.locked && !Moye.isLoggedIn()) {
+      const name = s.name || s.agent_id;
+      host.innerHTML = `<div class="row" style="gap:.4rem;align-items:center">
+        <button type="button" class="avatar" id="acct-avatar" style="background:${Moye.avatarColor(s.agent_id || name)};border:none;cursor:pointer" title="${esc(name)}">${esc(Moye.initials(name))}</button>
+        <div class="account-menu" id="acct-menu">
+          <div class="account-head">
+            <div style="font-weight:650;margin-bottom:.15rem">${esc(name)}</div>
+            <div class="mono muted" style="font-size:var(--fs-xs);overflow-wrap:anywhere">${esc(s.did ? Moye.shortDid(s.did) : s.agent_id)}</div>
+            <div class="badge badge-amber" style="margin-top:.4rem;font-size:10px">locked</div>
+          </div>
+          ${s.hasPasskey ? `<button type="button" class="menu-item" id="acct-unlock">🔓 ${t('passkey-unlock')}</button>` : ''}
+          <button type="button" class="menu-item" id="acct-login2">🔑 ${t('login')}</button>
+          <button type="button" class="menu-item danger" id="acct-forget">🗑 ${t('forget-device')}</button>
+        </div></div>`;
+      host.querySelector('#acct-avatar').onclick = (e) => {
+        e.stopPropagation();
+        document.getElementById('acct-menu').classList.toggle('show');
+      };
+      host.querySelector('#acct-menu').onclick = (e) => e.stopPropagation();
+      host.querySelector('#acct-unlock')?.addEventListener('click', () => { closeMenu(); doUnlockPasskey(); });
+      host.querySelector('#acct-login2').onclick = () => { closeMenu(); openLogin(); };
+      host.querySelector('#acct-forget').onclick = async () => {
+        closeMenu();
+        await Moye.forgetDevice();
+        renderAccount();
+        Moye.toast(t('forget-ok'));
+        notifyAuth();
+      };
+      return;
+    }
     const name = s.name || s.agent_id;
     const showProfile = typeof opts.onShowProfile === 'function';
     host.innerHTML = `
@@ -113,6 +155,8 @@
         </div>
         ${Moye.isRecoverable() && Moye.hasBackup() ? `<button type="button" class="menu-item" id="acct-dl">💾 ${t('backup-download')}</button>` : ''}
         ${Moye.isRecoverable() && !Moye.hasBackup() ? `<button type="button" class="menu-item" id="acct-setpass">🔑 ${t('set-pass')}</button>` : ''}
+        ${Moye.isRecoverable() && !Moye.hasPasskey() ? `<button type="button" class="menu-item" id="acct-passkey">🪪 ${t('passkey-enable')}</button>` : ''}
+        ${Moye.isRecoverable() && Moye.hasPasskey() ? `<button type="button" class="menu-item" id="acct-passkey-off">🪪 ${t('passkey-disable')}</button>` : ''}
         ${showProfile ? `<button type="button" class="menu-item" id="acct-detail">👤 ${t('detail')}</button>` : ''}
         <button type="button" class="menu-item danger" id="acct-dereg">⛔ ${t('deregister')}</button>
         <button type="button" class="menu-item danger" id="acct-logout">🚪 ${t('logout')}</button>
@@ -124,6 +168,8 @@
     host.querySelector('#acct-menu').onclick = (e) => e.stopPropagation();
     host.querySelector('#acct-dl')?.addEventListener('click', () => dlBackup());
     host.querySelector('#acct-setpass')?.addEventListener('click', () => { closeMenu(); openSetPass(); });
+    host.querySelector('#acct-passkey')?.addEventListener('click', () => { closeMenu(); doEnablePasskey(); });
+    host.querySelector('#acct-passkey-off')?.addEventListener('click', () => { closeMenu(); doDisablePasskey(); });
     host.querySelector('#acct-detail')?.addEventListener('click', () => {
       closeMenu();
       opts.onShowProfile(s.agent_id);
@@ -132,9 +178,41 @@
     host.querySelector('#acct-logout').onclick = async () => {
       await Moye.logout();
       renderAccount();
-      Moye.toast(t('logout-ok'));
+      Moye.toast(Moye.current() && Moye.current().locked ? t('lock-ok') : t('logout-ok'));
       notifyAuth();
     };
+  }
+
+  async function doEnablePasskey() {
+    try {
+      if (!(await Moye.passkeyAvailable())) {
+        return Moye.toast('Passkeys are not available in this browser/device', 'error');
+      }
+      await Moye.enablePasskey();
+      renderAccount();
+      Moye.toast(t('passkey-ok'), 'success');
+    } catch (e) {
+      Moye.toast(e.message || String(e), 'error');
+    }
+  }
+  async function doDisablePasskey() {
+    try {
+      await Moye.disablePasskey();
+      renderAccount();
+      Moye.toast(t('passkey-off'));
+    } catch (e) {
+      Moye.toast(e.message || String(e), 'error');
+    }
+  }
+  async function doUnlockPasskey() {
+    try {
+      await Moye.unlockWithPasskey();
+      renderAccount();
+      Moye.toast(t('passkey-unlocked'), 'success');
+      notifyAuth();
+    } catch (e) {
+      Moye.toast(e.message || String(e), 'error');
+    }
   }
 
   function openDeregister() {
@@ -162,7 +240,7 @@
       await Moye.api('/api/agents/' + encodeURIComponent(agentId) + '/deregister', {
         method: 'POST', body: {}, auth: true,
       });
-      await Moye.logout();
+      await Moye.forgetDevice();
       closeModal();
       renderAccount();
       Moye.toast(t('dereg-ok'), 'success');
@@ -221,10 +299,18 @@
   function showBackupPrompt() {
     modal(`<h3>${t('backup-title')}</h3><p class="modal-sub">${t('backup-sub')}</p>
       <div class="warn-banner">⚠️ <span>${t('backup-warn')}</span></div>
+      <p class="modal-sub" style="margin-top:var(--sp-3)">${t('passkey-hint')}</p>
       <div class="modal-actions">
         <button type="button" class="btn btn-primary" id="bk-dl">💾 ${t('backup-download')}</button>
+        <button type="button" class="btn" id="bk-passkey">🪪 ${t('passkey-enable')}</button>
         <button type="button" class="btn" id="bk-done">${t('backup-done')}</button></div>`);
     document.getElementById('bk-dl').onclick = () => dlBackup();
+    document.getElementById('bk-passkey').onclick = async () => {
+      try {
+        await Moye.enablePasskey();
+        Moye.toast(t('passkey-ok'), 'success');
+      } catch (e) { Moye.toast(e.message || String(e), 'error'); }
+    };
     document.getElementById('bk-done').onclick = () => closeModal();
   }
 

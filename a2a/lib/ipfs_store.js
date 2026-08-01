@@ -8,10 +8,14 @@ const path = require('path');
 const crdt = require('./crdt'); // F4: rich CRDT merge laws for tagged shared-state values
 const schema = require('./schema'); // capName() normalizes legacy string vs. structured (F1) capabilities
 const shard = require('./shard'); // ADR-0008: consistent-hash directory sharding
+const spill = require('./dir_spill'); // ADR-0012 S2 / P2-1: SQLite write-through + cold load
 
 const IPFS_URL = process.env.IPFS_URL || 'http://127.0.0.1:5001';
 const ROOT_FILE = path.join(__dirname, '..', '.ipfs_root_cid');
 const CHANNEL = 'moye-net-state';
+// Hot cache size. IDs/indexes stay complete in memory; full agent/room/shared bodies beyond
+// this budget are served from SQLite (dir_spill) so RAM stays roughly flat as the directory grows.
+const MEM_BUDGET = Math.max(64, parseInt(process.env.MEM_BUDGET || '2000', 10) || 2000);
 
 let ipfs = null;
 let ready = false;
@@ -33,6 +37,41 @@ let didIndex = new Map();
 // incrementally on put/remove, same pattern as didIndex right above. Bounded by capability
 // cardinality (typically far smaller than agent count), not agent count.
 let capabilityIndex = new Map();
+// Insertion-order Maps used as LRUs (Map preserves insertion order; re-set = most recent).
+const agentLru = new Map();
+const roomLru = new Map();
+const sharedLru = new Map();
+
+function touchAgent(id, obj) {
+  if (agentLru.has(id)) agentLru.delete(id);
+  agentLru.set(id, true);
+  state.agents[id] = obj;
+  while (agentLru.size > MEM_BUDGET) {
+    const oldest = agentLru.keys().next().value;
+    agentLru.delete(oldest);
+    delete state.agents[oldest];
+  }
+}
+function touchRoom(id, obj) {
+  if (roomLru.has(id)) roomLru.delete(id);
+  roomLru.set(id, true);
+  state.rooms[id] = obj;
+  while (roomLru.size > MEM_BUDGET) {
+    const oldest = roomLru.keys().next().value;
+    roomLru.delete(oldest);
+    delete state.rooms[oldest];
+  }
+}
+function touchShared(key, obj) {
+  if (sharedLru.has(key)) sharedLru.delete(key);
+  sharedLru.set(key, true);
+  state.shared[key] = obj;
+  while (sharedLru.size > MEM_BUDGET) {
+    const oldest = sharedLru.keys().next().value;
+    sharedLru.delete(oldest);
+    delete state.shared[oldest];
+  }
+}
 function indexAgent(id, obj) {
   if (obj && obj.did) didIndex.set(obj.did, id);
   for (const cap of (obj && obj.capabilities) || []) {
@@ -89,11 +128,15 @@ function loadTombstones(obj) {
   if (!obj) return;
   for (const id of obj.agents || []) {
     tombstones.agents.add(id);
-    if (state.agents[id]) { delete state.agents[id]; delete cids.agents[id]; }
+    if (state.agents[id] || spill.getAgent(id)) {
+      delete state.agents[id]; agentLru.delete(id); spill.delAgent(id); delete cids.agents[id];
+    }
   }
   for (const id of obj.rooms || []) {
     tombstones.rooms.add(id);
-    if (state.rooms[id]) { delete state.rooms[id]; delete cids.rooms[id]; }
+    if (state.rooms[id] || spill.getRoom(id)) {
+      delete state.rooms[id]; roomLru.delete(id); spill.delRoom(id); delete cids.rooms[id];
+    }
   }
 }
 
@@ -136,27 +179,32 @@ async function mergeManifest(manifest) {
     // magnitude smaller and stay fully-replicated for simplicity.
     if (!shard.isResponsibleFor(id)) continue;
     const obj = await catJson(cid);
-    if (obj) { state.agents[id] = obj; cids.agents[id] = cid; indexAgent(id, obj); changed = true; }
+    if (obj) { touchAgent(id, obj); spill.putAgent(id, obj); cids.agents[id] = cid; indexAgent(id, obj); changed = true; }
   }
   for (const [id, cid] of Object.entries(manifest.rooms || {})) {
     if (tombstones.rooms.has(id) || cids.rooms[id]) continue;
     const obj = await catJson(cid);
-    if (obj) { state.rooms[id] = obj; cids.rooms[id] = cid; changed = true; }
+    if (obj) { touchRoom(id, obj); spill.putRoom(id, obj); cids.rooms[id] = cid; changed = true; }
   }
   for (const [key, cid] of Object.entries(manifest.shared || {})) {
     if (cids.shared[key] === cid) continue; // already have exactly this version
     const obj = await catJson(cid);
     if (!obj) continue;
-    const cur = state.shared[key];
     // F4: CRDT-tagged incoming value -> merge (order-independent), so pubsub/federation reordering
     // can't diverge. Untagged -> the original lamport/owner LWW comparison, byte-for-byte unchanged.
     if (obj && crdt.isCrdt(obj.value)) {
+      const cur = state.shared[key] || spill.getShared(key);
       const base = cur && crdt.isCrdt(cur.value) && cur.value.crdt === obj.value.crdt ? cur.value : {};
       const merged = crdt.merge(obj.value.crdt, base, obj.value) || obj.value;
-      state.shared[key] = { value: merged, lamport: Math.max(obj.lamport || 0, cur ? cur.lamport : 0), owner: obj.owner || '' };
+      const row = { value: merged, lamport: Math.max(obj.lamport || 0, cur ? cur.lamport : 0), owner: obj.owner || '' };
+      touchShared(key, row); spill.putShared(key, row);
       cids.shared[key] = cid; changed = true;
-    } else if (!cur || obj.lamport > cur.lamport || (obj.lamport === cur.lamport && (obj.owner || '') > (cur.owner || ''))) {
-      state.shared[key] = obj; cids.shared[key] = cid; changed = true;
+    } else {
+      const cur = state.shared[key] || spill.getShared(key);
+      if (!cur || obj.lamport > cur.lamport || (obj.lamport === cur.lamport && (obj.owner || '') > (cur.owner || ''))) {
+        touchShared(key, obj); spill.putShared(key, obj);
+        cids.shared[key] = cid; changed = true;
+      }
     }
   }
   return changed;
@@ -212,21 +260,27 @@ async function loadFromIpfs() {
 async function commitAgent(id) {
   if (!ipfs) return;
   try {
-    cids.agents[id] = await addJson(state.agents[id]);
+    const obj = getAgent(id);
+    if (!obj) return;
+    cids.agents[id] = await addJson(obj);
     await publishManifest();
   } catch (e) { console.log('[ipfs-store] commitAgent failed, keeping in-memory only:', e.message); }
 }
 async function commitRoom(id) {
   if (!ipfs) return;
   try {
-    cids.rooms[id] = await addJson(state.rooms[id]);
+    const obj = getRoom(id);
+    if (!obj) return;
+    cids.rooms[id] = await addJson(obj);
     await publishManifest();
   } catch (e) { console.log('[ipfs-store] commitRoom failed, keeping in-memory only:', e.message); }
 }
 async function commitShared(key) {
   if (!ipfs) return;
   try {
-    cids.shared[key] = await addJson(state.shared[key]);
+    const obj = state.shared[key] || spill.getShared(key);
+    if (!obj) return;
+    cids.shared[key] = await addJson(obj);
     await publishManifest();
   } catch (e) { console.log('[ipfs-store] commitShared failed, keeping in-memory only:', e.message); }
 }
@@ -256,6 +310,32 @@ async function catBytes(cid, maxBytes = 8 * 1024 * 1024) {
 }
 
 async function init() {
+  // Hydrate indexes (+ a hot slice) from SQLite before/without IPFS so a restart on a
+  // memory-constrained node does not begin empty until the next peer sync.
+  try {
+    const persisted = spill.allAgents();
+    const ids = Object.keys(persisted);
+    for (const id of ids) indexAgent(id, persisted[id]);
+    // Warm the LRU with the most recently written MEM_BUDGET agents (SQLite has no order here —
+    // take an arbitrary slice; subsequent gets will promote).
+    for (const id of ids.slice(-MEM_BUDGET)) touchAgent(id, persisted[id]);
+    const rooms = spill.allRooms();
+    for (const id of Object.keys(rooms).slice(-MEM_BUDGET)) touchRoom(id, rooms[id]);
+    const shared = spill.allShared();
+    for (const key of Object.keys(shared).slice(-MEM_BUDGET)) touchShared(key, shared[key]);
+    const metaCids = spill.getMeta('cids');
+    if (metaCids && typeof metaCids === 'object') {
+      cids.agents = metaCids.agents || cids.agents;
+      cids.rooms = metaCids.rooms || cids.rooms;
+      cids.shared = metaCids.shared || cids.shared;
+    }
+    const metaTombs = spill.getMeta('tombstones');
+    if (metaTombs) loadTombstones(metaTombs);
+    if (ids.length) console.log('[ipfs-store] hydrated from SQLite:', spill.agentCount(), 'agents,', spill.roomCount(), 'rooms, budget', MEM_BUDGET);
+  } catch (e) {
+    console.log('[ipfs-store] SQLite hydrate skipped:', e.message);
+  }
+
   try {
     const mod = await import('ipfs-http-client');
     ipfs = mod.create({ url: IPFS_URL });
@@ -290,13 +370,24 @@ async function init() {
 
 // ---- agents ----
 async function putAgent(id, obj) {
-  state.agents[id] = obj;
   deindexAgentCapabilities(id); // safe no-op today (no capability-update endpoint exists yet), but
   indexAgent(id, obj);          // keeps the index correct if a future re-put ever changes capabilities
+  touchAgent(id, obj);
+  spill.putAgent(id, obj);
+  spill.putMeta('cids', cids);
   await commitAgent(id);
-  return state.agents[id];
+  return obj;
 }
-function getAgent(id) { return state.agents[id] || null; }
+function getAgent(id) {
+  if (state.agents[id]) {
+    touchAgent(id, state.agents[id]);
+    return state.agents[id];
+  }
+  const obj = spill.getAgent(id);
+  if (!obj) return null;
+  touchAgent(id, obj);
+  return obj;
+}
 function getAgentByDid(did) { const id = didIndex.get(did); return id ? getAgent(id) : null; }
 // Bug found via code review (2026-07-24): `c.includes(q)` assumed every capability entry is a
 // string, but F1 (structured capabilities) can put objects here -- `c.includes` would throw
@@ -304,7 +395,14 @@ function getAgentByDid(did) { const id = didIndex.get(did); return id ? getAgent
 // a free-text `q`. Fixed with schema.capName(), the same normalizer already used for the
 // `?capability=` filter path in server.js.
 function listAgents(q) {
-  let a = Object.entries(state.agents).map(([id, v]) => ({ id, ...v }));
+  // Full directory listing must see cold rows too — IDs live in SQLite even when bodies are evicted.
+  const ids = new Set([...spill.allAgentIds(), ...Object.keys(state.agents)]);
+  let a = [];
+  for (const id of ids) {
+    if (tombstones.agents.has(id)) continue;
+    const v = getAgent(id);
+    if (v) a.push({ id, ...v });
+  }
   if (q) a = a.filter(x => (x.name || '').includes(q) || (x.capabilities || []).some(c => schema.capName(c).includes(q)));
   return a;
 }
@@ -316,7 +414,10 @@ function listAgentsByCapability(capability) {
   const ids = capabilityIndex.get(capability);
   if (!ids) return [];
   const out = [];
-  for (const id of ids) { const a = state.agents[id]; if (a) out.push({ id, ...a }); }
+  for (const id of ids) {
+    const a = getAgent(id);
+    if (a) out.push({ id, ...a });
+  }
   return out;
 }
 // O(distinct capabilities) instead of O(total agents * avg capabilities per agent) for the
@@ -329,24 +430,56 @@ function capabilityCounts() {
 // Permanently removes an agent (OR-Set remove: tombstoned so no peer can resurrect it by
 // re-merging an older manifest that still references it). Used by self/governance deregistration.
 async function removeAgent(id) {
-  if (!state.agents[id]) return false;
+  if (!getAgent(id) && !spill.getAgent(id)) return false;
   delete state.agents[id];
+  agentLru.delete(id);
+  spill.delAgent(id);
   delete cids.agents[id];
   tombstones.agents.add(id);
+  spill.putMeta('tombstones', serializeTombstones());
+  spill.putMeta('cids', cids);
   didIndex.forEach((v, k) => { if (v === id) didIndex.delete(k); });
   deindexAgentCapabilities(id);
   if (ipfs) { try { await publishManifest(); } catch (e) { console.log('[ipfs-store] removeAgent publish failed:', e.message); } }
   return true;
 }
 // ---- rooms ----
-async function putRoom(id, obj) { state.rooms[id] = obj; await commitRoom(id); return state.rooms[id]; }
-function getRoom(id) { return state.rooms[id] || null; }
-function listRooms() { return Object.entries(state.rooms).map(([id, v]) => ({ id, ...v })); }
+async function putRoom(id, obj) {
+  touchRoom(id, obj);
+  spill.putRoom(id, obj);
+  spill.putMeta('cids', cids);
+  await commitRoom(id);
+  return obj;
+}
+function getRoom(id) {
+  if (state.rooms[id]) {
+    touchRoom(id, state.rooms[id]);
+    return state.rooms[id];
+  }
+  const obj = spill.getRoom(id);
+  if (!obj) return null;
+  touchRoom(id, obj);
+  return obj;
+}
+function listRooms() {
+  const ids = new Set([...spill.allRoomIds(), ...Object.keys(state.rooms)]);
+  const out = [];
+  for (const id of ids) {
+    if (tombstones.rooms.has(id)) continue;
+    const v = getRoom(id);
+    if (v) out.push({ id, ...v });
+  }
+  return out;
+}
 async function removeRoom(id) {
-  if (!state.rooms[id]) return false;
+  if (!getRoom(id) && !spill.getRoom(id)) return false;
   delete state.rooms[id];
+  roomLru.delete(id);
+  spill.delRoom(id);
   delete cids.rooms[id];
   tombstones.rooms.add(id);
+  spill.putMeta('tombstones', serializeTombstones());
+  spill.putMeta('cids', cids);
   if (ipfs) { try { await publishManifest(); } catch (e) { console.log('[ipfs-store] removeRoom publish failed:', e.message); } }
   return true;
 }
@@ -354,7 +487,7 @@ async function removeRoom(id) {
 // A key's final value = (highest lamport, ties broken by writer lexicographically) --
 // all nodes converge to the same result, no owner lock
 async function putShared(key, value, lamport, writer) {
-  const cur = state.shared[key];
+  const cur = state.shared[key] || spill.getShared(key);
   const L = lamport || 0;
   const W = writer || '';
   // F4: a CRDT-tagged value is MERGED with whatever is stored (its merge law -- not lamport -- decides
@@ -363,28 +496,49 @@ async function putShared(key, value, lamport, writer) {
   if (crdt.isCrdt(value)) {
     const base = cur && crdt.isCrdt(cur.value) && cur.value.crdt === value.crdt ? cur.value : {};
     const merged = crdt.merge(value.crdt, base, value) || value;
-    state.shared[key] = { value: merged, lamport: Math.max(L, cur ? cur.lamport : 0), owner: W };
+    const row = { value: merged, lamport: Math.max(L, cur ? cur.lamport : 0), owner: W };
+    touchShared(key, row);
+    spill.putShared(key, row);
     await commitShared(key);
-    return state.shared[key];
+    return row;
   }
   if (!cur || L > cur.lamport || (L === cur.lamport && W > (cur.owner || ''))) {
-    state.shared[key] = { value, lamport: L, owner: W };
+    const row = { value, lamport: L, owner: W };
+    touchShared(key, row);
+    spill.putShared(key, row);
     await commitShared(key);
+    return row;
   }
-  return state.shared[key];
+  return cur;
 }
 // Bug found via room-chat integration testing (2026-07-24): this used to return the raw stored
 // value verbatim, which for a CRDT-tagged value (e.g. the rga-backed room chat log) is the internal
 // {crdt, nodes} representation, not the readable materialized form -- inconsistent with allShared()
 // below, which already materializes via crdt.read(). Any caller of getShared() on a CRDT key got the
 // wrong shape. crdt.read() is the identity function for anything without a recognized `crdt` tag, so
-// this is a no-op for every existing non-CRDT caller (repKey/vcKey/revoke: etc.) -- pure bugfix.
-function getShared(key) { return state.shared[key] ? crdt.read(state.shared[key].value) : null; }
+// this is a no-op for every existing non-CRDT caller (repKey/vcKey/revoke: etc.) -- pure bug fix.
+function getShared(key) {
+  let row = state.shared[key];
+  if (!row) {
+    row = spill.getShared(key);
+    if (row) touchShared(key, row);
+  } else {
+    touchShared(key, row);
+  }
+  return row ? crdt.read(row.value) : null;
+}
 // F4: materialize CRDT values to their readable form (counter->number, orset->array); untagged
 // values pass through unchanged (crdt.read is identity for anything without a known crdt tag).
-function allShared() { return Object.fromEntries(Object.entries(state.shared).map(([k, v]) => [k, crdt.read(v.value)])); }
+function allShared() {
+  const all = spill.allShared();
+  for (const [k, v] of Object.entries(state.shared)) all[k] = v;
+  return Object.fromEntries(Object.entries(all).map(([k, v]) => [k, crdt.read(v.value)]));
+}
 
-function allAgentIds() { return Object.keys(state.agents); }
+function allAgentIds() {
+  return [...new Set([...spill.allAgentIds(), ...Object.keys(state.agents)])]
+    .filter((id) => !tombstones.agents.has(id));
+}
 // Callers merging remote-provided agent/room records (federation HTTP reconcile, not just the
 // IPFS-pubsub path inside this file) must check this before re-adding an id they don't have
 // locally -- "don't have it" and "deliberately removed it" look identical from the outside
@@ -393,6 +547,16 @@ function allAgentIds() { return Object.keys(state.agents); }
 function isTombstoned(kind, id) { return !!(tombstones[kind] && tombstones[kind].has(id)); }
 function _cids() { return cids; }
 function _tombstones() { return tombstones; }
+function _raw() {
+  // Federation/sync callers need the complete directory, not just the hot LRU slice.
+  const agents = spill.allAgents();
+  for (const [id, obj] of Object.entries(state.agents)) agents[id] = obj;
+  const rooms = spill.allRooms();
+  for (const [id, obj] of Object.entries(state.rooms)) rooms[id] = obj;
+  const shared = spill.allShared();
+  for (const [key, obj] of Object.entries(state.shared)) shared[key] = obj;
+  return { agents, rooms, shared };
+}
 
 module.exports = {
   init, ipfs: () => ipfs, ready: () => ready,
@@ -401,5 +565,5 @@ module.exports = {
   putShared, getShared, allShared, allAgentIds, isTombstoned,
   getTombstones: serializeTombstones, mergeTombstones: loadTombstones,
   addBytes, catBytes,
-  _raw: () => state, _rootCid: () => rootCid, _cids, _tombstones,
+  _raw, _rootCid: () => rootCid, _cids, _tombstones,
 };

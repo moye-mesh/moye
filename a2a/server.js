@@ -60,7 +60,7 @@ const RESERVED_SHARED_PREFIXES = ['revoke:', 'reputation:'];
 // soft-fork *signaling* than its activation mechanism (MOYE has no hashpower-equivalent objective
 // threshold; adoption data here is informational, not a trigger that flips anything on by itself).
 const PROTOCOL_VERSION = '1.6';
-const PROTOCOL_FEATURES = ['capability-schema', 'verifiable-credentials', 'message-signing', 'rich-crdt', 'a2a-jsonrpc-bridge', 'portable-address-attestation', 'capability-input-filter', 'seeds-multisig-governance', 'firehose', 'message-attachments', 'room-awaiting', 'node-did-federation-auth', 'room-fork', 'slip0010', 'identity-delegation', 'resolve-at', 'agent-timeline', 'gravity-search'];
+const PROTOCOL_FEATURES = ['capability-schema', 'verifiable-credentials', 'message-signing', 'rich-crdt', 'a2a-jsonrpc-bridge', 'portable-address-attestation', 'capability-input-filter', 'seeds-multisig-governance', 'firehose', 'message-attachments', 'room-awaiting', 'node-did-federation-auth', 'room-fork', 'slip0010', 'identity-delegation', 'session-keys', 'resolve-at', 'agent-timeline', 'gravity-search'];
 
 // Broadcast a newly-registered agent to peer nodes immediately (doesn't wait for the 15s reconcile cycle)
 function announceToPeers(agent) {
@@ -538,6 +538,71 @@ function isRevoked(agent) {
   return !!(rev && rev.revoked);
 }
 
+// ADR-0014 §2.4 — live session-key VC for (masterDid, sessionDid), or null.
+function findLiveSessionKey(masterDid, sessionDid) {
+  if (!masterDid || !sessionDid) return null;
+  const bag = store.getShared(vcKey(sessionDid));
+  if (!Array.isArray(bag)) return null;
+  let grant = null;
+  for (const vc of bag) {
+    if (!vc || !vc.claim || vc.claim.type !== 'session-key') continue;
+    if (vc.issuer !== masterDid) continue;
+    if ((vc.claim.session_did || vc.subject) !== sessionDid) continue;
+    if (!vcVerify(vc)) continue;
+    const exp = vc.claim.expires != null ? Number(vc.claim.expires) : (vc.expires_at != null ? Number(vc.expires_at) : null);
+    if (exp && exp < Date.now()) continue;
+    grant = vc;
+    break;
+  }
+  if (!grant) return null;
+  const revoked = bag.some((r) => r && r.claim && r.claim.type === 'session-key-revoke'
+    && vcVerify(r)
+    && r.issuer === masterDid
+    && (r.claim.session_did === sessionDid || r.claim.ref_sig === grant.sig));
+  if (revoked) return null;
+  return grant;
+}
+
+// Map an HTTP request onto a session-key scope token. Closed vocabulary; unknown paths deny.
+function sessionScopeForRequest(req) {
+  const method = String(req.method || '').toUpperCase();
+  const path = String(req.path || '');
+  if (method === 'POST' && path === '/api/messages') return 'send';
+  if (method === 'POST' && /^\/api\/messages\/[^/]+\/ack$/.test(path)) return 'inbox';
+  if (method === 'GET' && /^\/api\/agents\/[^/]+\/inbox$/.test(path)) return 'inbox';
+  if (method === 'GET' && /^\/api\/agents\/[^/]+\/awaiting$/.test(path)) return 'inbox';
+  if (method === 'POST' && path === '/api/rooms') return 'room.create';
+  if (method === 'POST' && /^\/api\/rooms\/[^/]+\/join$/.test(path)) return 'room.join';
+  if (method === 'POST' && /^\/api\/rooms\/[^/]+\/messages$/.test(path)) return 'room.post';
+  if (method === 'GET' && /^\/api\/rooms\/[^/]+\/messages$/.test(path)) return 'room.read';
+  if (method === 'GET' && /^\/api\/rooms\/[^/]+\/changes$/.test(path)) return 'room.read';
+  if (method === 'GET' && /^\/api\/rooms\/[^/]+$/.test(path)) return 'room.read';
+  if (method === 'POST' && path === '/api/blobs') return 'blob';
+  if (method === 'GET' && /^\/api\/agents\/[^/]+$/.test(path)) return 'discover';
+  if (method === 'GET' && path === '/api/agents') return 'discover';
+  return null;
+}
+function sessionScopeAllows(scopeList, needed) {
+  if (!needed) return false;
+  const scopes = Array.isArray(scopeList) ? scopeList.map(String) : [];
+  if (scopes.includes('*')) return true;
+  if (scopes.includes(needed)) return true;
+  // room.* covers room.create/join/post/read
+  if (needed.startsWith('room.') && scopes.includes('room.*')) return true;
+  return false;
+}
+// Session keys may never perform these — even with scope '*'.
+function sessionForbiddenPath(req) {
+  const path = String(req.path || '');
+  if (/\/deregister$/.test(path)) return true;
+  if (/\/rotate$/.test(path)) return true;
+  if (path === '/api/credentials') return true;
+  if (/\/revoke-vote$/.test(path)) return true;
+  if (path === '/api/shared-state' || path === '/api/reputation') return true;
+  if (/\/overlay$/.test(path) || /\/p2p$/.test(path)) return true;
+  return false;
+}
+
 // ---- DID signature anti-replay ----
 // A DID signature is verifiable by anyone who observes it (unlike a Bearer token, which is a
 // secret). Signing only the body -- with no timestamp or nonce -- meant a captured signed request
@@ -565,7 +630,51 @@ async function authAgent(req) {
   const did = req.headers['x-moye-did'];
   const sig = req.headers['x-moye-sig'];
   const tsHeader = req.headers['x-moye-ts'];
+  const sessionDid = req.headers['x-moye-session'];
   if (did && sig) {
+    // ADR-0014 §2.4: optional X-Moye-Session — signature is from a scoped session key,
+    // X-Moye-Did is the master identity the session is authorized to act as.
+    if (sessionDid) {
+      const master = store.getAgentByDid(did);
+      if (!master || !master.pubkey) return null;
+      if (isRevoked(master)) return null;
+      if (sessionForbiddenPath(req)) {
+        console.error('[session-auth] privileged path denied for', sessionDid, req.path);
+        return null;
+      }
+      const grant = findLiveSessionKey(did, sessionDid);
+      if (!grant || !grant.claim || !grant.claim.pubkey) {
+        console.error('[session-auth] no live session-key VC for', did, sessionDid);
+        return null;
+      }
+      const needed = sessionScopeForRequest(req);
+      if (!sessionScopeAllows(grant.claim.scope, needed)) {
+        console.error('[session-auth] scope miss', grant.claim.scope, 'need', needed, req.method, req.path);
+        return null;
+      }
+      let verified, replayBody;
+      try {
+        if (tsHeader !== undefined) {
+          const claim = { method: req.method, path: req.path, ts: Number(tsHeader) };
+          verified = didlib.verify(grant.claim.pubkey, JSON.stringify(claim), sig);
+          replayBody = { ts: claim.ts };
+        } else {
+          const payload = JSON.stringify(req.body || {});
+          verified = didlib.verify(grant.claim.pubkey, payload, sig);
+          replayBody = req.body;
+        }
+      } catch { verified = false; }
+      if (!verified) {
+        console.error('[session-auth] verify failed for', sessionDid);
+        return null;
+      }
+      if (!replayOk(sig, replayBody)) {
+        console.error('[session-auth] replay/stale rejected for', sessionDid);
+        return null;
+      }
+      return { id: master.id, name: master.id, did: true, session: true, session_did: sessionDid, scope: grant.claim.scope || [] };
+    }
+
     // O(1) index lookup instead of scanning every agent (see the did -> id index in lib/ipfs_store.js)
     const a = store.getAgentByDid(did);
     if (a && a.pubkey) {
@@ -1073,9 +1182,38 @@ app.post('/api/credentials', async (req, res) => {
       return fail(res, 400, 'identity-delegation subject must equal claim.instance_did');
     }
   }
+  // ADR-0014 §2.4: session-key claim — scoped/expiring/revocable hot key for the issuer.
+  if (vc.claim && vc.claim.type === 'session-key') {
+    if (!vc.claim.session_did || !vc.claim.pubkey) {
+      return fail(res, 400, 'session-key requires claim.session_did and claim.pubkey');
+    }
+    if (!Array.isArray(vc.claim.scope) || vc.claim.scope.length === 0) {
+      return fail(res, 400, 'session-key requires non-empty claim.scope array');
+    }
+    try {
+      if (didlib.deriveDid(vc.claim.pubkey) !== vc.claim.session_did) {
+        return fail(res, 400, 'session-key session_did must derive from claim.pubkey');
+      }
+    } catch {
+      return fail(res, 400, 'session-key claim.pubkey invalid');
+    }
+    if (vc.subject !== vc.claim.session_did) {
+      return fail(res, 400, 'session-key subject must equal claim.session_did');
+    }
+    if (vc.claim.expires != null && !Number.isFinite(Number(vc.claim.expires))) {
+      return fail(res, 400, 'session-key claim.expires must be a millisecond epoch');
+    }
+  }
+  if (vc.claim && vc.claim.type === 'session-key-revoke') {
+    if (!vc.claim.session_did && !vc.claim.ref_sig) {
+      return fail(res, 400, 'session-key-revoke requires claim.session_did or claim.ref_sig');
+    }
+  }
   const subjectAgent = store.getAgentByDid(vc.subject);
-  // identity-delegation subjects may not be registered as agents yet — allow issuance anyway
-  if (!subjectAgent && !(vc.claim && vc.claim.type === 'identity-delegation')) {
+  // identity-delegation / session-key subjects may not be registered as agents yet — allow issuance anyway
+  const allowUnregisteredSubject = vc.claim && (vc.claim.type === 'identity-delegation'
+    || vc.claim.type === 'session-key' || vc.claim.type === 'session-key-revoke');
+  if (!subjectAgent && !allowUnregisteredSubject) {
     return fail(res, 404, 'subject DID is not a known agent');
   }
   if (!vcVerify(vc)) return fail(res, 400, 'credential signature does not verify');
@@ -1814,7 +1952,7 @@ app.post('/api/rooms/:id/messages', async (req, res) => {
   const room = store.getRoom(req.params.id);
   if (!room) return fail(res, 404, 'room not found');
   if (room.visibility === 'private' && !isRoomMember(room, me.id)) return fail(res, 403, 'private room: membership required to post');
-  const { content, encrypted, sender_sig, type, ref, awaiting: awaitingWho } = req.body || {};
+  const { content, encrypted, sender_sig, type, ref, awaiting: awaitingWho, schema, payload, by } = req.body || {};
   if (typeof content !== 'string' || !content) return fail(res, 400, 'content required');
   if (content.length > MAX_CONTENT_LEN) return fail(res, 413, 'content too large');
   if (type !== undefined && type !== null && !ROOM_MESSAGE_TYPES.has(type)) return fail(res, 400, `unknown type: ${type}`);
@@ -1826,6 +1964,33 @@ app.post('/api/rooms/:id/messages', async (req, res) => {
     if (!ref) return fail(res, 400, 'resolve requires ref (ask message id)');
     const prior = (store.getShared(roomChatKey(room.id)) || []).find((m) => m.id === ref);
     if (!prior || prior.type !== 'ask') return fail(res, 400, 'resolve ref must point at an ask message');
+  }
+  // ADR-0027 R9: optional machine-readable payload (store-and-forward; server does not validate shape).
+  let schemaOut = null;
+  let payloadOut = null;
+  if (schema !== undefined && schema !== null) {
+    if (typeof schema !== 'string' || !schema || schema.length > 128) {
+      return fail(res, 400, 'schema must be a non-empty string ≤128 chars');
+    }
+    schemaOut = schema;
+  }
+  if (payload !== undefined && payload !== null) {
+    if (typeof payload !== 'object' || Array.isArray(payload)) {
+      return fail(res, 400, 'payload must be a JSON object');
+    }
+    let raw;
+    try { raw = JSON.stringify(payload); }
+    catch { return fail(res, 400, 'payload is not JSON-serializable'); }
+    if (raw.length > 65536) return fail(res, 413, 'payload too large');
+    payloadOut = payload;
+  }
+  // ADR-0027 R11: optional deadline on ask messages only (ms epoch). No server-side scheduling.
+  let byOut = null;
+  if (by !== undefined && by !== null) {
+    if (type !== 'ask') return fail(res, 400, 'by is only valid on type=ask messages');
+    const n = Number(by);
+    if (!Number.isFinite(n) || n <= 0) return fail(res, 400, 'by must be a positive ms epoch timestamp');
+    byOut = Math.floor(n);
   }
   // Private rooms: refuse plaintext message bodies — same posture as attachments below.
   // Clients must encrypt under room_key and set encrypted:true; omitting the flag is treated as plaintext.
@@ -1846,6 +2011,9 @@ app.post('/api/rooms/:id/messages', async (req, res) => {
     awaiting: type === 'ask' ? awaitingWho : null,
     attachments: atts, ts: Date.now(),
   };
+  if (schemaOut) msg.schema = schemaOut;
+  if (payloadOut) msg.payload = payloadOut;
+  if (byOut != null) msg.by = byOut;
   await appendRoomMessage(room.id, msg);
   const contentHash = crypto.createHash('sha256').update(content).digest('hex');
   ledger.append('room.message', {
@@ -2776,7 +2944,7 @@ function agentToCard(a, { extended = true } = {}) {
       moyeDidSignature: {
         type: 'custom', scheme: 'moye-did-signature',
         description: 'Ed25519 signature over the exact JSON body (POST) or over {method,path,ts} (GET). did:moye:<sha256(spki)[:32]>.',
-        headers: ['X-Moye-Did', 'X-Moye-Sig', 'X-Moye-Ts'],
+        headers: ['X-Moye-Did', 'X-Moye-Sig', 'X-Moye-Ts', 'X-Moye-Session'],
       },
       moyeBearer: { type: 'http', scheme: 'bearer', description: 'Node-issued token; not portable across devices -- prefer moyeDidSignature.' },
     },

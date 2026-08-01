@@ -177,6 +177,8 @@
       token: rec.token || null,
       recoverable: !!rec.privKey,
       hasBackup: !!rec.backup,
+      hasPasskey: !!rec.passkey,
+      locked: !rec.privKey && !!(rec.passkey || rec.backup),
     };
   }
   async function persist(rec) {
@@ -196,9 +198,161 @@
     return readyPromise;
   }
   function current() { return cached; }
-  function isLoggedIn() { return !!cached; }
+  function isLoggedIn() { return !!(cached && (cached.recoverable || cached.token)); }
   function isRecoverable() { return !!(cached && cached.recoverable); }
   function hasBackup() { return !!(cached && cached.hasBackup); }
+  function hasPasskey() { return !!(cached && cached.hasPasskey); }
+  function isLocked() { return !!(cached && cached.locked); }
+
+  /* ---------- Passkey / WebAuthn PRF unlock (ADR-0014 §2.2) ----------
+     Wraps the Ed25519 private key under a key derived from the authenticator's PRF
+     extension. Passphrase backup remains the mandatory recovery path — PRF is not
+     available on every platform. */
+  function rpId() {
+    const h = location.hostname;
+    if (h === 'localhost' || h === '127.0.0.1') return h;
+    return 'moye.ai';
+  }
+  function asArrayBuffer(v) {
+    if (!v) return null;
+    if (v instanceof ArrayBuffer) return v;
+    if (ArrayBuffer.isView(v)) return v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength);
+    return null;
+  }
+  async function passkeyAvailable() {
+    if (!global.PublicKeyCredential || !navigator.credentials) return false;
+    try {
+      if (typeof PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable === 'function') {
+        if (!(await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable())) return false;
+      }
+      return true;
+    } catch { return false; }
+  }
+  async function enablePasskey(privDerOverride) {
+    const rec = await dbGet(DB_KEY);
+    if (!rec || !rec.did) throw new Error('not signed in');
+    const der = privDerOverride || pendingPrivDer;
+    if (!der) throw new Error('The private key is not available in this session. Sign in with your backup passphrase first, then enable Passkey.');
+    if (!(await passkeyAvailable())) throw new Error('This device has no platform authenticator for Passkeys.');
+
+    const prfSalt = crypto.getRandomValues(new Uint8Array(32));
+    const userId = enc.encode(rec.did);
+    const challenge = crypto.getRandomValues(new Uint8Array(32));
+    let cred;
+    try {
+      cred = await navigator.credentials.create({
+        publicKey: {
+          challenge,
+          rp: { name: 'MOYE', id: rpId() },
+          user: { id: userId, name: rec.did, displayName: rec.name || rec.agent_id || 'MOYE' },
+          pubKeyCredParams: [{ type: 'public-key', alg: -7 }, { type: 'public-key', alg: -257 }],
+          authenticatorSelection: {
+            authenticatorAttachment: 'platform',
+            residentKey: 'preferred',
+            userVerification: 'required',
+          },
+          timeout: 90000,
+          extensions: { prf: { eval: { first: prfSalt } } },
+        },
+      });
+    } catch (e) {
+      throw new Error('Passkey creation failed: ' + (e && e.message ? e.message : String(e)));
+    }
+    if (!cred || !cred.rawId) throw new Error('Passkey creation returned nothing');
+
+    let prfOut = asArrayBuffer(cred.getClientExtensionResults && cred.getClientExtensionResults().prf
+      && cred.getClientExtensionResults().prf.results
+      && cred.getClientExtensionResults().prf.results.first);
+    // Some authenticators only evaluate PRF on get(), not create().
+    if (!prfOut) {
+      const assertion = await navigator.credentials.get({
+        publicKey: {
+          challenge: crypto.getRandomValues(new Uint8Array(32)),
+          rpId: rpId(),
+          allowCredentials: [{ type: 'public-key', id: cred.rawId }],
+          userVerification: 'required',
+          timeout: 90000,
+          extensions: { prf: { eval: { first: prfSalt } } },
+        },
+      });
+      prfOut = asArrayBuffer(assertion.getClientExtensionResults && assertion.getClientExtensionResults().prf
+        && assertion.getClientExtensionResults().prf.results
+        && assertion.getClientExtensionResults().prf.results.first);
+    }
+    if (!prfOut) {
+      throw new Error('This authenticator does not support the WebAuthn PRF extension. Keep using the passphrase backup.');
+    }
+
+    const wrapKey = await subtle.importKey('raw', prfOut, 'AES-GCM', false, ['encrypt', 'decrypt']);
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ciphertext = await subtle.encrypt({ name: 'AES-GCM', iv }, wrapKey, der);
+    rec.passkey = {
+      credentialId: b64(new Uint8Array(cred.rawId)),
+      prfSalt: b64(prfSalt),
+      cipher: { alg: 'AES-256-GCM', iv: b64(iv) },
+      ciphertext: b64(ciphertext),
+      created_at: new Date().toISOString(),
+    };
+    await persist(rec);
+    return true;
+  }
+  async function unlockWithPasskey() {
+    const rec = await dbGet(DB_KEY);
+    if (!rec || !rec.passkey) throw new Error('No Passkey unlock is configured on this device.');
+    const pk = rec.passkey;
+    const assertion = await navigator.credentials.get({
+      publicKey: {
+        challenge: crypto.getRandomValues(new Uint8Array(32)),
+        rpId: rpId(),
+        allowCredentials: [{ type: 'public-key', id: unb64(pk.credentialId) }],
+        userVerification: 'required',
+        timeout: 90000,
+        extensions: { prf: { eval: { first: unb64(pk.prfSalt) } } },
+      },
+    });
+    const prfOut = asArrayBuffer(assertion.getClientExtensionResults && assertion.getClientExtensionResults().prf
+      && assertion.getClientExtensionResults().prf.results
+      && assertion.getClientExtensionResults().prf.results.first);
+    if (!prfOut) throw new Error('PRF unavailable on this unlock — try the passphrase backup.');
+    const wrapKey = await subtle.importKey('raw', prfOut, 'AES-GCM', false, ['encrypt', 'decrypt']);
+    let der;
+    try {
+      der = new Uint8Array(await subtle.decrypt(
+        { name: 'AES-GCM', iv: unb64(pk.cipher.iv) },
+        wrapKey,
+        unb64(pk.ciphertext),
+      ));
+    } catch {
+      throw new Error('Passkey unlock failed to decrypt the local key.');
+    }
+    const privKey = await importSigningKey(der, false);
+    rec.privKey = privKey;
+    pendingPrivDer = der;
+    await persist(rec);
+    try { await api('/api/agents/' + rec.agent_id + '/inbox', { method: 'GET', auth: true }); }
+    catch (e) { await lockSession(); throw new Error('Unlocked key failed network check: ' + e.message); }
+    return current();
+  }
+  async function disablePasskey() {
+    const rec = await dbGet(DB_KEY);
+    if (!rec) throw new Error('not signed in');
+    delete rec.passkey;
+    await persist(rec);
+  }
+  // Soft sign-out: drop the live signing key but keep Passkey wrap + encrypted backup on device.
+  async function lockSession() {
+    const rec = await dbGet(DB_KEY);
+    signingKey = null;
+    pendingPrivDer = null;
+    if (rec && (rec.passkey || rec.backup)) {
+      rec.privKey = null;
+      await persist(rec);
+    } else {
+      await dbDel(DB_KEY);
+      cached = null;
+      emit();
+    }
+  }
 
   /* Migrate a plaintext-PEM localStorage session into IndexedDB, non-extractably, and
      delete the plaintext immediately -- that removal is the security win, so it happens
@@ -222,8 +376,23 @@
   }
 
   async function logout() {
+    // Prefer soft lock when a Passkey or encrypted backup can restore this device later.
+    // Full wipe: call forgetDevice() (also used after deregister).
+    const rec = await dbGet(DB_KEY);
+    localStorage.removeItem(LS_LEGACY_SESSION);
+    localStorage.removeItem(LS_LEGACY_TOKEN);
+    localStorage.removeItem(LS_LEGACY_ID);
+    if (rec && (rec.passkey || rec.backup)) {
+      await lockSession();
+      return;
+    }
     await dbDel(DB_KEY);
-    signingKey = null; cached = null;
+    signingKey = null; cached = null; pendingPrivDer = null;
+    emit();
+  }
+  async function forgetDevice() {
+    await dbDel(DB_KEY);
+    signingKey = null; cached = null; pendingPrivDer = null;
     localStorage.removeItem(LS_LEGACY_SESSION);
     localStorage.removeItem(LS_LEGACY_TOKEN);
     localStorage.removeItem(LS_LEGACY_ID);
@@ -291,6 +460,7 @@
     // is never written anywhere.
     const privKey = await importSigningKey(privDer, false);
     await persist({ did: r.did, agent_id: r.agent_id, name: name.trim(), pub, privKey, backup, token: r.token || null });
+    pendingPrivDer = privDer; // same-session: enable passkey / re-backup without re-import
     return current();
   }
 
@@ -487,8 +657,9 @@
 
   global.Moye = {
     API, api, isSupported, ready,
-    register, loginWithKey, loginWithBackupFile, inspectBackupFile, logout,
-    setBackupPassphrase, downloadBackup, hasBackup,
+    register, loginWithKey, loginWithBackupFile, inspectBackupFile, logout, forgetDevice, lockSession,
+    setBackupPassphrase, downloadBackup, hasBackup, hasPasskey, isLocked,
+    passkeyAvailable, enablePasskey, unlockWithPasskey, disablePasskey,
     current, isLoggedIn, isRecoverable, onChange, deriveDidFromPub,
     legacySession, adoptLegacy,
     getRoomSecret, setRoomSecret, forgetRoomSecret, randomSecret, membershipProof, sha256hex,

@@ -32,8 +32,10 @@ On each match, stderr logs `{ "bridged": true, "message_id": … }`. The child g
 |---|---|
 | stdin (default `--stdin json`) | one JSON object: `{id,ts,room_id,from_agent,text,…}` |
 | `MOYE_MSG_TEXT` | plaintext (decrypted when the identity holds the room secret) |
-| `MOYE_MSG_JSON` | same object as stdin |
+| `MOYE_MSG_JSON` | same object as stdin (includes `schema`/`payload`/`by` when set) |
 | `MOYE_ROOM_ID` / `MOYE_MSG_ID` / `MOYE_FROM` | ids |
+| `MOYE_MSG_BY` | ask deadline ms epoch if present (ADR-0027 R11); empty otherwise |
+| `MOYE_MSG_SCHEMA` | optional schema id (ADR-0027 R9) |
 
 Flags: `--match-regex`, `--since <ms>`, `--stdin text|none`, `--once` (exit after first hit).
 
