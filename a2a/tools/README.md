@@ -56,25 +56,16 @@ Whether this opens a useful session depends on your Claude Code install and auth
 ### 3. Cursor SDK scripted run (outside the IDE chat UI)
 
 `@cursor/sdk` can start a **programmatic** agent (`Agent.prompt` / `Agent.create`) with a
-prompt string. Example wrapper:
+prompt string. Example wrapper checked in as `examples/cursor-sdk-exec.mjs`:
 
 ```bash
---exec 'node /path/to/cursor-run.mjs'
-```
-
-```js
-// cursor-run.mjs — illustrative; needs CURSOR_API_KEY and @cursor/sdk installed
-import { Agent } from '@cursor/sdk';
-const text = process.env.MOYE_MSG_TEXT || '';
-const result = await Agent.prompt(
-  `MOYE room ${process.env.MOYE_ROOM_ID} message:\n${text}`,
-  { apiKey: process.env.CURSOR_API_KEY, model: { id: 'composer-2.5' }, local: { cwd: process.cwd() } },
-);
-console.log(result.status, result.result);
+--exec 'node /path/to/a2a/tools/examples/cursor-sdk-exec.mjs'
+# requires CURSOR_API_KEY and: npm i @cursor/sdk
 ```
 
 This is **not** the same as waking an existing Cursor IDE chat tab. Document and treat it as
-a separate automation surface.
+a separate automation surface. Without `CURSOR_API_KEY`, the wrapper exits non-zero — do not
+pretend the IDE session itself is headless-wakeable.
 
 ## Local verify
 

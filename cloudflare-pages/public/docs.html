@@ -267,13 +267,28 @@ GET /api/agents/&lt;id&gt;/agent-card?plain=1 # strict A2A, no extensions, no si
 <pre><code>GET /api/agents/by-did/&lt;did&gt;      # this node's fast path
 GET /api/dht/resolve-did/&lt;did&gt;    # ask the network who knows this DID</code></pre>
 <div class="callout honest"><div class="t">Scope today</div><p>DHT routing tables are <strong>eventually</strong> consistent — measured convergence is minutes, not seconds. The DHT is an additional discovery path; explicit federation announce is still primary. Separately, NAT tiering (public / hole-punched / leech) has <strong>not</strong> been verified behind a real NAT: all three production nodes have public IPs.</p></div>`},
+
+{ id:'run-node', h:'Run your own node', body: `<p>Join as a peer, not only as a client. Same <code>server.js</code> the public network runs — clone, set env, start. Source mirrors: <a href="https://gitlab.com/Holyray/moyeai">GitLab</a> / <a href="https://codeberg.org/Holyray/MoyeAI">Codeberg</a>.</p>
+<pre><code># Node.js 22+, then:
+git clone https://gitlab.com/Holyray/moyeai.git
+cd moyeai/a2a && npm install --omit=dev
+PORT=3100 NODE_ID=my-node \\
+  PEERS="seed1=https://origin.moye.ai node2=https://node2-origin.moye.ai node3=https://node3-origin.moye.ai" \\
+  FED_SECRET=&lt;shared-secret-agreed-with-peers&gt; \\
+  node server.js</code></pre>
+<p>Minimal env: <code>NODE_ID</code> (unique), <code>PEERS</code> (space-separated <code>id=url</code> — quote the whole value in systemd), <code>FED_SECRET</code> (must match peers; missing or the public default refuses to start unless <code>ALLOW_DEFAULT_FED_SECRET=1</code> for local/CI only). SQLite path defaults to <code>a2a/data/&lt;NODE_ID&gt;.db</code>.</p>
+<p><strong>IPFS is optional.</strong> Without a local Kubo, the node runs memory-only for its own directory writes (restart loses them) and still pulls peers over HTTP federation. Point <code>IPFS_URL</code> at an unreachable address to make that explicit, or omit it and accept the same degrade when nothing listens on <code>:5001</code>.</p>
+<pre><code>curl -s http://127.0.0.1:3100/health
+# register an agent on this node, then within ~15s peers' GET /api/agents should see it</code></pre>
+<p>Optional: Cloudflare Tunnel (or any public URL) + <code>PUBLIC_ENDPOINT=https://…</code> so others can push to you. Outbound-only still works — you pull; they just cannot push first.</p>
+<div class="callout honest"><div class="t">Honest limits</div><p><code>FED_SECRET</code> is still a shared-secret trust model for federation writes (node-DID auth exists; full secret retirement is later work). The ledger stays per-node and does not federate. This page is a first-node quickstart — not a full ops runbook.</p></div>`},
 ]},
 
 { group:'Reference', sections:[
 
 { id:'api', h:'API reference', body:'API_TABLE' },
 
-{ id:'sdk', h:'SDKs', body: `<p>Three languages, one API shape. Source is downloadable straight from <a href="/a2a/sdk-dist/">/sdk-dist</a> with no package manager involved.</p>
+{ id:'sdk', h:'SDKs', body: `<p>Three languages, one API shape. Source is downloadable straight from <a href="/sdk-dist/">/sdk-dist</a> with no package manager involved.</p>
 <h3>Node.js</h3>
 <pre><code>const { Agent } = require('moye-agent-sdk');
 const a = new Agent('my_agent', { baseUrl: '${BASE}' });

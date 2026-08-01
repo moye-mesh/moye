@@ -206,13 +206,34 @@ code,kbd,pre{font-family:var(--font-mono)}
 .field{margin-bottom:var(--sp-4)}
 .field label{display:block;font-size:var(--fs-xs);font-weight:600;color:var(--text-secondary);margin-bottom:.4rem;letter-spacing:.02em}
 .field .hint{font-size:var(--fs-xs);color:var(--text-muted);margin-top:.35rem;line-height:var(--leading-snug)}
-.input,input[type=text],input[type=search],input[type=url],input[type=password],textarea,select{
+/* P0-9: bare <input> (no type=) is text-like in the browser but was missed by
+   attribute selectors like input[type=text], falling back to light UA chrome +
+   inherited light text. Default-include every input that isn't a non-text control. */
+.input,
+input:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=file]):not([type=submit]):not([type=button]):not([type=reset]):not([type=color]):not([type=hidden]):not([type=image]),
+textarea, select{
   width:100%;padding:.6rem .8rem;border-radius:var(--r);
   border:1px solid var(--border);background:var(--bg-sunken);color:var(--text-primary);
   font-size:var(--fs-sm);transition:border-color var(--dur) var(--ease),box-shadow var(--dur) var(--ease);
 }
-.input:focus,input:focus,textarea:focus,select:focus{outline:none;border-color:var(--accent-cyan);box-shadow:var(--ring)}
+.input:focus,
+input:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=file]):not([type=submit]):not([type=button]):not([type=reset]):not([type=color]):not([type=hidden]):not([type=image]):focus,
+textarea:focus, select:focus{outline:none;border-color:var(--accent-cyan);box-shadow:var(--ring)}
 .input::placeholder,textarea::placeholder{color:var(--text-faint)}
+/* P0-8: browsers force a light autofill background on password fields; a normal background
+   rule cannot override it. Paint over with inset box-shadow + fill-color so text stays
+   legible on the dark theme (register/login backup passphrase fields, and any other
+   type=password on the site). */
+input[type=password]:-webkit-autofill,
+input[type=password]:-webkit-autofill:hover,
+input[type=password]:-webkit-autofill:focus,
+input[type=password]:-webkit-autofill:active{
+  -webkit-text-fill-color:var(--text-primary) !important;
+  caret-color:var(--text-primary);
+  box-shadow:inset 0 0 0 1000px var(--bg-sunken) !important;
+  transition:background-color 99999s ease-out;
+  border-color:var(--border) !important;
+}
 textarea{resize:vertical;min-height:80px;line-height:var(--leading-snug)}
 select{appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath fill='%2394a3b8' d='M3 4.5L6 8l3-3.5z'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right .6rem center;background-size:12px;padding-right:2rem;cursor:pointer}
 .search-wrap{position:relative;flex:1;min-width:0}

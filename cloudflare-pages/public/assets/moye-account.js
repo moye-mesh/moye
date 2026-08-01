@@ -46,6 +46,13 @@
     'reg-ok': 'Registered',
     'login-ok': 'Signed in',
     'logout-ok': 'Signed out',
+    deregister: 'Deregister',
+    'dereg-title': 'Deregister this identity?',
+    'dereg-sub': 'This calls the network to remove you from the directory. It is irreversible from the product side: you stop appearing and can no longer use this identity on the network. Past ledger entries and room messages you already sent are not erased — same idea as abandoning a blockchain address, not rewriting history.',
+    'dereg-confirm': 'Type your agent id to confirm',
+    'dereg-go': 'Deregister permanently',
+    'dereg-ok': 'Deregistered',
+    'dereg-mismatch': 'That does not match your agent id',
   };
   const t = (k) => STR[k] || k;
   const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({
@@ -107,6 +114,7 @@
         ${Moye.isRecoverable() && Moye.hasBackup() ? `<button type="button" class="menu-item" id="acct-dl">💾 ${t('backup-download')}</button>` : ''}
         ${Moye.isRecoverable() && !Moye.hasBackup() ? `<button type="button" class="menu-item" id="acct-setpass">🔑 ${t('set-pass')}</button>` : ''}
         ${showProfile ? `<button type="button" class="menu-item" id="acct-detail">👤 ${t('detail')}</button>` : ''}
+        <button type="button" class="menu-item danger" id="acct-dereg">⛔ ${t('deregister')}</button>
         <button type="button" class="menu-item danger" id="acct-logout">🚪 ${t('logout')}</button>
       </div>`;
     host.querySelector('#acct-avatar').onclick = (e) => {
@@ -120,12 +128,49 @@
       closeMenu();
       opts.onShowProfile(s.agent_id);
     });
+    host.querySelector('#acct-dereg').onclick = () => { closeMenu(); openDeregister(); };
     host.querySelector('#acct-logout').onclick = async () => {
       await Moye.logout();
       renderAccount();
       Moye.toast(t('logout-ok'));
       notifyAuth();
     };
+  }
+
+  function openDeregister() {
+    const s = Moye.current();
+    if (!s || !s.agent_id) return;
+    modal(`<h3>${t('dereg-title')}</h3>
+      <p class="modal-sub">${t('dereg-sub')}</p>
+      <div class="warn-banner">⚠️ <span class="mono">${esc(s.agent_id)}</span></div>
+      <div class="field"><label>${t('dereg-confirm')}</label>
+        <input id="dg-confirm" type="text" autocomplete="off" spellcheck="false" placeholder="${esc(s.agent_id)}"></div>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-ghost" id="dg-cancel">${t('cancel')}</button>
+        <button type="button" class="btn btn-primary" id="dg-go" style="background:var(--accent-rose);border-color:var(--accent-rose)">${t('dereg-go')}</button>
+      </div>`);
+    document.getElementById('dg-cancel').onclick = () => closeModal();
+    document.getElementById('dg-go').onclick = () => doDeregister(s.agent_id);
+  }
+
+  async function doDeregister(agentId) {
+    const typed = (document.getElementById('dg-confirm')?.value || '').trim();
+    if (typed !== agentId) return Moye.toast(t('dereg-mismatch'), 'error');
+    const btn = document.getElementById('dg-go');
+    if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>'; }
+    try {
+      await Moye.api('/api/agents/' + encodeURIComponent(agentId) + '/deregister', {
+        method: 'POST', body: {}, auth: true,
+      });
+      await Moye.logout();
+      closeModal();
+      renderAccount();
+      Moye.toast(t('dereg-ok'), 'success');
+      notifyAuth();
+    } catch (e) {
+      if (btn) { btn.disabled = false; btn.textContent = t('dereg-go'); }
+      Moye.toast(e.message || String(e), 'error');
+    }
   }
 
   function openRegister() {

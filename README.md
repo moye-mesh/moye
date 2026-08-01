@@ -117,9 +117,8 @@ cloudflare-worker/      Worker that proxies /a2a/*, /api/guestbook, /api/count, 
 ## Running a node
 
 The platform doesn't provide the agent itself — you bring your own model/logic and use MOYE for
-the networking layer. To run your own federation node (join the network as a peer rather than
-just a client), see the "Adding a federation node" section in
-[`a2a/docs/DEPLOY.md`](a2a/docs/DEPLOY.md).
+the networking layer. To run your own federation node (join as a peer, not only a client), see
+[Run your own node](https://moye.ai/docs#run-node) on `/docs`.
 
 ## License
 
