@@ -229,7 +229,8 @@ app.use('/sdk-dist', express.static(path.join(__dirname, 'sdk'))); // SDK source
 // (cloudflare-pages/public/install.sh) doesn't have to depend on GitHub being reachable -- it's
 // part of the same self-hosted network the installed agent will join.
 app.use('/mcp-dist', express.static(path.join(__dirname, 'mcp'), { extensions: [], dotfiles: 'ignore' }));
-app.use(siteRoutes(db)); // Guestbook + visitor counter (replaces the old PHP: /api/guestbook, /api/count)
+// Guestbook + visitor counter mounted after room helpers (see below) so POST can mirror into the ops room.
+// app.use(siteRoutes(...)) — deferred
 
 // ---- SQLite prepared statements (sync API, no await needed) ----
 const stmt = {
@@ -1841,6 +1842,56 @@ async function appendRoomMessage(roomId, msg) {
   const L = Date.now();
   await store.putShared(key, { crdt: 'rga', nodes }, L, ledger.NODE_ID);
 }
+
+// Site widgets (guestbook + visit counter). Guestbook POST mirrors into the dogfood room so
+// ops/dev/coder see submissions without a public list endpoint (privacy fix 2026-08-06).
+app.use(siteRoutes(db, {
+  onGuestbook: async ({ agent_name, content }) => {
+    const roomId = process.env.GUESTBOOK_ROOM_ID || siteRoutes.DEFAULT_MIRROR_ROOM;
+    let room = store.getRoom(roomId);
+    if (!room) {
+      // Seed an empty public room when the configured mirror id is missing (smoke / fresh node).
+      // Production dogfood room already exists; this is a no-op there.
+      await store.putRoom(roomId, {
+        id: roomId,
+        name: 'guestbook-mirror',
+        description: 'Auto-seeded guestbook mirror target',
+        creator: '(site-guestbook)',
+        status: 'open',
+        home_node: ledger.NODE_ID,
+        created_at: Date.now(),
+        visibility: 'public',
+        membership_proof_hash: null,
+        member_ids: [],
+      });
+      room = store.getRoom(roomId);
+    }
+    if (!room) {
+      console.log(`[guestbook] mirror skipped: could not open room ${roomId}`);
+      return;
+    }
+    const text = `New feedback from ${agent_name}: ${content}`;
+    const msg = {
+      id: newId('rmsg'),
+      from_agent: '(site-guestbook)',
+      content: text,
+      encrypted: false,
+      sender_sig: null,
+      type: null,
+      ref: null,
+      awaiting: null,
+      attachments: null,
+      ts: Date.now(),
+    };
+    await appendRoomMessage(roomId, msg);
+    for (const uid of (room.member_ids || [])) {
+      pushTo(uid, { type: 'room_message', room_id: roomId, message: msg });
+    }
+    ledger.append('guestbook.mirror', {
+      room: roomId, from: '(site-guestbook)', content_hash: crypto.createHash('sha256').update(text).digest('hex'), ts: msg.ts,
+    }).catch(() => {});
+  },
+}));
 
 // ---- Federated room tasks (see the "FIXED 2026-07-25" note above) ----
 function roomTasksKey(roomId) { return 'room-tasks:' + roomId; }
