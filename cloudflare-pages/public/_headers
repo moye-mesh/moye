@@ -1,0 +1,5 @@
+# Cloudflare Pages custom headers (https://developers.cloudflare.com/pages/configuration/headers/)
+# AGENTS.md is UTF-8 markdown; without charset, browsers may mojibake em-dashes (ops live check).
+
+/AGENTS.md
+  Content-Type: text/markdown; charset=utf-8

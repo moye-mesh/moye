@@ -9,10 +9,16 @@
  * Honest limit: this solves "notification arrived → run a command". Whether that command
  * actually wakes Cursor / Claude Code / … depends on that runtime. See tools/README.md.
  *
+ * Cursor persistence (R14 / AGENTS.md guidance): by default the bridge stores the last
+ * processed message ts in a cursor file and resumes from it on restart. It does NOT silently
+ * fall back to Date.now() — that was the bug room-watch-core.js already fixed. First-ever
+ * run (no cursor file) starts at 0 and logs cursor_init:first_ever_arm. Pass --since <ms>
+ * to override for a one-shot (also writes through to the cursor file as it advances).
+ *
  * Usage:
  *   node moye-agent-bridge.js --room <id> --match <needle> --exec <command> \
  *     [--secret <s>] [--identity <path>] [--base-url <url>] [--since <ms>] \
- *     [--stdin json|text|none] [--once]
+ *     [--cursor-file <path>] [--stdin json|text|none] [--once]
  *
  * Env passed to --exec: MOYE_MSG_TEXT, MOYE_MSG_JSON, MOYE_ROOM_ID, MOYE_MSG_ID,
  * MOYE_FROM, MOYE_MATCH. Stdin (default): one JSON object for the message.
@@ -40,7 +46,7 @@ const execCmd = flag('exec');
 const secret = flag('secret', null);
 const identityPath = flag('identity', process.env.MOYE_IDENTITY_FILE || null);
 const baseUrl = (flag('base-url', process.env.MOYE_BASE_URL || 'https://moye.ai/a2a')).replace(/\/$/, '');
-const since = parseInt(flag('since', String(Date.now())), 10) || Date.now();
+const sinceFlag = flag('since', null); // explicit override only — never default to Date.now()
 const stdinMode = flag('stdin', 'json'); // json | text | none
 const once = hasFlag('once');
 
@@ -48,6 +54,60 @@ if (!roomId) die('usage: --room <room_id> required');
 if (!matchNeedle && !matchRegexSrc) die('usage: --match <needle> and/or --match-regex <re> required');
 if (!execCmd) die('usage: --exec <command> required');
 if (!['json', 'text', 'none'].includes(stdinMode)) die('--stdin must be json|text|none');
+
+function defaultCursorPath() {
+  if (process.env.MOYE_BRIDGE_CURSOR_FILE) return process.env.MOYE_BRIDGE_CURSOR_FILE;
+  const home = process.env.HOME || process.env.USERPROFILE || '.';
+  const safe = String(roomId).replace(/[^a-zA-Z0-9._-]/g, '_');
+  return path.join(home, '.moye-mcp', `bridge-cursor-${safe}.txt`);
+}
+const cursorFile = flag('cursor-file', defaultCursorPath());
+
+function loadCursor() {
+  if (sinceFlag != null) {
+    const n = parseInt(sinceFlag, 10);
+    if (!Number.isFinite(n) || n < 0) die('--since must be a non-negative ms epoch');
+    return { since: n, init: 'explicit_since' };
+  }
+  if (!fs.existsSync(cursorFile)) {
+    process.stderr.write(JSON.stringify({
+      cursor_init: 'first_ever_arm',
+      cursor: 0,
+      cursor_file: cursorFile,
+      note: 'no cursor file ever existed; starting at 0 to catch full backlog (AGENTS.md / R14)',
+    }) + '\n');
+    try {
+      fs.mkdirSync(path.dirname(cursorFile), { recursive: true });
+      fs.writeFileSync(cursorFile, '0\n');
+    } catch (e) {
+      die('cannot create cursor file ' + cursorFile + ': ' + (e.message || e));
+    }
+    return { since: 0, init: 'first_ever_arm' };
+  }
+  let raw;
+  try {
+    raw = fs.readFileSync(cursorFile, 'utf8').trim();
+  } catch (e) {
+    die('cursor file exists but unreadable (' + cursorFile + '): ' + (e.message || e));
+  }
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 0) {
+    die('cursor file corrupt (' + cursorFile + '): ' + JSON.stringify(raw));
+  }
+  return { since: n, init: 'persisted' };
+}
+
+function saveCursor(ts) {
+  try {
+    fs.mkdirSync(path.dirname(cursorFile), { recursive: true });
+    fs.writeFileSync(cursorFile, String(ts) + '\n');
+  } catch (e) {
+    process.stderr.write(JSON.stringify({
+      cursor_save_error: e.message || String(e),
+      cursor_file: cursorFile,
+    }) + '\n');
+  }
+}
 
 function loadAgent() {
   if (!identityPath || !fs.existsSync(identityPath)) {
@@ -138,10 +198,17 @@ function runExec(m) {
   const agent = loadAgent();
   if (secret) agent.rememberRoomSecret(roomId, secret);
 
+  const loaded = loadCursor();
   let busy = Promise.resolve();
   let stopped = false;
   let sub = null;
-  let watchSince = since;
+  let watchSince = loaded.since;
+
+  function advanceCursor(ts) {
+    if (!ts || !(ts > watchSince)) return;
+    watchSince = ts;
+    saveCursor(watchSince);
+  }
 
   function errPayload(e) {
     const out = { watch_error: (e && e.message) || String(e) };
@@ -163,7 +230,8 @@ function runExec(m) {
       secret: secret || undefined,
       onMessage(m) {
         if (stopped) return;
-        if (m && m.ts) watchSince = Math.max(watchSince, m.ts);
+        // Advance past every seen message (matched or not) so restart does not re-deliver noise.
+        if (m && m.ts) advanceCursor(m.ts);
         if (!matches(m)) {
           process.stderr.write(JSON.stringify({ skipped: true, message_id: m.id }) + '\n');
           return;
@@ -182,7 +250,7 @@ function runExec(m) {
         process.stderr.write(JSON.stringify(errPayload(e)) + '\n');
       },
       onReconnect({ cursor, backoff_ms }) {
-        if (cursor) watchSince = Math.max(watchSince, cursor);
+        if (cursor) advanceCursor(cursor);
         process.stderr.write(JSON.stringify({ reconnect: true, cursor, backoff_ms: backoff_ms || null }) + '\n');
       },
     });
@@ -213,7 +281,9 @@ function runExec(m) {
     agent_id: agent.agentId,
     match: matchNeedle || null,
     match_regex: matchRegexSrc || null,
-    since,
+    since: watchSince,
+    cursor_file: cursorFile,
+    cursor_init: loaded.init,
     ws_impl: (process.env.MOYE_WS_IMPL || 'ws-preferred'),
     caveat: 'notification→exec only; agent runtime wake is outside MOYE',
   }) + '\n');

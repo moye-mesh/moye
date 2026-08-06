@@ -3068,9 +3068,23 @@ function a2aTaskToJson(row) {
 }
 function jsonRpcError(id, code, message) { return { jsonrpc: '2.0', id: id === undefined ? null : id, error: { code, message } }; }
 function jsonRpcResult(id, result) { return { jsonrpc: '2.0', id, result }; }
-function a2aStreamUrl(agentId, taskId) {
-  const endpoint = process.env.PUBLIC_ENDPOINT || `http://localhost:${PORT}`;
-  return `${endpoint}/api/agents/${agentId}/a2a/stream?task_id=${encodeURIComponent(taskId)}`;
+function publicBaseUrl(req) {
+  // Prefer operator-set PUBLIC_ENDPOINT; otherwise derive from the incoming request so
+  // external-facing URLs (e.g. A2A streamUrl) aren't stuck on localhost when the env is unset
+  // (ops live check after M1 deploy — a2aStreamUrl newly exposed this existing config gap).
+  if (process.env.PUBLIC_ENDPOINT) return process.env.PUBLIC_ENDPOINT.replace(/\/$/, '');
+  if (req) {
+    const host = (req.get && req.get('host')) || req.headers.host;
+    if (host) {
+      const xf = (req.headers['x-forwarded-proto'] || '').toString().split(',')[0].trim();
+      const proto = xf || req.protocol || 'http';
+      return `${proto}://${host}`;
+    }
+  }
+  return `http://localhost:${PORT}`;
+}
+function a2aStreamUrl(agentId, taskId, req) {
+  return `${publicBaseUrl(req)}/api/agents/${agentId}/a2a/stream?task_id=${encodeURIComponent(taskId)}`;
 }
 function wantsA2aSse(req) {
   const accept = (req.headers.accept || '').toString().toLowerCase();
@@ -3102,7 +3116,7 @@ app.post('/api/agents/:id/a2a', async (req, res) => {
       id: taskId,
       status: { state: 'submitted', timestamp: new Date(now).toISOString() },
       history: [message],
-      streamUrl: a2aStreamUrl(agentId, taskId),
+      streamUrl: a2aStreamUrl(agentId, taskId, req),
     }));
   }
 
@@ -3134,7 +3148,7 @@ app.post('/api/agents/:id/a2a', async (req, res) => {
       if (!sub.ok) return res.status(503).json(jsonRpcError(rpcId, -32000, 'stream unavailable: ' + sub.reason));
       return; // response stays open
     }
-    return res.json(jsonRpcResult(rpcId, { id: taskId, status: snapshot.status, streamUrl: a2aStreamUrl(agentId, taskId) }));
+    return res.json(jsonRpcResult(rpcId, { id: taskId, status: snapshot.status, streamUrl: a2aStreamUrl(agentId, taskId, req) }));
   }
 
   return res.status(400).json(jsonRpcError(rpcId, -32601, `method not found: ${method}`));
