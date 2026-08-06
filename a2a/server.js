@@ -17,6 +17,7 @@ const crdt = require('./lib/crdt');       // F4: rich CRDT merge laws (tagged va
 const shard = require('./lib/shard');     // ADR-0008: consistent-hash directory sharding
 const firehose = require('./lib/firehose'); // ADR-0013: SSE/NDJSON live event stream
 const a2aTaskStream = require('./lib/a2a_task_stream'); // ADR-0030: per-task SSE for tasks/resubscribe
+const roomMcp = require('./lib/room_mcp');           // ADR-0031: room-as-MCP-server (Streamable HTTP)
 const attachments = require('./lib/attachments'); // N1: CID attachment metadata
 const verbs = require('./lib/verbs');             // ADR-0013: unified verb table
 const path = require('path');
@@ -61,7 +62,7 @@ const RESERVED_SHARED_PREFIXES = ['revoke:', 'reputation:'];
 // soft-fork *signaling* than its activation mechanism (MOYE has no hashpower-equivalent objective
 // threshold; adoption data here is informational, not a trigger that flips anything on by itself).
 const PROTOCOL_VERSION = '1.6';
-const PROTOCOL_FEATURES = ['capability-schema', 'verifiable-credentials', 'message-signing', 'rich-crdt', 'a2a-jsonrpc-bridge', 'portable-address-attestation', 'capability-input-filter', 'seeds-multisig-governance', 'firehose', 'message-attachments', 'room-awaiting', 'node-did-federation-auth', 'room-fork', 'slip0010', 'identity-delegation', 'session-keys', 'resolve-at', 'agent-timeline', 'gravity-search'];
+const PROTOCOL_FEATURES = ['capability-schema', 'verifiable-credentials', 'message-signing', 'rich-crdt', 'a2a-jsonrpc-bridge', 'portable-address-attestation', 'capability-input-filter', 'seeds-multisig-governance', 'firehose', 'message-attachments', 'room-awaiting', 'node-did-federation-auth', 'room-fork', 'slip0010', 'identity-delegation', 'session-keys', 'resolve-at', 'agent-timeline', 'gravity-search', 'room-mcp'];
 
 // Broadcast a newly-registered agent to peer nodes immediately (doesn't wait for the 15s reconcile cycle)
 function announceToPeers(agent) {
@@ -2255,6 +2256,13 @@ app.post('/api/rooms/:id/fork', async (req, res) => {
   });
 });
 
+// ADR-0031: room-as-MCP-server — Streamable HTTP MCP transport scoped to :id.
+// Mounted after room helpers (authAgent, isRoomMember, appendRoomMessage, …) exist.
+roomMcp.mount(app, {
+  authAgent, store, isRoomMember, canReadRoom, roomChatKey, appendRoomMessage,
+  newId, ledger, pushTo, ok, fail, MAX_CONTENT_LEN,
+});
+
 // ---- 8. Distribute a task to a room (requires auth: room creator) ----
 app.post('/api/rooms/:id/tasks', async (req, res) => {
   const me = await authAgent(req);
@@ -3246,6 +3254,9 @@ app.get(['/api/network', '/.well-known/moye-net'], async (req, res) => {
       verbs: '/api/verbs',
       room_fork: '/api/rooms/:id/fork  (POST {checkpoint_id,name})',
       room_at: '/api/rooms/:id/at?ts=|checkpoint=',
+      // ADR-0031: per-room MCP Streamable HTTP (JSON-RPC initialize|tools/list|tools/call).
+      // Coexists with stdio MCP at /mcp-dist — scoped to one room_id; no create/join tools.
+      room_mcp: '/mcp/rooms/:id  (POST JSON-RPC; GET discovery|SSE hello); Bearer or DID',
       resolve_at: '/api/agents/:id/resolve?at=<ts|seq:N>',
       timeline: '/api/agents/:id/timeline',
       dashboard: '/dashboard/dashboard.html',
