@@ -18,6 +18,7 @@ const shard = require('./lib/shard');     // ADR-0008: consistent-hash directory
 const firehose = require('./lib/firehose'); // ADR-0013: SSE/NDJSON live event stream
 const a2aTaskStream = require('./lib/a2a_task_stream'); // ADR-0030: per-task SSE for tasks/resubscribe
 const roomMcp = require('./lib/room_mcp');           // ADR-0031: room-as-MCP-server (Streamable HTTP)
+const roomAwaiting = require('./lib/room_awaiting'); // ADR-0027 D1/D3: multi-target + capability ask
 const attachments = require('./lib/attachments'); // N1: CID attachment metadata
 const verbs = require('./lib/verbs');             // ADR-0013: unified verb table
 const path = require('path');
@@ -1942,19 +1943,14 @@ app.get('/api/rooms/:id', async (req, res) => {
 const ROOM_MESSAGE_TYPES = new Set(['task-broadcast', 'task-claim', 'task-accept', 'ask', 'resolve']);
 
 function materializeRoomAwaiting(roomId) {
-  const msgs = store.getShared(roomChatKey(roomId)) || [];
-  const open = new Map(); // ask message id → ask msg
-  for (const m of msgs) {
-    if (m.type === 'ask' && m.awaiting) open.set(m.id, m);
-    if (m.type === 'resolve' && m.ref) open.delete(m.ref);
-  }
-  return [...open.values()];
+  return roomAwaiting.materializeRoomAwaiting(roomId, {
+    getRoom: (id) => store.getRoom(id),
+    getShared: (k) => store.getShared(k),
+    roomChatKey,
+    getAgent: (id) => store.getAgent(id),
+  });
 }
-
-function agentMatchesAwaiting(who, agent) {
-  if (!who || !agent) return false;
-  return who === agent.id || who === agent.did || (agent.did && who === agent.did);
-}
+const agentMatchesAwaiting = roomAwaiting.agentMatchesAwaiting;
 
 app.post('/api/rooms/:id/messages', async (req, res) => {
   const me = await authAgent(req);
@@ -1962,13 +1958,18 @@ app.post('/api/rooms/:id/messages', async (req, res) => {
   const room = store.getRoom(req.params.id);
   if (!room) return fail(res, 404, 'room not found');
   if (room.visibility === 'private' && !isRoomMember(room, me.id)) return fail(res, 403, 'private room: membership required to post');
-  const { content, encrypted, sender_sig, type, ref, awaiting: awaitingWho, schema, payload, by } = req.body || {};
+  const {
+    content, encrypted, sender_sig, type, ref, awaiting: awaitingWho,
+    awaiting_capability: awaitingCapability, schema, payload, by,
+  } = req.body || {};
   if (typeof content !== 'string' || !content) return fail(res, 400, 'content required');
   if (content.length > MAX_CONTENT_LEN) return fail(res, 413, 'content too large');
   if (type !== undefined && type !== null && !ROOM_MESSAGE_TYPES.has(type)) return fail(res, 400, `unknown type: ${type}`);
   if (type === 'task-accept' && me.id !== room.creator) return fail(res, 403, 'only the room creator can accept a claim');
+  let askTargets = null;
   if (type === 'ask') {
-    if (!awaitingWho || typeof awaitingWho !== 'string') return fail(res, 400, 'ask requires awaiting (agent id or did)');
+    askTargets = roomAwaiting.normalizeAskTargets(awaitingWho, awaitingCapability);
+    if (!askTargets.ok) return fail(res, askTargets.status || 400, askTargets.error);
   }
   if (type === 'resolve') {
     if (!ref) return fail(res, 400, 'resolve requires ref (ask message id)');
@@ -2018,9 +2019,10 @@ app.post('/api/rooms/:id/messages', async (req, res) => {
   const msg = {
     id: newId('rmsg'), from_agent: me.id, content, encrypted: !!encrypted,
     sender_sig: sender_sig || null, type: type || null, ref: ref || null,
-    awaiting: type === 'ask' ? awaitingWho : null,
+    awaiting: type === 'ask' ? askTargets.awaiting : null,
     attachments: atts, ts: Date.now(),
   };
+  if (type === 'ask' && askTargets.awaiting_capability) msg.awaiting_capability = askTargets.awaiting_capability;
   if (schemaOut) msg.schema = schemaOut;
   if (payloadOut) msg.payload = payloadOut;
   if (byOut != null) msg.by = byOut;
@@ -2054,7 +2056,8 @@ app.get('/api/rooms/:id/awaiting/:who', async (req, res) => {
     if (!me || !canReadRoom(room, me.id)) return fail(res, 403, 'private room: membership required');
   }
   const who = req.params.who;
-  const open = materializeRoomAwaiting(room.id).filter((m) => m.awaiting === who);
+  const whoAgent = store.getAgent(who) || { id: who, did: who.startsWith('did:') ? who : null };
+  const open = materializeRoomAwaiting(room.id).filter((m) => roomAwaiting.askConcernsAgent(m, who, whoAgent, room));
   ok(res, { room_id: room.id, who, awaiting: open });
 });
 
@@ -2066,7 +2069,7 @@ app.get('/api/agents/:id/awaiting', async (req, res) => {
   for (const room of store.listRooms()) {
     if (room.visibility === 'private' && !canReadRoom(room, agent.id)) continue;
     for (const m of materializeRoomAwaiting(room.id)) {
-      if (agentMatchesAwaiting(m.awaiting, agent)) {
+      if (roomAwaiting.askConcernsAgent(m, agent.id, agent, room) || roomAwaiting.askConcernsAgent(m, agent.did, agent, room)) {
         items.push({ room_id: room.id, room_name: room.name, ask: m });
       }
     }
@@ -2088,7 +2091,9 @@ app.get('/api/rooms/:id/state', async (req, res) => {
   };
   // Prefer live awaiting materialization over stale copy in the doc.
   const liveAwaiting = materializeRoomAwaiting(room.id).map((m) => ({
-    what: m.content, who: m.awaiting, since: m.ts, ref: m.id, by: m.from_agent,
+    what: m.content, who: m.awaiting, awaiting_capability: m.awaiting_capability || null,
+    awaiting_remaining: m.awaiting_remaining || null, awaiting_mode: m.awaiting_mode || null,
+    since: m.ts, ref: m.id, by: m.from_agent,
   }));
   ok(res, { room_id: room.id, state: { ...stateDoc, awaiting: liveAwaiting } });
 });

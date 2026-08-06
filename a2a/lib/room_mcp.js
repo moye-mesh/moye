@@ -13,6 +13,7 @@
  * posts rejected (encrypted:true required) — server never decrypts.
  */
 const crypto = require('crypto');
+const roomAwaiting = require('./room_awaiting');
 
 const PROTOCOL_VERSION = '2025-03-26';
 const ROOM_MESSAGE_TYPES = new Set([
@@ -51,7 +52,8 @@ function toolsList(roomId) {
             encrypted: { type: 'boolean', description: 'Must be true for private rooms' },
             type: { type: 'string', description: 'ask|resolve|task-broadcast|task-claim|task-accept' },
             ref: { type: 'string' },
-            awaiting: { type: 'string', description: 'Required when type=ask (agent id or did)' },
+            awaiting: { description: 'agent id/did string, or string[] for multi-target (R10)' },
+            awaiting_capability: { type: 'string', description: 'Capability name; first capable member resolve wins (R12)' },
           },
           required: ['content'],
         },
@@ -140,7 +142,7 @@ function mount(app, deps) {
     return { room, me };
   }
 
-  async function postMessage(room, me, { content, encrypted, type, ref, awaiting }) {
+  async function postMessage(room, me, { content, encrypted, type, ref, awaiting, awaiting_capability }) {
     if (typeof content !== 'string' || !content) throw Object.assign(new Error('content required'), { status: 400 });
     if (content.length > MAX_CONTENT_LEN) throw Object.assign(new Error('content too large'), { status: 413 });
     if (room.visibility === 'private' && !isRoomMember(room, me.id)) {
@@ -149,8 +151,10 @@ function mount(app, deps) {
     if (type !== undefined && type !== null && !ROOM_MESSAGE_TYPES.has(type)) {
       throw Object.assign(new Error('unknown type: ' + type), { status: 400 });
     }
-    if (type === 'ask' && (!awaiting || typeof awaiting !== 'string')) {
-      throw Object.assign(new Error('ask requires awaiting'), { status: 400 });
+    let askTargets = null;
+    if (type === 'ask') {
+      askTargets = roomAwaiting.normalizeAskTargets(awaiting, awaiting_capability);
+      if (!askTargets.ok) throw Object.assign(new Error(askTargets.error), { status: askTargets.status || 400 });
     }
     if (type === 'resolve') {
       if (!ref) throw Object.assign(new Error('resolve requires ref'), { status: 400 });
@@ -176,10 +180,11 @@ function mount(app, deps) {
       sender_sig: null,
       type: type || null,
       ref: ref || null,
-      awaiting: type === 'ask' ? awaiting : null,
+      awaiting: type === 'ask' ? askTargets.awaiting : null,
       attachments: null,
       ts: Date.now(),
     };
+    if (type === 'ask' && askTargets.awaiting_capability) msg.awaiting_capability = askTargets.awaiting_capability;
     await appendRoomMessage(room.id, msg);
     const contentHash = crypto.createHash('sha256').update(content).digest('hex');
     ledger.append('room.message', {

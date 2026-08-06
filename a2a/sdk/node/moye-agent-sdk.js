@@ -408,8 +408,9 @@ class Agent {
   // `type`/`ref` (2026-07-24, scenario 5): structured task-broadcast/task-claim/task-accept
   // convention layered on the chat log -- see the matching comment in server.js. Plain chat messages
   // omit both.
-  // ADR-0027: optional `awaiting` (ask), `schema`+`payload` (R9), `by` deadline ms (R11, ask only).
-  async sendRoomMessage(roomId, content, { encrypt, type, ref, awaiting, schema, payload, by } = {}) {
+  // ADR-0027: optional `awaiting` (ask; string|string[]), `awaiting_capability` (R12),
+  // `schema`+`payload` (R9), `by` deadline ms (R11, ask only).
+  async sendRoomMessage(roomId, content, { encrypt, type, ref, awaiting, awaiting_capability, schema, payload, by } = {}) {
     if (!this.agentId) throw new MoyeError('agent not registered');
     const secret = this._roomSecrets && this._roomSecrets[roomId];
     const shouldEncrypt = encrypt !== false && !!secret;
@@ -418,6 +419,7 @@ class Agent {
     if (type) body.type = type;
     if (ref) body.ref = ref;
     if (awaiting) body.awaiting = awaiting;
+    if (awaiting_capability) body.awaiting_capability = awaiting_capability;
     if (schema != null) body.schema = schema;
     if (payload != null) body.payload = payload;
     if (by != null) body.by = by;
