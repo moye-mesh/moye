@@ -16,6 +16,7 @@ const schema = require('./lib/schema');   // F1: minimal capability JSON-Schema 
 const crdt = require('./lib/crdt');       // F4: rich CRDT merge laws (tagged values only)
 const shard = require('./lib/shard');     // ADR-0008: consistent-hash directory sharding
 const firehose = require('./lib/firehose'); // ADR-0013: SSE/NDJSON live event stream
+const a2aTaskStream = require('./lib/a2a_task_stream'); // ADR-0030: per-task SSE for tasks/resubscribe
 const attachments = require('./lib/attachments'); // N1: CID attachment metadata
 const verbs = require('./lib/verbs');             // ADR-0013: unified verb table
 const path = require('path');
@@ -142,7 +143,8 @@ async function bootstrapFederation() {
       const since = lastSyncTs[peer.id] || 0;
       const syncStartedAt = Date.now();
       // Push only local increments (owned by this node) created since the last successful round
-      const localAgents = Object.values(store._raw().agents).filter(a => a.home_node === ledger.NODE_ID && (a.created_at || 0) > since);
+      // P3-6: filter by lamport (not created_at) so agent *updates* re-push after the first sync window.
+      const localAgents = Object.values(store._raw().agents).filter(a => a.home_node === ledger.NODE_ID && store.agentLamport(a) > since);
       const localRooms = Object.values(store._raw().rooms).filter(r => r.home_node === ledger.NODE_ID && (r.created_at || 0) > since);
       // Tombstones are sent in full every round (not since-filtered -- deletions are rare, the
       // set stays small, and this is the only channel nodes with no local IPFS (node3) ever get
@@ -165,8 +167,13 @@ async function bootstrapFederation() {
       // a separate merge path (HTTP, not pubsub).
       // ADR-0008: only pull agents this node is responsible for (shard.isResponsibleFor is a no-op
       // true when sharding is disabled, i.e. NUM_SHARDS=1 -- default, unchanged behavior).
-      for (const a of r.agents || []) if (a.home_node && a.home_node !== ledger.NODE_ID && shard.isResponsibleFor(a.id) && !store.getAgent(a.id) && !store.isTombstoned('agents', a.id)) {
-        await store.putAgent(a.id, a); got++;
+      // P3-6: LWW accept (not insert-only) so a peer's updated agent record can replace a stale local copy.
+      for (const a of r.agents || []) {
+        if (!a || !a.id || !a.home_node || a.home_node === ledger.NODE_ID) continue;
+        if (!shard.isResponsibleFor(a.id) || store.isTombstoned('agents', a.id)) continue;
+        const cur = store.getAgent(a.id);
+        if (!store.agentLwwWins(a, cur)) continue;
+        await store.putAgent(a.id, a, { preserveLamport: true }); got++;
       }
       // Rooms need the same pull-back as agents -- previously only agents were read from the
       // response, so a room created on the peer only ever reached us via the peer's own push,
@@ -768,7 +775,7 @@ app.post('/api/agents', async (req, res) => {
   }
   stmt.insertAgent.run(id, name, hashToken(token), ledger.NODE_ID, Date.now());
   // Directory/pubkey/capabilities are written to IPFS shared state (decentralized, visible across nodes)
-  await store.putAgent(id, {
+  const registered = await store.putAgent(id, {
     id, name, description: description || '', capabilities: capabilities || [], endpoint: endpoint || '',
     owner: owner || '', pubkey: pubkey || null, did: did || null, enc_pubkey: enc_pubkey || null,
     webhook_url: webhook_url || null, home_node: ledger.NODE_ID, created_at: Date.now(),
@@ -776,8 +783,8 @@ app.post('/api/agents', async (req, res) => {
     relay_tier,  // ADR-0006 workstream E: self-reported relay capability ('public'|'hole-punched'|'leech'|'unknown')
     overlay_addr // ADR-0006 workstream P2 (scaffolding): self-reported Yggdrasil overlay IPv6, or null
   });
-  // Announce immediately to federation peers (doesn't wait for the 15s reconcile cycle)
-  if (PEERS.length) announceToPeers({ id, name, description: description || '', capabilities: capabilities || [], endpoint: endpoint || '', owner: owner || '', did: did || null, home_node: ledger.NODE_ID, created_at: Date.now() });
+  // Announce the full stored record (incl. pubkey + lamport) so peers don't get a stripped copy.
+  if (PEERS.length) announceToPeers({ id, ...registered });
   // Anchor to the ledger: identity is tamper-evident
   await ledger.append('agent.register', { id, name, did, pubkey_fingerprint: did ? did.slice(10) : null, ts: Date.now() });
   POW_WINDOW.push(Date.now());   // record registration rate, feeds the adaptive PoW difficulty
@@ -830,11 +837,12 @@ app.post('/api/agents/:id/overlay', async (req, res) => {
   if (!overlay_addr) return fail(res, 400, 'valid overlay_addr required (Yggdrasil 200::/7 range)');
   const agent = store.getAgent(me.id);
   if (!agent) return fail(res, 404, 'agent not found');
-  await store.putAgent(me.id, { ...agent, overlay_addr });
+  const updatedOverlay = await store.putAgent(me.id, { ...agent, overlay_addr });
   await ledger.append('agent.overlay_update', { agent: me.id, did: agent.did || null, overlay_addr, ts: Date.now(), attestation: portableAttestation(req) }).catch(() => {});
   // ADR-0006 workstream F2 continued: best-effort DHT announce so this DID is findable via
   // GET /api/dht/resolve-did/:did on any DHT-enabled node, not just this one. No-op if DHT is off.
   if (agent.did) p2pRelay.provideDid(agent.did).catch(() => {});
+  if (PEERS.length) announceToPeers({ id: me.id, ...updatedOverlay });
   ok(res, { agent_id: me.id, overlay_addr });
 });
 
@@ -856,9 +864,10 @@ app.post('/api/agents/:id/p2p', async (req, res) => {
   const tier = ['public', 'hole-punched', 'leech'].includes(relay_tier) ? relay_tier : 'unknown';
   const agent = store.getAgent(me.id);
   if (!agent) return fail(res, 404, 'agent not found');
-  await store.putAgent(me.id, { ...agent, p2p_addrs, relay_tier: tier });
+  const updatedP2p = await store.putAgent(me.id, { ...agent, p2p_addrs, relay_tier: tier });
   await ledger.append('agent.p2p_update', { agent: me.id, did: agent.did || null, p2p_addrs, relay_tier: tier, ts: Date.now(), attestation: portableAttestation(req) }).catch(() => {});
   if (agent.did) p2pRelay.provideDid(agent.did).catch(() => {});
+  if (PEERS.length) announceToPeers({ id: me.id, ...updatedP2p });
   ok(res, { agent_id: me.id, p2p_addrs, relay_tier: tier });
 });
 
@@ -2718,7 +2727,11 @@ app.post('/api/federation/sync', async (req, res) => {
       // ADR-0008: peers push everything they own; this node decides what to keep based on its own
       // shard responsibility (a no-op filter when sharding is disabled, NUM_SHARDS=1 default).
       if (!shard.isResponsibleFor(a.id)) continue;
-      if (!store.getAgent(a.id) && !store.isTombstoned('agents', a.id)) { await store.putAgent(a.id, a); merged++; }
+      // P3-6: lamport+home_node LWW (was insert-only — stale incomplete copies stuck forever).
+      if (store.isTombstoned('agents', a.id)) continue;
+      const cur = store.getAgent(a.id);
+      if (!store.agentLwwWins(a, cur)) continue;
+      await store.putAgent(a.id, a, { preserveLamport: true }); merged++;
     }
   }
   if (Array.isArray(body.remote_rooms)) {
@@ -2730,8 +2743,9 @@ app.post('/api/federation/sync', async (req, res) => {
   // Shared state (room chat/task logs, reputation, VCs) -- see sharedSince/mergeRemoteShared.
   merged += await mergeRemoteShared(body.remote_shared);
   // 2) Return local increments since since_ts (including ones owned by this node)
+  // P3-6: return agents whose lamport advanced since `since`, not only brand-new created_at.
   const agents = Object.entries(store._raw().agents)
-    .filter(([, v]) => (v.created_at || 0) > since)
+    .filter(([, v]) => store.agentLamport(v) > since)
     .map(([id, v]) => ({ id, ...v }));
   const rooms = Object.entries(store._raw().rooms)
     .filter(([, v]) => (v.created_at || 0) > since)
@@ -2932,7 +2946,7 @@ function agentToCard(a, { extended = true } = {}) {
       url: endpoint,
     },
     capabilities: {
-      streaming: false,
+      streaming: true,                  // ADR-0030: tasks/resubscribe + GET .../a2a/stream
       pushNotifications: !!a.webhook_url,
       stateTransitionHistory: true,     // room task events + ledger give a real audit trail
       extensions: PROTOCOL_FEATURES.map(f => ({ uri: `https://moye.ai/ext/${f}`, required: false })),
@@ -3006,7 +3020,7 @@ app.get('/api/agents/:id/agent-card', async (req, res) => {
   res.json(req.query.plain === '1' ? card : signCard(card));
 });
 
-// ---- ADR-0010: A2A JSON-RPC invocation bridge ----
+// ---- ADR-0010 + ADR-0030: A2A JSON-RPC invocation bridge ----
 // Beyond discovery: lets a real external A2A client submit work to a MOYE agent and poll for the
 // result, using MOYE's existing async inbox/message pattern as the queue -- deliberately NOT
 // synchronous invocation. MOYE agents are pull-based by design (an agent might be offline and catch
@@ -3014,19 +3028,24 @@ app.get('/api/agents/:id/agent-card', async (req, res) => {
 // not just A2A callers. Implements a practical subset of the A2A JSON-RPC methods:
 //   - message/send (and the older tasks/send alias): submits a task, returns {id, status:"submitted"}
 //   - tasks/get {id}: current status/result
-//   - tasks/cancel {id}: best-effort cancel if not already completed/failed
-// NOT implemented: streaming (SSE), push-notification delivery over this path, full A2A auth-scheme
-// negotiation. The Agent Card declares no required auth scheme, so this endpoint is open to any
+//   - tasks/cancel {id}: best-effort cancel if not already terminal
+//   - tasks/resubscribe {id}: SSE stream of status changes (ADR-0030); also GET .../a2a/stream
+// NOT implemented: push-notification webhooks over this path, full A2A OAuth negotiation.
+// The Agent Card declares no required auth scheme, so this endpoint is open to any
 // caller the same way POST /api/messages historically was -- the rate limit below is the concrete
 // trade-off for that openness (an unauthenticated caller can still only submit ~30 tasks/min/agent
 // before being throttled, not flood an agent's inbox unbounded).
 //
 // For a MOYE agent to actually answer A2A tasks: watch the inbox for messages from
 // '(a2a-bridge)', parse `{a2a_task_id, text}` out of the JSON content, process it, then call
-// POST /api/agents/:id/a2a-result {task_id, state, parts} (self-auth) to complete the task. This is a
-// documented pattern, not automatic -- no SDK does this for you yet (see ADR-0010's known gaps).
+// POST /api/agents/:id/a2a-result {task_id, state, parts} (self-auth) to update/complete the task.
 const A2A_RATE_WINDOW_MS = 60 * 1000;
 const A2A_RATE_LIMIT = 30; // task submissions per agent per minute
+const A2A_TERMINAL = new Set(['completed', 'failed', 'canceled', 'rejected']);
+const A2A_RESULT_STATES = new Set([
+  'working', 'input_required', 'auth_required',
+  'completed', 'failed', 'canceled', 'rejected',
+]);
 const a2aRateWindows = new Map(); // agent_id -> [timestamps within the window]
 function a2aRateLimited(agentId) {
   const now = Date.now();
@@ -3049,6 +3068,14 @@ function a2aTaskToJson(row) {
 }
 function jsonRpcError(id, code, message) { return { jsonrpc: '2.0', id: id === undefined ? null : id, error: { code, message } }; }
 function jsonRpcResult(id, result) { return { jsonrpc: '2.0', id, result }; }
+function a2aStreamUrl(agentId, taskId) {
+  const endpoint = process.env.PUBLIC_ENDPOINT || `http://localhost:${PORT}`;
+  return `${endpoint}/api/agents/${agentId}/a2a/stream?task_id=${encodeURIComponent(taskId)}`;
+}
+function wantsA2aSse(req) {
+  const accept = (req.headers.accept || '').toString().toLowerCase();
+  return accept.includes('text/event-stream');
+}
 
 app.post('/api/agents/:id/a2a', async (req, res) => {
   const agentId = req.params.id;
@@ -3071,7 +3098,12 @@ app.post('/api/agents/:id/a2a', async (req, res) => {
     stmt.insertMessage.run(msgId, '(a2a-bridge)', agentId, JSON.stringify({ a2a_task_id: taskId, text }), 'pending', 0, null, null, null, now);
     stmt.updateA2aTaskMessageId.run(msgId, taskId);
     ledger.append('a2a.task_submit', { task: taskId, agent: agentId, ts: now }).catch(() => {});
-    return res.json(jsonRpcResult(rpcId, { id: taskId, status: { state: 'submitted', timestamp: new Date(now).toISOString() }, history: [message] }));
+    return res.json(jsonRpcResult(rpcId, {
+      id: taskId,
+      status: { state: 'submitted', timestamp: new Date(now).toISOString() },
+      history: [message],
+      streamUrl: a2aStreamUrl(agentId, taskId),
+    }));
   }
 
   if (method === 'tasks/get' || method === 'tasks/cancel') {
@@ -3080,30 +3112,72 @@ app.post('/api/agents/:id/a2a', async (req, res) => {
     if (!row || row.agent_id !== agentId) return res.status(404).json(jsonRpcError(rpcId, -32001, 'task not found'));
     if (method === 'tasks/get') return res.json(jsonRpcResult(rpcId, a2aTaskToJson(row)));
     // tasks/cancel
-    if (row.status === 'completed' || row.status === 'failed') {
+    if (A2A_TERMINAL.has(row.status)) {
       return res.status(400).json(jsonRpcError(rpcId, -32002, `task already ${row.status}, cannot cancel`));
     }
     stmt.updateA2aTaskStatus.run('canceled', Date.now(), taskId);
-    return res.json(jsonRpcResult(rpcId, a2aTaskToJson(stmt.a2aTaskById.get(taskId))));
+    const canceled = a2aTaskToJson(stmt.a2aTaskById.get(taskId));
+    a2aTaskStream.publish(canceled);
+    ledger.append('a2a.task_result', { task: taskId, agent: agentId, state: 'canceled', ts: Date.now() }).catch(() => {});
+    return res.json(jsonRpcResult(rpcId, canceled));
+  }
+
+  // ADR-0030: tasks/resubscribe — A2A method name. Prefer Accept: text/event-stream (hijack this
+  // response as SSE); otherwise return a streamUrl for GET /api/agents/:id/a2a/stream.
+  if (method === 'tasks/resubscribe') {
+    const taskId = params && params.id;
+    const row = taskId && stmt.a2aTaskById.get(taskId);
+    if (!row || row.agent_id !== agentId) return res.status(404).json(jsonRpcError(rpcId, -32001, 'task not found'));
+    const snapshot = a2aTaskToJson(row);
+    if (wantsA2aSse(req) || params && params.subscribe === true) {
+      const sub = a2aTaskStream.subscribe(res, { taskId, agentId, snapshot });
+      if (!sub.ok) return res.status(503).json(jsonRpcError(rpcId, -32000, 'stream unavailable: ' + sub.reason));
+      return; // response stays open
+    }
+    return res.json(jsonRpcResult(rpcId, { id: taskId, status: snapshot.status, streamUrl: a2aStreamUrl(agentId, taskId) }));
   }
 
   return res.status(400).json(jsonRpcError(rpcId, -32601, `method not found: ${method}`));
 });
 
+// ADR-0030: REST SSE mirror of tasks/resubscribe (easier for curl / EventSource clients).
+app.get('/api/agents/:id/a2a/stream', (req, res) => {
+  const agentId = req.params.id;
+  const agent = store.getAgent(agentId);
+  if (!agent) return fail(res, 404, 'agent not found');
+  const taskId = (req.query.task_id || '').toString();
+  if (!taskId) return fail(res, 400, 'task_id query required');
+  const row = stmt.a2aTaskById.get(taskId);
+  if (!row || row.agent_id !== agentId) return fail(res, 404, 'task not found');
+  const sub = a2aTaskStream.subscribe(res, { taskId, agentId, snapshot: a2aTaskToJson(row) });
+  if (!sub.ok) return fail(res, 503, 'stream unavailable: ' + sub.reason);
+});
+
 // The receiving MOYE agent reports its own task's result (self-auth only). Mirrors the existing
 // room-task-report pattern (POST /api/rooms/:id/tasks/:tid/report).
+// ADR-0030: accepts the full non-initial A2A lifecycle. Intermediate states
+// (working/input_required/auth_required) may be reported repeatedly; terminal states may not.
 app.post('/api/agents/:id/a2a-result', async (req, res) => {
   const me = await authAgent(req);
   if (!me) return fail(res, 401, 'Bearer token or DID sig required');
   if (me.id !== req.params.id) return fail(res, 403, 'identity mismatch');
   const { task_id, state, parts } = req.body || {};
   if (!task_id) return fail(res, 400, 'task_id required');
-  if (!['completed', 'failed'].includes(state)) return fail(res, 400, 'state must be "completed" or "failed"');
+  if (!A2A_RESULT_STATES.has(state)) {
+    return fail(res, 400, 'state must be one of working|input_required|auth_required|completed|failed|canceled|rejected');
+  }
   const row = stmt.a2aTaskById.get(task_id);
   if (!row || row.agent_id !== me.id) return fail(res, 404, 'task not found');
-  stmt.updateA2aTaskResult.run(state, JSON.stringify(parts || []), Date.now(), task_id);
-  ledger.append('a2a.task_result', { task: task_id, agent: me.id, state, ts: Date.now() }).catch(() => {});
-  ok(res, { task_id, state });
+  if (A2A_TERMINAL.has(row.status)) {
+    return fail(res, 400, `task already ${row.status}; terminal states cannot be updated`);
+  }
+  const now = Date.now();
+  // Intermediate + terminal both may carry parts (e.g. input_required prompt); overwrite result.
+  stmt.updateA2aTaskResult.run(state, JSON.stringify(parts || []), now, task_id);
+  const updated = a2aTaskToJson(stmt.a2aTaskById.get(task_id));
+  a2aTaskStream.publish(updated);
+  ledger.append('a2a.task_result', { task: task_id, agent: me.id, state, ts: now }).catch(() => {});
+  ok(res, { task_id, state, terminal: A2A_TERMINAL.has(state) });
 });
 // Node-level index card -- explicitly labeled as a registry/gateway, not a single agent's card, so
 // an A2A client doesn't mistake "this whole MOYE node" for one agent.

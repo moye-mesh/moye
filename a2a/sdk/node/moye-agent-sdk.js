@@ -555,12 +555,21 @@ class Agent {
     if (!this.agentId) throw new MoyeError('agent not registered');
     if (typeof onMessage !== 'function') throw new MoyeError('onMessage required');
 
+    // Prefer the `ws` package over Node's native globalThis.WebSocket (undici). Native WS can
+    // surface connection failures as AggregateError that bypass the WHATWG 'error' event and
+    // become unhandled process-level exceptions in some Node versions — that killed long-lived
+    // listeners (dev 3-for-3: reconnect storm → watch_error:AggregateError → process exit).
+    // Override with MOYE_WS_IMPL=native to force globalThis.WebSocket for debugging.
     let WebSocketImpl;
+    const preferNative = (process.env.MOYE_WS_IMPL || '').toLowerCase() === 'native';
     try {
-      if (typeof globalThis.WebSocket === 'function') WebSocketImpl = globalThis.WebSocket;
-      else WebSocketImpl = require('ws');
+      if (!preferNative) {
+        try { WebSocketImpl = require('ws'); } catch { /* fall through */ }
+      }
+      if (!WebSocketImpl && typeof globalThis.WebSocket === 'function') WebSocketImpl = globalThis.WebSocket;
+      if (!WebSocketImpl) WebSocketImpl = require('ws');
     } catch {
-      throw new MoyeError('watchRoom needs Node 22+ global WebSocket or the ws package');
+      throw new MoyeError('watchRoom needs the ws package or Node 22+ global WebSocket');
     }
 
     let stopped = false;
@@ -569,7 +578,24 @@ class Agent {
     let ws = null;
     let reconnectTimer = null;
     let connecting = false;
+    let backoffMs = 1500;
     const self = this;
+
+    function errDetail(e) {
+      if (!e) return { message: 'unknown' };
+      const out = {
+        name: e.name || 'Error',
+        message: e.message || String(e),
+      };
+      if (e.code) out.code = e.code;
+      if (Array.isArray(e.errors)) {
+        out.errors = e.errors.map((x) => ({
+          name: x && x.name, message: x && (x.message || String(x)), code: x && x.code,
+        }));
+      }
+      if (e.cause) out.cause = errDetail(e.cause);
+      return out;
+    }
 
     function decryptMsg(m) {
       const out = Object.assign({}, m);
@@ -624,13 +650,15 @@ class Agent {
 
     function scheduleReconnect() {
       if (stopped || reconnectTimer) return;
+      const delay = backoffMs;
+      backoffMs = Math.min(backoffMs * 2, 30000);
       reconnectTimer = setTimeout(() => {
         reconnectTimer = null;
         if (typeof onReconnect === 'function') {
-          try { onReconnect({ cursor }); } catch { /* */ }
+          try { onReconnect({ cursor, backoff_ms: delay }); } catch { /* */ }
         }
         start().catch((e) => { if (typeof onError === 'function') onError(e); });
-      }, 1500);
+      }, delay);
     }
 
     function openSocket() {
@@ -645,7 +673,7 @@ class Agent {
         return;
       }
       ws = sock;
-      const onOpen = () => { connecting = false; };
+      const onOpen = () => { connecting = false; backoffMs = 1500; };
       const onMessageWs = (ev) => {
         let data = ev && ev.data !== undefined ? ev.data : ev;
         if (Buffer.isBuffer(data)) data = data.toString('utf8');
@@ -660,7 +688,17 @@ class Agent {
         ws = null;
         if (!stopped) scheduleReconnect();
       };
-      const onErr = () => { /* close follows */ };
+      // Log the real error (was a no-op) so AggregateError / undici failures are diagnosable.
+      const onErr = (err) => {
+        if (typeof onError === 'function') {
+          try { onError(err || new Error('websocket error')); }
+          catch { /* */ }
+        } else {
+          try {
+            process.stderr.write(JSON.stringify({ watchRoom_ws_error: errDetail(err) }) + '\n');
+          } catch { /* */ }
+        }
+      };
       if (typeof sock.on === 'function') {
         // ws package
         sock.on('open', onOpen);

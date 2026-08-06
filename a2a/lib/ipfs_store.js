@@ -171,15 +171,22 @@ async function mergeManifest(manifest) {
   loadTombstones(manifest.tombstones);
 
   for (const [id, cid] of Object.entries(manifest.agents || {})) {
-    if (tombstones.agents.has(id) || cids.agents[id]) continue;
+    if (tombstones.agents.has(id)) continue;
     // ADR-0008: only replicate agents this node is actually responsible for (its served shards).
     // With NUM_SHARDS=1 (default), isResponsibleFor() is always true -- this is a no-op and every
     // node keeps replicating everything, exactly like before sharding existed. Scoped to agents
     // only (not rooms) -- "billions of agents" is the stated target, room counts are orders of
     // magnitude smaller and stay fully-replicated for simplicity.
     if (!shard.isResponsibleFor(id)) continue;
+    // P3-6: previously `cids.agents[id]` short-circuited forever (insert-only). Same CID = no-op;
+    // a newer CID is accepted only when LWW says the incoming record wins.
+    if (cids.agents[id] === cid) continue;
     const obj = await catJson(cid);
-    if (obj) { touchAgent(id, obj); spill.putAgent(id, obj); cids.agents[id] = cid; indexAgent(id, obj); changed = true; }
+    if (!obj) continue;
+    const cur = state.agents[id] || spill.getAgent(id);
+    if (!agentLwwWins(obj, cur)) continue;
+    deindexAgentCapabilities(id);
+    touchAgent(id, obj); spill.putAgent(id, obj); cids.agents[id] = cid; indexAgent(id, obj); changed = true;
   }
   for (const [id, cid] of Object.entries(manifest.rooms || {})) {
     if (tombstones.rooms.has(id) || cids.rooms[id]) continue;
@@ -368,15 +375,41 @@ async function init() {
   } catch (e) { console.log('[ipfs-store] subscribe failed, continuing memory-only:', e.message); }
 }
 
+// P3-6: agent-record federation LWW. Analogous to shared state's (lamport, owner) — for agents
+// the writer identity is home_node (the authoritative node), not the free-text `owner` org field.
+function agentLamport(a) {
+  if (!a) return 0;
+  return a.lamport || a.updated_at || a.created_at || 0;
+}
+function agentLwwWins(incoming, local) {
+  if (!local) return true;
+  const iL = agentLamport(incoming);
+  const cL = agentLamport(local);
+  if (iL !== cL) return iL > cL;
+  return String(incoming.home_node || '') > String(local.home_node || '');
+}
+
 // ---- agents ----
-async function putAgent(id, obj) {
+// opts.preserveLamport: federation merge of a peer's already-versioned record — keep its lamport.
+// Local writes (default) bump lamport so peers can LWW-accept the update (P3-6).
+async function putAgent(id, obj, opts = {}) {
+  const cur = state.agents[id] || spill.getAgent(id);
+  const next = { ...obj, id };
+  if (opts.preserveLamport) {
+    if (next.lamport == null) next.lamport = next.created_at || Date.now();
+  } else {
+    let L = Date.now();
+    const curL = agentLamport(cur);
+    if (L <= curL) L = curL + 1;
+    next.lamport = L;
+  }
   deindexAgentCapabilities(id); // safe no-op today (no capability-update endpoint exists yet), but
-  indexAgent(id, obj);          // keeps the index correct if a future re-put ever changes capabilities
-  touchAgent(id, obj);
-  spill.putAgent(id, obj);
+  indexAgent(id, next);         // keeps the index correct if a future re-put ever changes capabilities
+  touchAgent(id, next);
+  spill.putAgent(id, next);
   spill.putMeta('cids', cids);
   await commitAgent(id);
-  return obj;
+  return next;
 }
 function getAgent(id) {
   if (state.agents[id]) {
@@ -561,6 +594,7 @@ function _raw() {
 module.exports = {
   init, ipfs: () => ipfs, ready: () => ready,
   putAgent, getAgent, getAgentByDid, listAgents, listAgentsByCapability, capabilityCounts, removeAgent,
+  agentLamport, agentLwwWins,
   putRoom, getRoom, listRooms, removeRoom,
   putShared, getShared, allShared, allAgentIds, isTombstoned,
   getTombstones: serializeTombstones, mergeTombstones: loadTombstones,

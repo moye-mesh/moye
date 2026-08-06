@@ -140,32 +140,72 @@ function runExec(m) {
 
   let busy = Promise.resolve();
   let stopped = false;
-  const sub = agent.watchRoom(roomId, {
-    since,
-    secret: secret || undefined,
-    onMessage(m) {
-      if (stopped) return;
-      if (!matches(m)) {
-        process.stderr.write(JSON.stringify({ skipped: true, message_id: m.id }) + '\n');
-        return;
-      }
-      busy = busy.then(async () => {
+  let sub = null;
+  let watchSince = since;
+
+  function errPayload(e) {
+    const out = { watch_error: (e && e.message) || String(e) };
+    if (e && e.name) out.name = e.name;
+    if (e && Array.isArray(e.errors)) {
+      out.causes = e.errors.map((x) => (x && (x.message || String(x))) || String(x));
+    }
+    return out;
+  }
+
+  function startWatch() {
+    if (stopped) return;
+    if (sub) {
+      try { sub.stop(); } catch { /* */ }
+      sub = null;
+    }
+    sub = agent.watchRoom(roomId, {
+      since: watchSince,
+      secret: secret || undefined,
+      onMessage(m) {
         if (stopped) return;
-        await runExec(m);
-        if (once) {
-          stopped = true;
-          sub.stop();
-          process.exit(0);
+        if (m && m.ts) watchSince = Math.max(watchSince, m.ts);
+        if (!matches(m)) {
+          process.stderr.write(JSON.stringify({ skipped: true, message_id: m.id }) + '\n');
+          return;
         }
-      });
-    },
-    onError(e) {
-      process.stderr.write(JSON.stringify({ watch_error: e.message || String(e) }) + '\n');
-    },
-    onReconnect({ cursor }) {
-      process.stderr.write(JSON.stringify({ reconnect: true, cursor }) + '\n');
-    },
-  });
+        busy = busy.then(async () => {
+          if (stopped) return;
+          await runExec(m);
+          if (once) {
+            stopped = true;
+            if (sub) sub.stop();
+            process.exit(0);
+          }
+        });
+      },
+      onError(e) {
+        process.stderr.write(JSON.stringify(errPayload(e)) + '\n');
+      },
+      onReconnect({ cursor, backoff_ms }) {
+        if (cursor) watchSince = Math.max(watchSince, cursor);
+        process.stderr.write(JSON.stringify({ reconnect: true, cursor, backoff_ms: backoff_ms || null }) + '\n');
+      },
+    });
+  }
+
+  startWatch();
+
+  // Safety net: native/undici WebSocket AggregateError (and similar) can bypass the socket
+  // 'error' event and kill the process. Log + restart the watch loop instead of exiting.
+  function survive(kind, err) {
+    if (stopped) return;
+    process.stderr.write(JSON.stringify({
+      bridge_safety_net: kind,
+      ...errPayload(err),
+      action: 'restart_watch',
+      cursor: watchSince,
+    }) + '\n');
+    try { startWatch(); } catch (e) {
+      process.stderr.write(JSON.stringify({ bridge_restart_failed: e.message || String(e) }) + '\n');
+    }
+  }
+  process.on('uncaughtException', (err) => survive('uncaughtException', err));
+  process.on('unhandledRejection', (err) => survive('unhandledRejection', err));
 
   process.stderr.write(JSON.stringify({
     listening: true,
@@ -174,10 +214,11 @@ function runExec(m) {
     match: matchNeedle || null,
     match_regex: matchRegexSrc || null,
     since,
+    ws_impl: (process.env.MOYE_WS_IMPL || 'ws-preferred'),
     caveat: 'notification→exec only; agent runtime wake is outside MOYE',
   }) + '\n');
 
-  const stop = () => { stopped = true; sub.stop(); process.exit(0); };
+  const stop = () => { stopped = true; if (sub) sub.stop(); process.exit(0); };
   process.on('SIGINT', stop);
   process.on('SIGTERM', stop);
 })().catch((e) => die(e.message || String(e)));
