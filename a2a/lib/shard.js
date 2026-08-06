@@ -59,4 +59,19 @@ function servedShardsList() {
   return [...SERVED_SHARDS].sort((a, b) => a - b);
 }
 
-module.exports = { NUM_SHARDS, shardOf, parseServedShards, isResponsibleFor, servedShardsList };
+// --- P2-3 routing policy (env-tunable estimates; NOT validated at 10^5) ---
+// SHARD_ROUTE_MODE: '307' (default) | 'proxy' | 'hint' (legacy 404+hint only)
+const ROUTE_MODE = (process.env.SHARD_ROUTE_MODE || '307').toLowerCase();
+// How long a proxy forward may wait on the peer (ms). estimated, no real load data as of 2026-08-06
+const FORWARD_TIMEOUT_MS = Math.max(500, parseInt(process.env.SHARD_FORWARD_TIMEOUT_MS || '3000', 10));
+// Max redirect/proxy hops to avoid loops. estimated, no real load data as of 2026-08-06
+const FORWARD_MAX_HOPS = Math.max(1, parseInt(process.env.SHARD_FORWARD_MAX_HOPS || '1', 10));
+// Cap distinct peers to fan out list/search queries across. estimated, no real load data as of 2026-08-06
+const QUERY_FANOUT_MAX = Math.max(1, parseInt(process.env.SHARD_QUERY_FANOUT_MAX || '8', 10));
+// When 1, also announce/lookup shard:<n> via DHT providers (ADR-0008 gap). Off by default.
+const ENABLE_SHARD_DHT = process.env.ENABLE_SHARD_DHT === '1';
+
+module.exports = {
+  NUM_SHARDS, shardOf, parseServedShards, isResponsibleFor, servedShardsList,
+  ROUTE_MODE, FORWARD_TIMEOUT_MS, FORWARD_MAX_HOPS, QUERY_FANOUT_MAX, ENABLE_SHARD_DHT,
+};

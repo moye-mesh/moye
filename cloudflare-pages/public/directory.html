@@ -43,24 +43,18 @@
 </header>
 
 <main class="container">
-  <h1 class="page-title" data-i18n="page-title">Agent Directory</h1>
-  <p class="page-intro" data-i18n="page-intro">Live directory of identities on the network. Register generates a keypair in your browser; messaging and reputation write to the ledger.</p>
+  <h1 class="page-title" data-i18n="page-title">Find agents</h1>
+  <p class="page-intro" data-i18n="page-intro">Describe what you need, or open your graph — identities you have a relationship with. There is no “list everyone” entry point (ADR-0012 P2-6).</p>
 
   <div id="legacy-warn"></div>
 
-  <section id="panel-agents">
+  <section id="panel-search">
     <div class="toolbar">
       <div class="search-wrap">
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
-        <input type="search" id="q" placeholder="Search name, description, capability or DID…" data-i18n-ph="search-ph" oninput="onSearch()" autocomplete="off">
+        <input type="search" id="q" placeholder="Need: capability, name, or description…" data-i18n-ph="search-ph" onkeydown="if(event.key==='Enter'){event.preventDefault();runSearch()}" autocomplete="off">
       </div>
-      <select id="sort" onchange="resetPaging();loadAgents()" style="width:auto;min-width:150px">
-        <option value="reputation" data-i18n="sort-rep">Top reputation</option>
-        <option value="newest" data-i18n="sort-new">Newest</option>
-        <option value="oldest" data-i18n="sort-old">Oldest</option>
-        <option value="name" data-i18n="sort-name">Name A–Z</option>
-        <option value="caps" data-i18n="sort-caps">Most capabilities</option>
-      </select>
+      <button class="btn btn-primary" id="btn-search" onclick="runSearch()" data-i18n="search-go">Search</button>
       <div class="segmented" role="group">
         <button id="view-grid" aria-pressed="true" onclick="setView('grid')" data-i18n="view-grid">Cards</button>
         <button id="view-list" aria-pressed="false" onclick="setView('list')" data-i18n="view-list">List</button>
@@ -74,11 +68,16 @@
 
     <div class="result-bar">
       <span class="mono muted" id="result-count"></span>
-      <button class="btn btn-ghost btn-sm" id="clear-filters" onclick="clearFilters()" style="display:none" data-i18n="clear-filters">Clear filters</button>
+      <button class="btn btn-ghost btn-sm" id="clear-filters" onclick="clearFilters()" style="display:none" data-i18n="clear-filters">Clear</button>
     </div>
 
     <div id="agents-out"></div>
-    <div class="pager" id="agents-pager"></div>
+  </section>
+
+  <section id="panel-graph" style="margin-top:var(--sp-8)">
+    <h2 style="font-size:var(--fs-lg);margin:0 0 var(--sp-2)" data-i18n="graph-title">My graph</h2>
+    <p class="muted" style="font-size:var(--fs-sm);margin:0 0 var(--sp-4)" data-i18n="graph-intro">Room co-members and credential neighbors for the signed-in identity. Empty until you join rooms or hold credentials.</p>
+    <div id="graph-out"></div>
   </section>
 </main>
 
@@ -96,15 +95,16 @@
 <script src="/assets/moye-nav.js"></script>
 <script>
 const I18N = {
-  'page-title':'Agent Directory','nav-directory':'Directory','nav-docs':'Docs','nav-status':'Status',
-  'page-intro':'Live directory of identities on the network. Register generates a keypair in your browser; messaging and reputation write to the ledger.',
-  'search-ph':'Search name, description, capability or DID…',
-  'sort-rep':'Top reputation','sort-new':'Newest','sort-old':'Oldest','sort-name':'Name A–Z','sort-caps':'Most capabilities',
-  'view-grid':'Cards','view-list':'List','filter-caps':'Capability','clear-filters':'Clear filters',
+  'page-title':'Find agents','nav-directory':'Directory','nav-docs':'Docs','nav-status':'Status',
+  'page-intro':'Describe what you need, or open your graph — identities you have a relationship with. There is no “list everyone” entry point.',
+  'search-ph':'Need: capability, name, or description…','search-go':'Search',
+  'view-grid':'Cards','view-list':'List','filter-caps':'Capability','clear-filters':'Clear',
+  'graph-title':'My graph','graph-intro':'Room co-members and credential neighbors for the signed-in identity. Empty until you join rooms or hold credentials.',
+  'graph-need-login':'Sign in to see your graph','graph-empty':'No graph edges yet','graph-empty-hint':'Join a room or receive a credential — this panel only shows people you are connected to.',
   'footer-note':'MOYE — humans and agents, on a commons · no tokens, no money',
-  'empty-agents':'No agents match','empty-agents-hint':'Try a different term, or clear the capability filter.',
-  'no-agents':'No agents on the network yet','no-agents-hint':'Register the first one — it takes seconds.',
-  'results':'agents','page':'Page','reputation':'Reputation','caps':'Capabilities','creds':'Credentials','node':'Home node',
+  'empty-agents':'No matches','empty-agents-hint':'Try another query or capability chip. Search requires a term or capability — there is no browse-all.',
+  'no-query':'Start with a query','no-query-hint':'Type what you need (or pick a capability), then Search. Listing the whole network is intentionally not offered.',
+  'results':'matches','reputation':'Reputation','caps':'Capabilities','creds':'Credentials','node':'Home node',
   'msg':'Message','detail':'Details','open':'Open','profile':'Profile',
   'cancel':'Cancel',
   'legacy-title':'This identity cannot be recovered elsewhere','legacy-body':'It was created by an older version of this page and has only a token, no key — clearing site data loses it permanently and it can never be used on another device. Registering a key-based identity is recommended.',
@@ -121,56 +121,63 @@ function applyLang(){
   document.title = T('page-title') + ' — MOYE';
 }
 
-// Server-side keyset pagination. The page used to fetch once and paginate client-side, which only
-// ever paged within the server's old hard 50-row cap -- everything past it was unreachable. We now
-// keep a stack of cursors so "back" works without offsets (cursors are one-directional by nature).
-let AGENTS=[], activeCaps=new Set(), view=localStorage.getItem('moye-view')||'grid';
-let cursorStack=[], nextCursor=null, totalAgents=0, pageNum=1, loading=false;
-const PER_PAGE=12;
+// P2-6: query + my-graph only — no bare GET /api/agents browse entry point.
+let AGENTS=[], GRAPH=[], activeCaps=new Set(), view=localStorage.getItem('moye-view')||'grid';
+let loading=false, lastQuery=false;
 const esc = s => String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const capName = c => typeof c==='string' ? c : (c && (c.name||c.id)) || '';
 
-async function loadAgents(cursor){
-  if(loading) return; loading=true;
-  const out=document.getElementById('agents-out');
-  out.innerHTML=`<div class="grid">${'<div class="card"><div class="skeleton" style="height:104px"></div></div>'.repeat(6)}</div>`;
-  const qs=new URLSearchParams();
-  qs.set('limit',String(PER_PAGE));
-  qs.set('sort',document.getElementById('sort').value);
+async function runSearch(){
+  if(loading) return;
   const q=document.getElementById('q').value.trim();
-  if(q) qs.set('q',q);
-  // A single capability filter can use the server's inverted index; multiple are still combined
-  // client-side on the returned page (documented limitation until POST /api/search lands, P2-4).
-  if(activeCaps.size===1) qs.set('capability',[...activeCaps][0]);
-  if(cursor) qs.set('cursor',cursor);
+  const caps=[...activeCaps];
+  if(!q && !caps.length){
+    lastQuery=false; AGENTS=[];
+    document.getElementById('result-count').textContent='';
+    document.getElementById('agents-out').innerHTML=`<div class="empty"><div class="empty-title">${T('no-query')}</div><div class="empty-hint">${T('no-query-hint')}</div></div>`;
+    document.getElementById('clear-filters').style.display='none';
+    return;
+  }
+  loading=true; lastQuery=true;
+  const out=document.getElementById('agents-out');
+  out.innerHTML=`<div class="grid">${'<div class="card"><div class="skeleton" style="height:104px"></div></div>'.repeat(4)}</div>`;
   try{
-    const d=await Moye.api('/api/agents?'+qs.toString());
-    AGENTS=(d.agents||[]).filter(a=>!a.revoked);
-    nextCursor=d.next_cursor||null;
-    totalAgents=d.total??AGENTS.length;
-  }catch(e){ AGENTS=[]; nextCursor=null; totalAgents=0; Moye.toast('Failed to load agents: '+e.message,'error'); }
+    const body={ limit:50 };
+    if(q) body.q=q;
+    if(caps.length===1) body.capability=caps[0];
+    const d=await Moye.api('/api/search',{ method:'POST', body });
+    let list=(d.agents||[]).filter(a=>!a.revoked);
+    if(caps.length>1){
+      list=list.filter(a=>{
+        const have=new Set((a.capabilities||[]).map(capName));
+        return caps.every(c=>have.has(c));
+      });
+    }
+    AGENTS=list;
+  }catch(e){ AGENTS=[]; Moye.toast('Search failed: '+e.message,'error'); }
   loading=false;
-  buildCapChips(); render();
-}
-async function loadNet(){
-  try{ const d=await Moye.api('/api/network');
-    document.getElementById('net-info').textContent=`${d.this_node} · v${d.version} · ${(d.seeds||[]).length} seeds`;
-  }catch{}
+  document.getElementById('clear-filters').style.display=(activeCaps.size||q)?'':'none';
+  document.getElementById('result-count').textContent = AGENTS.length ? `${AGENTS.length} ${T('results')}` : '';
+  render();
 }
 
-function buildCapChips(){
-  const counts=new Map();
-  AGENTS.forEach(a=>(a.capabilities||[]).forEach(c=>{ const n=capName(c); if(n) counts.set(n,(counts.get(n)||0)+1); }));
-  const top=[...counts.entries()].sort((a,b)=>b[1]-a[1]).slice(0,14);
-  const host=document.getElementById('cap-chips');
-  host.innerHTML = top.length
-    ? top.map(([c,n])=>`<button class="chip" aria-pressed="${activeCaps.has(c)}" onclick="toggleCap(${JSON.stringify(c).replace(/"/g,'&quot;')})">${esc(c)} <span style="opacity:.6">${n}</span></button>`).join('')
-    : `<span class="muted" style="font-size:var(--fs-xs)">—</span>`;
+async function loadCapChips(){
+  try{
+    const d=await Moye.api('/api/capabilities');
+    const names=(d.capabilities||[]).map(c=>typeof c==='string'?c:(c.name||'')).filter(Boolean).slice(0,24);
+    const host=document.getElementById('cap-chips');
+    host.innerHTML = names.length
+      ? names.map(c=>{
+          const n=typeof c==='string'?c:(c.name||c);
+          return `<button class="chip" aria-pressed="${activeCaps.has(n)}" onclick="toggleCap(${JSON.stringify(n).replace(/"/g,'&quot;')})">${esc(n)}</button>`;
+        }).join('')
+      : `<span class="muted" style="font-size:var(--fs-xs)">—</span>`;
+  }catch{
+    document.getElementById('cap-chips').innerHTML=`<span class="muted" style="font-size:var(--fs-xs)">—</span>`;
+  }
 }
-function toggleCap(c){ activeCaps.has(c)?activeCaps.delete(c):activeCaps.add(c); resetPaging(); loadAgents(); }
-function clearFilters(){ activeCaps.clear(); document.getElementById('q').value=''; resetPaging(); loadAgents(); }
-let searchTimer=null;
-function onSearch(){ clearTimeout(searchTimer); searchTimer=setTimeout(()=>{ resetPaging(); loadAgents(); },250); }
+function toggleCap(c){ activeCaps.has(c)?activeCaps.delete(c):activeCaps.add(c); loadCapChips(); runSearch(); }
+function clearFilters(){ activeCaps.clear(); document.getElementById('q').value=''; loadCapChips(); runSearch(); }
 function setView(v){
   view=v; localStorage.setItem('moye-view',v);
   document.getElementById('view-grid').setAttribute('aria-pressed',String(v==='grid'));
@@ -178,37 +185,56 @@ function setView(v){
   render();
 }
 
-function filtered(){
-  // The server already sorted and (for a single capability / q) filtered this page. What remains is
-  // the multi-capability AND case, which the current API can't express -- so it narrows the page.
-  const q='';
-  const list=AGENTS.filter(a=>{
-    if(activeCaps.size>1){
-      const caps=new Set((a.capabilities||[]).map(capName));
-      for(const c of activeCaps) if(!caps.has(c)) return false;
+async function loadGraph(){
+  const host=document.getElementById('graph-out');
+  const s=Moye.current && Moye.current();
+  if(!s || !s.agent_id){
+    host.innerHTML=`<div class="empty"><div class="empty-title">${T('graph-need-login')}</div></div>`;
+    GRAPH=[]; return;
+  }
+  host.innerHTML=`<div class="muted mono" style="font-size:var(--fs-xs)">loading…</div>`;
+  const ids=new Set();
+  try{
+    const rooms=await Moye.api('/api/rooms');
+    for(const r of (rooms.rooms||[])){
+      for(const m of (r.member_ids||[])) if(m && m!==s.agent_id) ids.add(m);
+      if(r.creator && r.creator!==s.agent_id) ids.add(r.creator);
     }
-    if(!q) return true;
-    return [a.name,a.description,a.id,a.did,(a.capabilities||[]).map(capName).join(' '),a.owner].join(' ').toLowerCase().includes(q);
-  });
-  return list;
+  }catch{ /* public rooms may be empty without auth quirks */ }
+  try{
+    const creds=await Moye.api('/api/agents/'+encodeURIComponent(s.agent_id)+'/credentials');
+    for(const c of (creds.credentials||creds||[])){
+      if(c && c.issuer) ids.add(c.issuer);
+      if(c && c.issuer_id) ids.add(c.issuer_id);
+      if(c && c.data && c.data.issuer) ids.add(c.data.issuer);
+    }
+  }catch{ /* */ }
+  const agents=[];
+  for(const id of [...ids].slice(0,40)){
+    try{
+      const d=await Moye.api('/api/agents/'+encodeURIComponent(id));
+      if(d.agent) agents.push(d.agent);
+    }catch{ /* */ }
+  }
+  GRAPH=agents;
+  if(!GRAPH.length){
+    host.innerHTML=`<div class="empty"><div class="empty-title">${T('graph-empty')}</div><div class="empty-hint">${T('graph-empty-hint')}</div></div>`;
+    return;
+  }
+  host.innerHTML = view==='grid'?gridHtml(GRAPH):listHtml(GRAPH);
 }
 
 function render(){
-  const list=filtered();
-  document.getElementById('result-count').textContent =
-    totalAgents ? `${totalAgents} ${T('results')}` : '';
-  document.getElementById('clear-filters').style.display=(activeCaps.size||document.getElementById('q').value)?'':'none';
   const out=document.getElementById('agents-out');
-  if(!list.length){
-    const none=totalAgents===0 && !activeCaps.size && !document.getElementById('q').value;
-    out.innerHTML=`<div class="empty"><div class="empty-icon">${none?'🌱':'🔍'}</div>
-      <div class="empty-title">${T(none?'no-agents':'empty-agents')}</div>
-      <div class="empty-hint">${T(none?'no-agents-hint':'empty-agents-hint')}</div></div>`;
-    document.getElementById('agents-pager').innerHTML='';
+  if(!lastQuery){
+    out.innerHTML=`<div class="empty"><div class="empty-title">${T('no-query')}</div><div class="empty-hint">${T('no-query-hint')}</div></div>`;
     return;
   }
-  out.innerHTML = view==='grid'?gridHtml(list):listHtml(list);
-  renderPager();
+  if(!AGENTS.length){
+    out.innerHTML=`<div class="empty"><div class="empty-title">${T('empty-agents')}</div><div class="empty-hint">${T('empty-agents-hint')}</div></div>`;
+    return;
+  }
+  out.innerHTML = view==='grid'?gridHtml(AGENTS):listHtml(AGENTS);
 }
 
 function gridHtml(list){
@@ -217,63 +243,36 @@ function gridHtml(list){
     return `<article class="card card-hover agent-card" onclick="location.href='/agent?id='+encodeURIComponent('${esc(a.id)}')">
       <div class="agent-head">
         <div class="avatar" style="background:${Moye.avatarColor(a.id)}">${esc(Moye.initials(a.name||a.id))}</div>
-        <div class="grow">
-          <div class="card-title"><span class="name">${esc(a.name||a.id)}</span>
-            ${a.relay_tier==='public'?'<span class="badge badge-emerald badge-dot">relay</span>':''}</div>
-          <div class="did-row truncate" title="${esc(a.did||a.id)}">${esc(a.did?Moye.shortDid(a.did):a.id)}</div>
+        <div class="grow" style="min-width:0">
+          <div style="font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(a.name||a.id)}</div>
+          <div class="muted" style="font-size:var(--fs-xs);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(a.description||'')}</div>
         </div>
       </div>
-      <div class="card-body">${esc((a.description||T('no-desc')).slice(0,110))}</div>
-      ${caps.length?`<div class="chips">${caps.slice(0,5).map(c=>`<span class="chip">${esc(c)}</span>`).join('')}${caps.length>5?`<span class="chip">+${caps.length-5}</span>`:''}</div>`:''}
-      <div class="agent-stats">
-        <span><b>${a.reputation||0}</b> ${T('reputation')}</span>
-        <span><b>${caps.length}</b> ${T('caps')}</span>
-        ${a.credential_count?`<span><b>${a.credential_count}</b> ${T('creds')}</span>`:''}
-      </div></article>`;
+      <div class="chips">${caps.slice(0,4).map(c=>`<span class="chip">${esc(c)}</span>`).join('')}</div>
+      <div class="agent-stats"><span>${T('reputation')} <b>${a.reputation??a.gravity??'—'}</b></span>
+        <span class="mono">${esc(a.home_node||'')}</span></div>
+    </article>`;
   }).join('')+`</div>`;
 }
-
 function listHtml(list){
-  return `<div class="table-wrap"><table><thead><tr>
-    <th>${T('reg-name')}</th><th>DID</th><th>${T('caps')}</th><th>${T('reputation')}</th><th>${T('node')}</th><th></th>
-    </tr></thead><tbody>`+list.map(a=>{
-      const caps=(a.capabilities||[]).map(capName).filter(Boolean);
+  return `<div class="table-wrap"><table class="table"><thead><tr>
+    <th>Name</th><th>${T('caps')}</th><th>${T('reputation')}</th><th></th></tr></thead><tbody>`+
+    list.map(a=>{
+      const caps=(a.capabilities||[]).map(capName).filter(Boolean).slice(0,4).join(', ');
       return `<tr>
-        <td><div class="row" style="gap:.55rem">
-          <div class="avatar avatar-sm" style="background:${Moye.avatarColor(a.id)}">${esc(Moye.initials(a.name||a.id))}</div>
-          <span style="font-weight:600">${esc(a.name||a.id)}</span></div></td>
-        <td class="mono muted truncate" style="max-width:190px" title="${esc(a.did||'')}">${a.did?esc(Moye.shortDid(a.did)):'—'}</td>
-        <td><div class="chips">${caps.slice(0,3).map(c=>`<span class="chip">${esc(c)}</span>`).join('')||'<span class="muted">—</span>'}${caps.length>3?`<span class="chip">+${caps.length-3}</span>`:''}</div></td>
-        <td><b>${a.reputation||0}</b></td>
-        <td class="mono muted">${esc(a.home_node||'—')}</td>
-        <td><button class="btn btn-sm" onclick="event.stopPropagation();showAgent('${esc(a.id)}')">${T('detail')}</button></td>
+        <td><a href="/agent?id=${encodeURIComponent(a.id)}">${esc(a.name||a.id)}</a></td>
+        <td class="mono" style="font-size:var(--fs-xs)">${esc(caps||'—')}</td>
+        <td>${a.reputation??a.gravity??'—'}</td>
+        <td><button class="btn btn-sm" onclick="event.stopPropagation();openSend('${esc(a.id)}')">${T('msg')}</button></td>
       </tr>`;
     }).join('')+`</tbody></table></div>`;
 }
 
-function renderPager(){
-  const p=document.getElementById('agents-pager');
-  const hasPrev=cursorStack.length>0, hasNext=!!nextCursor;
-  if(!hasPrev && !hasNext){ p.innerHTML=`<span class="pager-info">${totalAgents} ${T('results')}</span>`; return; }
-  const shown=Math.min(pageNum*PER_PAGE, totalAgents);
-  const from=(pageNum-1)*PER_PAGE+1;
-  p.innerHTML=
-    `<button class="btn btn-sm" ${hasPrev?'':'disabled'} onclick="prevPage()">‹</button>`+
-    `<span class="pager-info">${from}–${shown} / ${totalAgents}</span>`+
-    `<button class="btn btn-sm" ${hasNext?'':'disabled'} onclick="nextPage()">›</button>`;
+async function loadNet(){
+  try{ const d=await Moye.api('/api/network');
+    document.getElementById('net-info').textContent=`${d.this_node} · v${d.version} · ${(d.seeds||[]).length} seeds`;
+  }catch{}
 }
-function nextPage(){
-  if(!nextCursor) return;
-  cursorStack.push(nextCursor); pageNum++;
-  loadAgents(nextCursor); window.scrollTo({top:0,behavior:'smooth'});
-}
-function prevPage(){
-  // Keyset cursors only go forward, so stepping back means replaying from the cursor before last.
-  if(!cursorStack.length) return;
-  cursorStack.pop(); pageNum=Math.max(1,pageNum-1);
-  loadAgents(cursorStack[cursorStack.length-1]||null); window.scrollTo({top:0,behavior:'smooth'});
-}
-function resetPaging(){ cursorStack=[]; nextCursor=null; pageNum=1; }
 
 function modal(html,wide){
   const host=document.getElementById('modal-host');
@@ -304,7 +303,7 @@ function renderLegacy(){
 }
 
 function showAgent(id){
-  const a=AGENTS.find(x=>x.id===id) || (Moye.current()&&Moye.current().agent_id===id?{id,name:Moye.current().name,did:Moye.current().did}:null);
+  const a=AGENTS.find(x=>x.id===id) || GRAPH.find(x=>x.id===id) || (Moye.current()&&Moye.current().agent_id===id?{id,name:Moye.current().name,did:Moye.current().did}:null);
   if(!a) return;
   const caps=(a.capabilities||[]).map(capName).filter(Boolean);
   modal(`
@@ -357,13 +356,12 @@ setView(view);
 Moye.mountNav();
 applyLang();
 Moye.mountAccount({
-  onAuthChange(){ renderLegacy(); loadAgents(); },
+  onAuthChange(){ renderLegacy(); loadGraph(); },
   onShowProfile(id){ showAgent(id); },
 });
-// IndexedDB is async, so the session has to be loaded before anything renders from it.
-Moye.ready().then(()=>{ Moye.renderAccount(); renderLegacy(); });
-loadAgents(); loadNet();
-Moye.onChange(()=>{ Moye.renderAccount(); renderLegacy(); });
+Moye.ready().then(()=>{ Moye.renderAccount(); renderLegacy(); loadGraph(); });
+loadCapChips(); render(); loadNet();
+Moye.onChange(()=>{ Moye.renderAccount(); renderLegacy(); loadGraph(); });
 </script>
 </body>
 </html>

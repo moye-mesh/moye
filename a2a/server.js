@@ -63,7 +63,7 @@ const RESERVED_SHARED_PREFIXES = ['revoke:', 'reputation:'];
 // soft-fork *signaling* than its activation mechanism (MOYE has no hashpower-equivalent objective
 // threshold; adoption data here is informational, not a trigger that flips anything on by itself).
 const PROTOCOL_VERSION = '1.6';
-const PROTOCOL_FEATURES = ['capability-schema', 'verifiable-credentials', 'message-signing', 'rich-crdt', 'a2a-jsonrpc-bridge', 'portable-address-attestation', 'capability-input-filter', 'seeds-multisig-governance', 'firehose', 'message-attachments', 'room-awaiting', 'node-did-federation-auth', 'room-fork', 'slip0010', 'identity-delegation', 'session-keys', 'resolve-at', 'agent-timeline', 'gravity-search', 'room-mcp'];
+const PROTOCOL_FEATURES = ['capability-schema', 'verifiable-credentials', 'message-signing', 'rich-crdt', 'a2a-jsonrpc-bridge', 'portable-address-attestation', 'capability-input-filter', 'seeds-multisig-governance', 'firehose', 'message-attachments', 'room-awaiting', 'node-did-federation-auth', 'room-fork', 'slip0010', 'identity-delegation', 'session-keys', 'resolve-at', 'agent-timeline', 'gravity-search', 'room-mcp', 'shard-route', 'query-directory'];
 
 // Broadcast a newly-registered agent to peer nodes immediately (doesn't wait for the 15s reconcile cycle)
 function announceToPeers(agent) {
@@ -1693,12 +1693,69 @@ function findShardPeerHint(agentId) {
   }
   return null;
 }
-app.get('/api/agents/:id', async (req, res) => {
-  const a = store.getAgent(req.params.id);
-  if (!a) {
-    const hint = findShardPeerHint(req.params.id);
+
+// P2-3: on local miss, 307 or proxy to a peer that serves the agent's shard (client-transparent when
+// clients follow redirects / when using proxy mode). NUM_SHARDS=1 → no-op (hint stays null).
+async function shardMissResponse(req, res, agentId) {
+  const hops = parseInt(req.headers['x-moye-shard-hops'] || '0', 10) || 0;
+  const hint = findShardPeerHint(agentId);
+  if (!hint || !hint.peer_endpoint) {
     return res.status(404).json({ success: false, error: 'agent not found on this node', hint });
   }
+  if (hops >= shard.FORWARD_MAX_HOPS || shard.ROUTE_MODE === 'hint') {
+    return res.status(404).json({ success: false, error: 'agent not found on this node', hint });
+  }
+  const destPath = req.originalUrl || req.url || `/api/agents/${encodeURIComponent(agentId)}`;
+  const location = hint.peer_endpoint.replace(/\/$/, '') + destPath.replace(/^\/a2a/, '');
+  // Prefer absolute /api/... on peer (peers expose a2a root without /a2a prefix usually)
+  const peerUrl = hint.peer_endpoint.replace(/\/$/, '') + `/api/agents/${encodeURIComponent(agentId)}`;
+
+  if (shard.ROUTE_MODE === '307') {
+    res.setHeader('Location', peerUrl);
+    res.setHeader('X-Moye-Shard', String(hint.shard));
+    res.setHeader('X-Moye-Shard-Peer', hint.peer_id || '');
+    return res.status(307).json({
+      success: false, error: 'redirect to shard peer', hint, location: peerUrl,
+    });
+  }
+  // proxy mode
+  try {
+    const u = new URL(peerUrl);
+    const lib = u.protocol === 'https:' ? require('https') : http;
+    const proxied = await new Promise((resolve, reject) => {
+      const r = lib.request({
+        hostname: u.hostname, port: u.port || (u.protocol === 'https:' ? 443 : 80),
+        path: u.pathname + u.search, method: 'GET',
+        headers: {
+          Accept: req.headers.accept || 'application/json',
+          'X-Moye-Shard-Hops': String(hops + 1),
+        },
+        timeout: shard.FORWARD_TIMEOUT_MS,
+      }, (pr) => {
+        let buf = '';
+        pr.on('data', (c) => { buf += c; });
+        pr.on('end', () => resolve({ status: pr.statusCode, headers: pr.headers, body: buf }));
+      });
+      r.on('error', reject);
+      r.on('timeout', () => { r.destroy(); reject(new Error('shard forward timeout')); });
+      r.end();
+    });
+    res.status(proxied.status || 502);
+    res.setHeader('X-Moye-Shard-Proxied', hint.peer_id || '');
+    const ct = proxied.headers && proxied.headers['content-type'];
+    if (ct) res.setHeader('Content-Type', ct);
+    return res.send(proxied.body);
+  } catch (e) {
+    return res.status(404).json({
+      success: false, error: 'agent not found on this node', hint,
+      forward_error: e.message || String(e),
+    });
+  }
+}
+
+app.get('/api/agents/:id', async (req, res) => {
+  const a = store.getAgent(req.params.id);
+  if (!a) return shardMissResponse(req, res, req.params.id);
   // P1-4 content negotiation (subset): same resource, markdown for LLM clients.
   const accept = (req.headers.accept || '').toString();
   if (accept.includes('text/markdown') && !accept.includes('application/json')) {
@@ -3240,7 +3297,16 @@ app.get(['/api/network', '/.well-known/moye-net'], async (req, res) => {
     // holds the full directory, exactly like every node before sharding existed -- nothing to
     // change for today's small deployments. A client/SDK doing agent lookups can use this to decide
     // whether it needs to fan out to multiple nodes for full-network coverage.
-    sharding: { num_shards: shard.NUM_SHARDS, served_shards: shard.servedShardsList() },
+    sharding: {
+      num_shards: shard.NUM_SHARDS,
+      served_shards: shard.servedShardsList(),
+      // P2-3 routing surface — all values estimated, no real load data as of 2026-08-06
+      route_mode: shard.ROUTE_MODE,
+      forward_timeout_ms: shard.FORWARD_TIMEOUT_MS,
+      forward_max_hops: shard.FORWARD_MAX_HOPS,
+      query_fanout_max: shard.QUERY_FANOUT_MAX,
+      enable_shard_dht: shard.ENABLE_SHARD_DHT,
+    },
     ipfs_root_cid: store._rootCid() || null,
     // true when no operator-issued invite code is required, i.e. anyone can register by
     // clearing the automatic PoW challenge or bringing their own DID pubkey -- NOT "no
@@ -3255,6 +3321,9 @@ app.get(['/api/network', '/.well-known/moye-net'], async (req, res) => {
       // ADR-0013: live event stream — SSE for browsers/agents, NDJSON for indexers/CLIs.
       // Query: ?types=agent.register,room.message&did=did:moye:...  (both optional filters).
       firehose: '/api/stream  (SSE) | /api/stream.ndjson  (NDJSON); disable with ENABLE_FIREHOSE=0',
+      // P2-5: optional L2 indexer URLs (operators run tools/moye-indexer.js). Empty until configured.
+      // estimated INDEXER_* tunables live on the indexer process, not this node.
+      indexers: (process.env.INDEXER_URLS || '').split(',').map((s) => s.trim()).filter(Boolean),
       search: '/api/search  (POST {q, capability, min_reputation, claim_type, limit}; gravity-ranked)',
       verbs: '/api/verbs',
       room_fork: '/api/rooms/:id/fork  (POST {checkpoint_id,name})',
@@ -3320,6 +3389,17 @@ server.listen(PORT, async () => {
     await p2pRelay.init().catch(e => console.log('[p2p-relay] failed to start:', e.message));
   } else {
     console.log('[p2p-relay] not enabled (set ENABLE_P2P=1 to force-enable, or AUTO_ENABLE_P2P=1 to auto-enable after a peer-verified reachability check)');
+  }
+  // P2-3: optional DHT announce of shard:<n> ownership (ADR-0008 gap). estimated, no real load data.
+  if (shard.ENABLE_SHARD_DHT && enableP2p) {
+    const served = shard.servedShardsList();
+    const list = served === 'all'
+      ? Array.from({ length: shard.NUM_SHARDS }, (_, i) => i)
+      : (Array.isArray(served) ? served : [0]);
+    for (const n of list) {
+      p2pRelay.provideShard(n).catch(() => {});
+    }
+    console.log(`[shard-dht] providing ${list.length} shard key(s) (ENABLE_SHARD_DHT=1)`);
   }
   // Auto-anchoring: the hash-chain ledger is only "tamper-evident" against a wholesale rewrite by
   // the node operator to the extent its Merkle root is periodically pinned to an external, immutable

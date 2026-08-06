@@ -239,6 +239,16 @@ async function provideDid(did) {
     return false;
   }
 }
+
+// P2-3 / ADR-0008 gap: announce this node as a provider for shard:<n> so peers can discover
+// ownership without relying solely on federation_nodes SQLite. Best-effort; ENABLE_SHARD_DHT gates callers.
+async function provideShard(shardNum) {
+  return provideDid(`shard:${shardNum}`);
+}
+async function findProvidersForShard(shardNum) {
+  return findProvidersForDid(`shard:${shardNum}`);
+}
+
 // Looks up which node(s) currently provide `did` via the DHT. Returns [] (not an error) if DHT is
 // off, times out, or nothing is found -- callers should treat this as "try the ledger-anchored
 // resolve instead", never as a hard failure.
@@ -287,4 +297,7 @@ function info() {
   };
 }
 
-module.exports = { init, info, reachabilityHint, provideDid, findProvidersForDid, node: () => node };
+module.exports = {
+  init, info, reachabilityHint, provideDid, findProvidersForDid,
+  provideShard, findProvidersForShard, node: () => node,
+};

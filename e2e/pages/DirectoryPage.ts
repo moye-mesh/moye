@@ -64,7 +64,15 @@ export class DirectoryPage extends BasePage {
     return this.agentGrid.locator('.agent-card, .card', { hasText: name });
   }
 
+  /** P2-6: no browse-all — the directory only ever shows search/graph results, so finding a
+   * just-registered agent requires searching for it (by name here). */
+  async search(query: string) {
+    await this.page.locator('#q').fill(query);
+    await this.page.locator('#btn-search').click();
+  }
+
   async waitForAgentVisible(name: string) {
+    await this.search(name);
     await expect(this.agentCard(name)).toBeVisible({ timeout: 15000 });
   }
 }
