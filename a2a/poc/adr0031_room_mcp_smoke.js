@@ -96,7 +96,7 @@ function parseTool(rpc) {
     // intact rather than pinning an exact list -- but it still fails loudly if the surface grows
     // beyond the room verb table, which ADR-0031 §2.2 deliberately scopes it to.
     const baseline = ['room_changes', 'room_messages', 'room_resolve', 'room_send', 'room_watch'];
-    const allowed = new Set([...baseline, 'room_awaiting']);
+    const allowed = new Set([...baseline, 'room_awaiting', 'room_catchup']);
     for (const want of baseline) {
       assert(names.includes(want), `tools/list missing ${want}: ` + names.join(','));
     }

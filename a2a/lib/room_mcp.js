@@ -8,6 +8,7 @@
 const crypto = require('crypto');
 const roomAwaiting = require('./room_awaiting');
 const roomRead = require('./room_read');
+const roomCatchup = require('./room_catchup');
 
 const PROTOCOL_VERSION_LEGACY = '2025-03-26';
 const PROTOCOL_VERSION_STATELESS = '2026-07-28';
@@ -139,8 +140,16 @@ function toolsList(roomId) {
     },
     {
       name: 'room_awaiting',
-      description: `List open asks that still concern the authenticated agent in this room (MRTR-friendly).`,
+      description: `List open asks that still concern the authenticated agent in this room (MRTR-friendly). Includes overdue/due_in_ms (R22).`,
       inputSchema: { type: 'object', properties: {} },
+    },
+    {
+      name: 'room_catchup',
+      description: 'Cross-room wake catchup for the authenticated agent (ADR-0037 R21): room deltas since a cursor, open asks awaiting you, overdue subset, and an explicit next_cursor. Prefer this over separate changes+awaiting round-trips.',
+      inputSchema: {
+        type: 'object',
+        properties: { since: { type: 'number', description: 'ms cursor from a prior next_cursor (default 0)' } },
+      },
     },
   ];
   // Deterministic order for client caching (2026-07-28 SHOULD).
@@ -315,17 +324,39 @@ function mount(app, deps) {
       }));
     }
     if (name === 'room_awaiting') {
-      const open = (typeof materializeRoomAwaiting === 'function'
-        ? materializeRoomAwaiting(room.id)
-        : []).filter((ask) => roomAwaiting.askConcernsAgent(ask, me.id, me, room));
+      const now = Date.now();
+      const open = roomAwaiting.annotateDeadlines(
+        (typeof materializeRoomAwaiting === 'function'
+          ? materializeRoomAwaiting(room.id)
+          : []).filter((ask) => roomAwaiting.askConcernsAgent(ask, me.id, me, room)),
+        now,
+      );
       if (open.length === 1) return askAsInputRequired(open[0], me);
       if (open.length > 1) {
         // Degrade: primary MRTR for first; list others in extension meta
         const primary = askAsInputRequired(open[0], me);
         primary._meta[MOYE_ROOM_EXTENSION].additional_asks = open.slice(1).map((x) => x.id);
+        primary._meta[MOYE_ROOM_EXTENSION].overdue_ids = open.filter((x) => x.overdue).map((x) => x.id);
         return primary;
       }
-      return toolComplete({ room_id: room.id, awaiting: [] });
+      return toolComplete({ room_id: room.id, as_of: now, awaiting: [] });
+    }
+    if (name === 'room_catchup') {
+      const agent = store.getAgent(me.id) || { id: me.id, did: me.did || null, capabilities: me.capabilities || [] };
+      const since = a.since != null ? Number(a.since) : 0;
+      const payload = roomCatchup.buildCatchup({
+        agent,
+        since,
+        listRooms: () => store.listRooms(),
+        isRoomMember,
+        getShared: (k) => store.getShared(k),
+        roomChatKey,
+        getSharedMaterialMeta: (v) => (typeof store.getSharedMaterialMeta === 'function'
+          ? store.getSharedMaterialMeta(v) : null),
+        materializeRoomAwaiting: materializeRoomAwaiting || (() => []),
+        now: Date.now(),
+      });
+      return toolComplete(payload);
     }
     if (name === 'room_messages') {
       if (room.visibility === 'private' && !canReadRoom(room, me.id)) {

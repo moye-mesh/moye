@@ -19,11 +19,12 @@ const firehose = require('./lib/firehose'); // ADR-0013: SSE/NDJSON live event s
 const a2aTaskStream = require('./lib/a2a_task_stream'); // ADR-0030: per-task SSE for tasks/resubscribe
 const roomMcp = require('./lib/room_mcp');           // ADR-0031: room-as-MCP-server (Streamable HTTP)
 const roomAwaiting = require('./lib/room_awaiting'); // ADR-0027 D1/D3: multi-target + capability ask
+const roomCatchup = require('./lib/room_catchup');   // ADR-0037 R21: cross-room catchup
+const roomRead = require('./lib/room_read');         // R20: memoized catch-up + binary since slice
 const attachments = require('./lib/attachments'); // N1: CID attachment metadata
 const verbs = require('./lib/verbs');             // ADR-0013: unified verb table
 const domainVerify = require('./lib/domain_verify'); // P4-4: _moye.<domain> TXT → verified name
 const mnemonicLib = require('./lib/mnemonic');       // P4-3: BIP-39 (exported for tests/tools)
-const roomRead = require('./lib/room_read');         // R20: memoized catch-up + binary since slice
 const path = require('path');
 
 // Fan every ledger append into the firehose (metadata only — ledger never stores plaintext bodies).
@@ -66,7 +67,7 @@ const RESERVED_SHARED_PREFIXES = ['revoke:', 'reputation:'];
 // soft-fork *signaling* than its activation mechanism (MOYE has no hashpower-equivalent objective
 // threshold; adoption data here is informational, not a trigger that flips anything on by itself).
 const PROTOCOL_VERSION = '1.6';
-const PROTOCOL_FEATURES = ['capability-schema', 'verifiable-credentials', 'message-signing', 'rich-crdt', 'a2a-jsonrpc-bridge', 'portable-address-attestation', 'capability-input-filter', 'seeds-multisig-governance', 'firehose', 'message-attachments', 'room-awaiting', 'node-did-federation-auth', 'room-fork', 'slip0010', 'identity-delegation', 'session-keys', 'resolve-at', 'agent-timeline', 'gravity-search', 'room-mcp', 'shard-route', 'query-directory', 'room-state-staleness', 'room-mcp-mrtr', 'room-pinning', 'room-consolidate', 'mnemonic-identity', 'domain-verify', 'room-read-cache'];
+const PROTOCOL_FEATURES = ['capability-schema', 'verifiable-credentials', 'message-signing', 'rich-crdt', 'a2a-jsonrpc-bridge', 'portable-address-attestation', 'capability-input-filter', 'seeds-multisig-governance', 'firehose', 'message-attachments', 'room-awaiting', 'node-did-federation-auth', 'room-fork', 'slip0010', 'identity-delegation', 'session-keys', 'resolve-at', 'agent-timeline', 'gravity-search', 'room-mcp', 'shard-route', 'query-directory', 'room-state-staleness', 'room-mcp-mrtr', 'room-pinning', 'room-consolidate', 'mnemonic-identity', 'domain-verify', 'room-read-cache', 'agent-catchup', 'ask-deadline'];
 
 // Broadcast a newly-registered agent to peer nodes immediately (doesn't wait for the 15s reconcile cycle)
 function announceToPeers(agent) {
@@ -584,6 +585,7 @@ function sessionScopeForRequest(req) {
   if (method === 'POST' && /^\/api\/messages\/[^/]+\/ack$/.test(path)) return 'inbox';
   if (method === 'GET' && /^\/api\/agents\/[^/]+\/inbox$/.test(path)) return 'inbox';
   if (method === 'GET' && /^\/api\/agents\/[^/]+\/awaiting$/.test(path)) return 'inbox';
+  if (method === 'GET' && /^\/api\/agents\/[^/]+\/catchup$/.test(path)) return 'inbox';
   if (method === 'POST' && path === '/api/rooms') return 'room.create';
   if (method === 'POST' && /^\/api\/rooms\/[^/]+\/join$/.test(path)) return 'room.join';
   if (method === 'POST' && /^\/api\/rooms\/[^/]+\/messages$/.test(path)) return 'room.post';
@@ -2304,24 +2306,57 @@ app.get('/api/rooms/:id/awaiting/:who', async (req, res) => {
   }
   const who = req.params.who;
   const whoAgent = store.getAgent(who) || { id: who, did: who.startsWith('did:') ? who : null };
-  const open = materializeRoomAwaiting(room.id).filter((m) => roomAwaiting.askConcernsAgent(m, who, whoAgent, room));
-  ok(res, { room_id: room.id, who, awaiting: open });
+  const now = Date.now();
+  const open = roomAwaiting.annotateDeadlines(
+    materializeRoomAwaiting(room.id).filter((m) => roomAwaiting.askConcernsAgent(m, who, whoAgent, room)),
+    now,
+  );
+  ok(res, { room_id: room.id, who, as_of: now, awaiting: open });
 });
 
 // Cross-room: everything currently awaiting this agent (by id or did).
 app.get('/api/agents/:id/awaiting', async (req, res) => {
   const agent = store.getAgent(req.params.id);
   if (!agent) return fail(res, 404, 'agent not found');
+  const now = Date.now();
   const items = [];
   for (const room of store.listRooms()) {
     if (room.visibility === 'private' && !canReadRoom(room, agent.id)) continue;
     for (const m of materializeRoomAwaiting(room.id)) {
       if (roomAwaiting.askConcernsAgent(m, agent.id, agent, room) || roomAwaiting.askConcernsAgent(m, agent.did, agent, room)) {
-        items.push({ room_id: room.id, room_name: room.name, ask: m });
+        items.push({
+          room_id: room.id, room_name: room.name,
+          ask: roomAwaiting.annotateDeadline(m, now),
+        });
       }
     }
   }
-  ok(res, { agent_id: agent.id, did: agent.did || null, awaiting: items });
+  ok(res, {
+    agent_id: agent.id, did: agent.did || null, as_of: now, awaiting: items,
+    overdue: items.filter((x) => x.ask && x.ask.overdue),
+  });
+});
+
+// ADR-0037 R21: one-shot cross-room catchup for a waking agent (self only).
+app.get('/api/agents/:id/catchup', async (req, res) => {
+  const me = await authAgent(req);
+  if (!me) return fail(res, 401, 'Bearer token or DID sig required');
+  if (me.id !== req.params.id) return fail(res, 403, 'identity mismatch');
+  const agent = store.getAgent(me.id);
+  if (!agent) return fail(res, 404, 'agent not found');
+  const since = parseInt(req.query.since, 10) || 0;
+  const payload = roomCatchup.buildCatchup({
+    agent,
+    since,
+    listRooms: () => store.listRooms(),
+    isRoomMember,
+    getShared: (k) => store.getShared(k),
+    roomChatKey,
+    getSharedMaterialMeta: (v) => store.getSharedMaterialMeta(v),
+    materializeRoomAwaiting,
+    now: Date.now(),
+  });
+  ok(res, payload);
 });
 
 // ---- ADR-0018 R2: room state document (single current snapshot, CRDT LWW) ----

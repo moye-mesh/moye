@@ -409,6 +409,19 @@ class Agent {
     return r.messages.slice(0, limit);
   }
 
+  // ADR-0037 R21: cross-room catchup — rooms I am in + awaiting me + overdue + explicit next_cursor.
+  async catchup(since = 0) {
+    if (!this.agentId) throw new MoyeError('agent not registered');
+    const path = `/api/agents/${this.agentId}/catchup?since=${encodeURIComponent(String(since || 0))}`;
+    return request(this.baseUrl, 'GET', path, null, this._headers(this._didHeadersForGet(`/api/agents/${this.agentId}/catchup`)));
+  }
+
+  async awaiting() {
+    if (!this.agentId) throw new MoyeError('agent not registered');
+    const path = `/api/agents/${this.agentId}/awaiting`;
+    return request(this.baseUrl, 'GET', path, null, this._headers(this._didHeadersForGet(path)));
+  }
+
   async ack(messageId, status = 'done') {
     const payload = { status };
     await request(this.baseUrl, 'POST', `/api/messages/${messageId}/ack`, payload, this._headers(this._didHeaders(payload)));

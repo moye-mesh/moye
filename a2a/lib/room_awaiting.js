@@ -167,6 +167,29 @@ function askConcernsAgent(ask, who, agent, room) {
 }
 
 /**
+ * R22 (ADR-0037): read-time deadline fields from ask.by (ms epoch). No scheduler.
+ * overdue / due_in_ms are null-ish when by is absent; overdue is boolean when by is set.
+ */
+function annotateDeadline(ask, nowMs = Date.now()) {
+  if (!ask || typeof ask !== 'object') return ask;
+  const byRaw = ask.by;
+  if (byRaw == null || byRaw === '') {
+    return { ...ask, overdue: false, due_in_ms: null };
+  }
+  const by = Number(byRaw);
+  if (!Number.isFinite(by) || by <= 0) {
+    return { ...ask, overdue: false, due_in_ms: null };
+  }
+  const due_in_ms = Math.floor(by) - Number(nowMs);
+  return { ...ask, by: Math.floor(by), overdue: due_in_ms < 0, due_in_ms };
+}
+
+function annotateDeadlines(asks, nowMs = Date.now()) {
+  if (!Array.isArray(asks)) return [];
+  return asks.map((a) => annotateDeadline(a, nowMs));
+}
+
+/**
  * Validate ask body fields. Returns { ok, error, awaiting, awaiting_capability } or { ok:false, error, status }.
  */
 function normalizeAskTargets(awaitingWho, awaitingCapability) {
@@ -209,6 +232,8 @@ module.exports = {
   agentHasCapability,
   materializeRoomAwaiting,
   askConcernsAgent,
+  annotateDeadline,
+  annotateDeadlines,
   normalizeAskTargets,
   eligibleForCapabilityAsk,
 };
