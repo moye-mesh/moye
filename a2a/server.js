@@ -23,6 +23,7 @@ const attachments = require('./lib/attachments'); // N1: CID attachment metadata
 const verbs = require('./lib/verbs');             // ADR-0013: unified verb table
 const domainVerify = require('./lib/domain_verify'); // P4-4: _moye.<domain> TXT → verified name
 const mnemonicLib = require('./lib/mnemonic');       // P4-3: BIP-39 (exported for tests/tools)
+const roomRead = require('./lib/room_read');         // R20: memoized catch-up + binary since slice
 const path = require('path');
 
 // Fan every ledger append into the firehose (metadata only — ledger never stores plaintext bodies).
@@ -65,7 +66,7 @@ const RESERVED_SHARED_PREFIXES = ['revoke:', 'reputation:'];
 // soft-fork *signaling* than its activation mechanism (MOYE has no hashpower-equivalent objective
 // threshold; adoption data here is informational, not a trigger that flips anything on by itself).
 const PROTOCOL_VERSION = '1.6';
-const PROTOCOL_FEATURES = ['capability-schema', 'verifiable-credentials', 'message-signing', 'rich-crdt', 'a2a-jsonrpc-bridge', 'portable-address-attestation', 'capability-input-filter', 'seeds-multisig-governance', 'firehose', 'message-attachments', 'room-awaiting', 'node-did-federation-auth', 'room-fork', 'slip0010', 'identity-delegation', 'session-keys', 'resolve-at', 'agent-timeline', 'gravity-search', 'room-mcp', 'shard-route', 'query-directory', 'room-state-staleness', 'room-mcp-mrtr', 'room-pinning', 'room-consolidate', 'mnemonic-identity', 'domain-verify'];
+const PROTOCOL_FEATURES = ['capability-schema', 'verifiable-credentials', 'message-signing', 'rich-crdt', 'a2a-jsonrpc-bridge', 'portable-address-attestation', 'capability-input-filter', 'seeds-multisig-governance', 'firehose', 'message-attachments', 'room-awaiting', 'node-did-federation-auth', 'room-fork', 'slip0010', 'identity-delegation', 'session-keys', 'resolve-at', 'agent-timeline', 'gravity-search', 'room-mcp', 'shard-route', 'query-directory', 'room-state-staleness', 'room-mcp-mrtr', 'room-pinning', 'room-consolidate', 'mnemonic-identity', 'domain-verify', 'room-read-cache'];
 
 // Broadcast a newly-registered agent to peer nodes immediately (doesn't wait for the 15s reconcile cycle)
 function announceToPeers(agent) {
@@ -2523,7 +2524,11 @@ app.get('/api/rooms/:id/changes', async (req, res) => {
     if (!me || !canReadRoom(room, me.id)) return fail(res, 403, 'private room: membership required');
   }
   const since = parseInt(req.query.since, 10) || 0;
-  const msgs = (store.getShared(roomChatKey(room.id)) || []).filter((m) => (m.ts || 0) > since);
+  const all = store.getShared(roomChatKey(room.id)) || [];
+  const meta = store.getSharedMaterialMeta(all);
+  const msgs = roomRead.messagesSince(all, since, {
+    knownSorted: meta && meta.tsSorted === true ? true : null,
+  });
   const awaiting_now = materializeRoomAwaiting(room.id);
   ok(res, {
     room_id: room.id, since,

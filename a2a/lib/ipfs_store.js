@@ -41,6 +41,17 @@ let capabilityIndex = new Map();
 const agentLru = new Map();
 const roomLru = new Map();
 const sharedLru = new Map();
+// R20: memoize crdt.read() materialization per shared key. Invalidated when the backing row
+// object changes (putShared) or the key is LRU-evicted. Read-heavy room catch-up goes from
+// O(n) rebuild per request to amortized O(1).
+const readCache = new Map(); // key -> { row, value }
+// WeakMap so callers can ask whether a materialized array is ts-sorted without re-scanning.
+const materialMeta = new WeakMap(); // array -> { tsSorted: boolean }
+
+function invalidateReadCache(key) {
+  if (key == null) readCache.clear();
+  else readCache.delete(key);
+}
 
 function touchAgent(id, obj) {
   if (agentLru.has(id)) agentLru.delete(id);
@@ -70,6 +81,7 @@ function touchShared(key, obj) {
     const oldest = sharedLru.keys().next().value;
     sharedLru.delete(oldest);
     delete state.shared[oldest];
+    invalidateReadCache(oldest);
   }
 }
 function indexAgent(id, obj) {
@@ -530,6 +542,7 @@ async function putShared(key, value, lamport, writer) {
     const base = cur && crdt.isCrdt(cur.value) && cur.value.crdt === value.crdt ? cur.value : {};
     const merged = crdt.merge(value.crdt, base, value) || value;
     const row = { value: merged, lamport: Math.max(L, cur ? cur.lamport : 0), owner: W };
+    invalidateReadCache(key);
     touchShared(key, row);
     spill.putShared(key, row);
     await commitShared(key);
@@ -537,6 +550,7 @@ async function putShared(key, value, lamport, writer) {
   }
   if (!cur || L > cur.lamport || (L === cur.lamport && W > (cur.owner || ''))) {
     const row = { value, lamport: L, owner: W };
+    invalidateReadCache(key);
     touchShared(key, row);
     spill.putShared(key, row);
     await commitShared(key);
@@ -550,6 +564,7 @@ async function putShared(key, value, lamport, writer) {
 // below, which already materializes via crdt.read(). Any caller of getShared() on a CRDT key got the
 // wrong shape. crdt.read() is the identity function for anything without a recognized `crdt` tag, so
 // this is a no-op for every existing non-CRDT caller (repKey/vcKey/revoke: etc.) -- pure bug fix.
+// R20: memoize materialization; row-identity check means putShared automatically misses the cache.
 function getShared(key) {
   let row = state.shared[key];
   if (!row) {
@@ -558,7 +573,23 @@ function getShared(key) {
   } else {
     touchShared(key, row);
   }
-  return row ? crdt.read(row.value) : null;
+  if (!row) return null;
+  const hit = readCache.get(key);
+  if (hit && hit.row === row) return hit.value;
+  const value = crdt.read(row.value);
+  if (Array.isArray(value)) {
+    // RGA merge sorts by (elem.ts, id); materialization preserves that order. Other shapes are
+    // not assumed sorted — callers must verify or fall back (see lib/room_read.js).
+    materialMeta.set(value, { tsSorted: !!(row.value && row.value.crdt === 'rga') });
+  }
+  readCache.set(key, { row, value });
+  return value;
+}
+
+/** Optional metadata for a value previously returned by getShared (WeakMap; GC-safe). */
+function getSharedMaterialMeta(value) {
+  if (value == null || typeof value !== 'object') return null;
+  return materialMeta.get(value) || null;
 }
 // F4: materialize CRDT values to their readable form (counter->number, orset->array); untagged
 // values pass through unchanged (crdt.read is identity for anything without a known crdt tag).
@@ -596,7 +627,7 @@ module.exports = {
   putAgent, getAgent, getAgentByDid, listAgents, listAgentsByCapability, capabilityCounts, removeAgent,
   agentLamport, agentLwwWins,
   putRoom, getRoom, listRooms, removeRoom,
-  putShared, getShared, allShared, allAgentIds, isTombstoned,
+  putShared, getShared, getSharedMaterialMeta, allShared, allAgentIds, isTombstoned,
   getTombstones: serializeTombstones, mergeTombstones: loadTombstones,
   addBytes, catBytes,
   _raw, _rootCid: () => rootCid, _cids, _tombstones,

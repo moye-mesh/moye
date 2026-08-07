@@ -7,6 +7,7 @@
  */
 const crypto = require('crypto');
 const roomAwaiting = require('./room_awaiting');
+const roomRead = require('./room_read');
 
 const PROTOCOL_VERSION_LEGACY = '2025-03-26';
 const PROTOCOL_VERSION_STATELESS = '2026-07-28';
@@ -339,9 +340,12 @@ function mount(app, deps) {
         return toolError('private room: membership required');
       }
       const since = Number(a.since) || 0;
-      const msgs = (store.getShared(roomChatKey(room.id)) || [])
-        .filter((m) => (m.ts || 0) > since)
-        .slice(0, 200);
+      const all = store.getShared(roomChatKey(room.id)) || [];
+      const meta = typeof store.getSharedMaterialMeta === 'function'
+        ? store.getSharedMaterialMeta(all) : null;
+      const msgs = roomRead.messagesSince(all, since, {
+        knownSorted: meta && meta.tsSorted === true ? true : null,
+      }).slice(0, 200);
       return toolComplete({ room_id: room.id, since, messages: msgs, new_messages: msgs.length });
     }
     if (name === 'room_watch') {
