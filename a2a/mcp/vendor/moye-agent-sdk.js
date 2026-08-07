@@ -21,6 +21,14 @@ const { URL } = require('url');
 
 class MoyeError extends Error {}
 
+// P4-3 mnemonic/Shamir support lives in a2a/lib/ (not distributed under /sdk-dist), so it's
+// required lazily — the rest of this SDK must keep working for a standalone single-file
+// download even though these specific methods can't, yet.
+let _mnemonicLib = null;
+function mnemonicLib() { return _mnemonicLib || (_mnemonicLib = require('../../lib/mnemonic')); }
+let _shamirLib = null;
+function shamirLib() { return _shamirLib || (_shamirLib = require('../../lib/shamir')); }
+
 function request(baseUrl, method, path, data, headers, timeoutMs) {
   return new Promise((resolve, reject) => {
     const url = new URL(baseUrl.replace(/\/$/, '') + path);
@@ -67,14 +75,46 @@ class Agent {
   }
 
   // ---------- DID ----------
+  // P4-3: NEW identities only. Existing randomly generated keys cannot be retrofitted to a mnemonic.
+  static generateMnemonic(strength = 256) {
+    return mnemonicLib().generateMnemonic(strength);
+  }
+
+  static existingIdentityMnemonicNote() {
+    return mnemonicLib().EXISTING_IDENTITY_NOTE;
+  }
+
+  /**
+   * Load identity from a BIP-39 mnemonic (deterministic Ed25519 via SLIP-0010 m/10086'/0').
+   * Cannot recover an already-registered random-key identity from a newly invented mnemonic.
+   */
+  fromMnemonic(mnemonic, passphrase = '') {
+    const d = mnemonicLib().deriveFromMnemonic(mnemonic, passphrase);
+    this._priv = d.privateKeyPem;
+    this.did = d.did;
+    this._fromMnemonic = true;
+    return this.did;
+  }
+
+  /** Shamir 2-of-3 (threshold = floor(n/2)+1) over the mnemonic UTF-8 bytes. */
+  static splitMnemonic(mnemonic, n = 3) {
+    return mnemonicLib().splitMnemonic(mnemonic, n);
+  }
+
+  static combineMnemonic(shares) {
+    return mnemonicLib().combineMnemonic(shares);
+  }
+
   generateIdentity() {
     const { privateKey, publicKey } = crypto.generateKeyPairSync('ed25519');
     this._priv = privateKey.export({ type: 'pkcs8', format: 'pem' });
+    this._fromMnemonic = false;
     return this._deriveDid(publicKey.export({ type: 'spki', format: 'pem' }));
   }
 
   fromPrivateKey(pem) {
     this._priv = pem;
+    this._fromMnemonic = false;
     const pub = crypto.createPublicKey(pem).export({ type: 'spki', format: 'pem' });
     return this._deriveDid(pub);
   }
@@ -450,6 +490,61 @@ class Agent {
     this._roomSecrets[roomId] = secret;
   }
 
+  // ---- R17 (ADR-0034): voluntary ciphertext pinning — default OFF ----
+  // Pins CIDs the agent already holds (message attachments). Ciphertext only; never plaintext.
+  // Opt-in per room; listPinnedCids() makes resource use visible (Grok Build lesson).
+  enableRoomPinning(roomId, { on = true } = {}) {
+    this._roomPinning = this._roomPinning || {};
+    if (on) this._roomPinning[roomId] = { enabled: true, cids: new Set(this._roomPinning[roomId]?.cids || []) };
+    else delete this._roomPinning[roomId];
+    return { room_id: roomId, enabled: !!on };
+  }
+
+  listPinnedCids(roomId = null) {
+    const out = {};
+    for (const [rid, st] of Object.entries(this._roomPinning || {})) {
+      if (roomId && rid !== roomId) continue;
+      out[rid] = { enabled: !!st.enabled, cids: [...(st.cids || [])] };
+    }
+    return out;
+  }
+
+  /**
+   * Scan room messages for attachment CIDs marked encrypted (or any CID when room is private /
+   * message.encrypted). Records them locally when pinning is enabled for the room.
+   * Does not upload or re-fetch bytes — only tracks CIDs already present on the messages.
+   */
+  async pinRoomCiphertext(roomId, { limit = 200 } = {}) {
+    if (!this._roomPinning || !this._roomPinning[roomId] || !this._roomPinning[roomId].enabled) {
+      throw new MoyeError('room pinning is OFF for this room — call enableRoomPinning(roomId) first');
+    }
+    const msgs = await this.roomMessages(roomId, limit);
+    const added = [];
+    for (const m of msgs) {
+      const atts = m.attachments || [];
+      for (const a of atts) {
+        if (!a || !a.cid) continue;
+        // Ciphertext only: require attachment.encrypted or parent message encrypted.
+        if (!a.encrypted && !m.encrypted) continue;
+        if (!this._roomPinning[roomId].cids.has(a.cid)) {
+          this._roomPinning[roomId].cids.add(a.cid);
+          added.push(a.cid);
+        }
+      }
+    }
+    // Visible announce (optional server registry) — no self-reported contribution counters.
+    if (added.length) {
+      try {
+        const payload = { cids: added };
+        await request(
+          this.baseUrl, 'POST', `/api/rooms/${roomId}/pins`,
+          payload, this._headers(this._didHeaders(payload)),
+        );
+      } catch { /* local pin list still valid if node lacks route */ }
+    }
+    return { room_id: roomId, newly_pinned: added, total: this._roomPinning[roomId].cids.size };
+  }
+
   async assignTask(roomId, task, assignees) {
     const payload = { task, assignees };
     const r = await request(this.baseUrl, 'POST', `/api/rooms/${roomId}/tasks`, payload, this._headers(this._didHeaders(payload)));
@@ -786,6 +881,44 @@ class Agent {
   async joinFederation(nodeId, endpoint, name = '') {
     return request(this.baseUrl, 'POST', '/api/federation/nodes', { id: nodeId, endpoint, name }, this._headers());
   }
+
+  // P4-3: ledger-anchored recovery ceremony (veto delay). Client still reconstructs mnemonic offline.
+  async initiateRecovery(reason = '') {
+    if (!this.agentId) throw new MoyeError('agent not registered');
+    const payload = { reason: String(reason || '').slice(0, 500) };
+    return request(this.baseUrl, 'POST', `/api/agents/${this.agentId}/recovery/initiate`, payload, this._headers(this._didHeaders(payload)));
+  }
+
+  async vetoRecovery() {
+    if (!this.agentId) throw new MoyeError('agent not registered');
+    const payload = {};
+    return request(this.baseUrl, 'POST', `/api/agents/${this.agentId}/recovery/veto`, payload, this._headers(this._didHeaders(payload)));
+  }
+
+  async completeRecovery() {
+    if (!this.agentId) throw new MoyeError('agent not registered');
+    const payload = {};
+    return request(this.baseUrl, 'POST', `/api/agents/${this.agentId}/recovery/complete`, payload, this._headers(this._didHeaders(payload)));
+  }
+
+  // P4-4: DNS `_moye.<domain>` TXT must contain this agent's DID.
+  async verifyDomain(domain) {
+    if (!this.agentId) throw new MoyeError('agent not registered');
+    const payload = { domain };
+    return request(this.baseUrl, 'POST', `/api/agents/${this.agentId}/domain-verify`, payload, this._headers(this._didHeaders(payload)));
+  }
+
+  async revokeDomain() {
+    if (!this.agentId) throw new MoyeError('agent not registered');
+    const payload = { revoke: true };
+    return request(this.baseUrl, 'POST', `/api/agents/${this.agentId}/domain-verify`, payload, this._headers(this._didHeaders(payload)));
+  }
+
+  // R16: volunteer consolidation (any member).
+  async consolidateRoom(roomId, { summary, checkpoint_seq, schema, payload } = {}) {
+    const body = { summary, checkpoint_seq, schema, payload };
+    return request(this.baseUrl, 'POST', `/api/rooms/${roomId}/consolidate`, body, this._headers(this._didHeaders(body)));
+  }
 }
 
-module.exports = { Agent, MoyeError };
+module.exports = { Agent, MoyeError, mnemonicLib, shamirLib };

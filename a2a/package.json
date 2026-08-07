@@ -25,6 +25,7 @@
     "@orbitdb/core": "^4.0.0",
     "arweave": "^1.15.7",
     "better-sqlite3": "^12.11.1",
+    "bip39": "^3.1.0",
     "express": "^4.19.2",
     "helia": "^7.1.0",
     "ipfs-http-client": "^60.0.1",

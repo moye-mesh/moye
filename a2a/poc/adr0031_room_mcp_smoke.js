@@ -91,9 +91,17 @@ function parseTool(rpc) {
 
     r = await mcp(agent, pubId, 'tools/list', {}, 2);
     const names = (r.json.result.tools || []).map((t) => t.name).sort();
-    assert(JSON.stringify(names) === JSON.stringify([
-      'room_changes', 'room_messages', 'room_resolve', 'room_send', 'room_watch',
-    ].sort()), 'tools/list names: ' + names.join(','));
+    // The ADR-0031 baseline set must all still be present. `room_awaiting` was added later by
+    // M3 (ADR-0033 §3) to expose outstanding asks as MCP MRTR, so this asserts the baseline is
+    // intact rather than pinning an exact list -- but it still fails loudly if the surface grows
+    // beyond the room verb table, which ADR-0031 §2.2 deliberately scopes it to.
+    const baseline = ['room_changes', 'room_messages', 'room_resolve', 'room_send', 'room_watch'];
+    const allowed = new Set([...baseline, 'room_awaiting']);
+    for (const want of baseline) {
+      assert(names.includes(want), `tools/list missing ${want}: ` + names.join(','));
+    }
+    const unexpected = names.filter((n) => !allowed.has(n));
+    assert(unexpected.length === 0, 'unexpected tools beyond the room verb table: ' + unexpected.join(','));
 
     r = await mcp(agent, pubId, 'tools/call', {
       name: 'room_send',

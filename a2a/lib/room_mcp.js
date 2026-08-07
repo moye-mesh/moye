@@ -1,21 +1,20 @@
 'use strict';
 /**
- * ADR-0031: room-as-MCP-server — Streamable HTTP MCP transport scoped to one room.
- * Coexists with a2a/mcp/server.js (stdio). Does not replace it.
- *
- * Endpoint: POST /mcp/rooms/:id  (JSON-RPC 2.0: initialize | tools/list | tools/call | ping)
- * Optional GET /mcp/rooms/:id    (SSE hello + keep-alive; notifications reserved)
- *
- * Tools (room verb subset only — no create/join):
- *   room_send | room_messages | room_changes | room_watch | room_resolve
- *
- * Auth: existing Bearer / DID (authAgent). Private rooms: membership required; plaintext
- * posts rejected (encrypted:true required) — server never decrypts.
+ * ADR-0031 + ADR-0033 M3/M4/M5: room-as-MCP-server (Streamable HTTP).
+ * Dual-version: legacy initialize/ping kept; 2026-07-28 adds server/discover, resultType,
+ * ttlMs/cacheScope, Mcp-Method/Mcp-Name headers, MRTR input_required ↔ room ask/resolve.
+ * Extension namespace: ai.moye/room
  */
 const crypto = require('crypto');
 const roomAwaiting = require('./room_awaiting');
 
-const PROTOCOL_VERSION = '2025-03-26';
+const PROTOCOL_VERSION_LEGACY = '2025-03-26';
+const PROTOCOL_VERSION_STATELESS = '2026-07-28';
+const PROTOCOL_VERSION = PROTOCOL_VERSION_STATELESS;
+const MOYE_ROOM_EXTENSION = 'ai.moye/room';
+// estimated list cache TTL — no real MCP client load data as of 2026-08-07
+const TOOLS_LIST_TTL_MS = Math.max(1000, parseInt(process.env.MCP_TOOLS_LIST_TTL_MS || '30000', 10));
+
 const ROOM_MESSAGE_TYPES = new Set([
   'ask', 'resolve', 'task-broadcast', 'task-claim', 'task-accept',
 ]);
@@ -29,84 +28,162 @@ function jsonRpcError(id, code, message, data) {
   return { jsonrpc: '2.0', id: id === undefined ? null : id, error: err };
 }
 
-function toolText(obj) {
-  return {
+function withResultType(payload, resultType) {
+  return { resultType: resultType || 'complete', ...payload };
+}
+
+function toolComplete(obj) {
+  return withResultType({
     content: [{ type: 'text', text: typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2) }],
-  };
+  }, 'complete');
 }
 
 function toolError(msg) {
-  return { content: [{ type: 'text', text: msg }], isError: true };
+  return withResultType({
+    content: [{ type: 'text', text: msg }],
+    isError: true,
+  }, 'complete');
+}
+
+/** M3: express an open ask as MCP MRTR input_required. Multi-target asks degrade: one inputRequest
+ *  for the calling client when they are among targets; extension metadata carries full N-of-M. */
+function askAsInputRequired(ask, me) {
+  const targets = roomAwaiting.normalizeAwaitingList(ask.awaiting) || [];
+  const multi = Array.isArray(ask.awaiting);
+  const concernsMe = !multi
+    || targets.some((t) => t === me.id || t === me.did)
+    || (ask.awaiting_capability && roomAwaiting.agentHasCapability(me, ask.awaiting_capability));
+  const inputRequests = concernsMe ? [{
+    id: ask.id,
+    description: typeof ask.content === 'string' ? ask.content.slice(0, 2000) : 'Room ask awaiting your response',
+    schema: { type: 'object', properties: { content: { type: 'string' }, encrypted: { type: 'boolean' } }, required: ['content'] },
+  }] : [];
+  return withResultType({
+    content: [{
+      type: 'text',
+      text: JSON.stringify({
+        moye_ask_id: ask.id,
+        awaiting: ask.awaiting,
+        awaiting_remaining: ask.awaiting_remaining || null,
+        awaiting_mode: ask.awaiting_mode || (multi ? 'n-of-m' : 'single'),
+        note: multi
+          ? 'Multi-target ask (N-of-M). MCP MRTR exposes one inputRequest for you; other targets resolve independently via room_resolve / inputResponses.'
+          : 'Respond by retrying tools/call with inputResponses, or call room_resolve.',
+      }, null, 2),
+    }],
+    inputRequests,
+    _meta: {
+      [MOYE_ROOM_EXTENSION]: {
+        ask_id: ask.id,
+        multi_target: multi,
+        awaiting: ask.awaiting,
+        awaiting_remaining: ask.awaiting_remaining || null,
+        awaiting_capability: ask.awaiting_capability || null,
+      },
+    },
+  }, 'input_required');
 }
 
 function toolsList(roomId) {
+  const tools = [
+    {
+      name: 'room_send',
+      description: `Post a message to MOYE room ${roomId}. Private rooms: encrypt under room_key and set encrypted:true.`,
+      inputSchema: {
+        type: 'object',
+        properties: {
+          content: { type: 'string' },
+          encrypted: { type: 'boolean' },
+          type: { type: 'string' },
+          ref: { type: 'string' },
+          awaiting: { description: 'agent id/did or string[] (R10 multi-target)' },
+          awaiting_capability: { type: 'string' },
+          inputResponses: { description: 'MRTR retry: map ask id → { content, encrypted? }' },
+        },
+        required: ['content'],
+      },
+    },
+    {
+      name: 'room_messages',
+      description: `Read recent messages from room ${roomId} (wire content; decrypt locally if private).`,
+      inputSchema: { type: 'object', properties: { limit: { type: 'number' } } },
+    },
+    {
+      name: 'room_changes',
+      description: `Catch up on room ${roomId} since a ms cursor.`,
+      inputSchema: { type: 'object', properties: { since: { type: 'number' } }, required: ['since'] },
+    },
+    {
+      name: 'room_watch',
+      description: `Wait for the next message in room ${roomId} after since.`,
+      inputSchema: {
+        type: 'object',
+        properties: { since: { type: 'number' }, timeout_ms: { type: 'number' } },
+      },
+    },
+    {
+      name: 'room_resolve',
+      description: `Resolve an open ask (or pass inputResponses for MRTR).`,
+      inputSchema: {
+        type: 'object',
+        properties: {
+          ref: { type: 'string' },
+          content: { type: 'string' },
+          encrypted: { type: 'boolean' },
+          inputResponses: { description: 'MRTR: { "<ask_id>": { content, encrypted? } }' },
+        },
+      },
+    },
+    {
+      name: 'room_awaiting',
+      description: `List open asks that still concern the authenticated agent in this room (MRTR-friendly).`,
+      inputSchema: { type: 'object', properties: {} },
+    },
+  ];
+  // Deterministic order for client caching (2026-07-28 SHOULD).
+  tools.sort((a, b) => a.name.localeCompare(b.name));
   return {
-    tools: [
-      {
-        name: 'room_send',
-        description: `Post a message to MOYE room ${roomId}. For private rooms you MUST encrypt under room_key client-side and set encrypted:true — the server never sees plaintext.`,
-        inputSchema: {
-          type: 'object',
-          properties: {
-            content: { type: 'string', description: 'Wire content (ciphertext for private rooms)' },
-            encrypted: { type: 'boolean', description: 'Must be true for private rooms' },
-            type: { type: 'string', description: 'ask|resolve|task-broadcast|task-claim|task-accept' },
-            ref: { type: 'string' },
-            awaiting: { description: 'agent id/did string, or string[] for multi-target (R10)' },
-            awaiting_capability: { type: 'string', description: 'Capability name; first capable member resolve wins (R12)' },
-          },
-          required: ['content'],
-        },
-      },
-      {
-        name: 'room_messages',
-        description: `Read recent messages from room ${roomId}. Returns stored wire content (ciphertext if private) — decrypt locally if you hold room_key.`,
-        inputSchema: {
-          type: 'object',
-          properties: { limit: { type: 'number', description: 'Max messages (default 50, max 200)' } },
-        },
-      },
-      {
-        name: 'room_changes',
-        description: `Catch up on room ${roomId} since a cursor (ms epoch). Same as GET /api/rooms/:id/changes.`,
-        inputSchema: {
-          type: 'object',
-          properties: { since: { type: 'number', description: 'ms epoch cursor' } },
-          required: ['since'],
-        },
-      },
-      {
-        name: 'room_watch',
-        description: `Block until a new message appears in room ${roomId} after since (or timeout). Returns the message or null.`,
-        inputSchema: {
-          type: 'object',
-          properties: {
-            since: { type: 'number', description: 'ms epoch; default now' },
-            timeout_ms: { type: 'number', description: 'Max wait (default 25000, max 55000)' },
-          },
-        },
-      },
-      {
-        name: 'room_resolve',
-        description: `Resolve an open ask in room ${roomId} (type=resolve + ref). Private rooms still require encrypted:true.`,
-        inputSchema: {
-          type: 'object',
-          properties: {
-            ref: { type: 'string', description: 'ask message id' },
-            content: { type: 'string' },
-            encrypted: { type: 'boolean' },
-          },
-          required: ['ref', 'content'],
-        },
-      },
-    ],
+    resultType: 'complete',
+    ttlMs: TOOLS_LIST_TTL_MS,
+    cacheScope: 'session',
+    tools,
   };
 }
 
-/**
- * @param {import('express').Express} app
- * @param {object} deps
- */
+function serverDiscover(room) {
+  return {
+    resultType: 'complete',
+    protocolVersion: PROTOCOL_VERSION_STATELESS,
+    serverInfo: {
+      name: `moye-room-${room.id}`,
+      version: '1.0.0',
+      title: `MOYE room ${room.name || room.id}`,
+    },
+    capabilities: {
+      tools: { listChanged: false },
+      extensions: {
+        [MOYE_ROOM_EXTENSION]: {
+          version: '1.0.0',
+          features: ['multi-target-ask', 'membership', 'e2e', 'ledger-anchor', 'mrtr-ask'],
+        },
+      },
+    },
+    instructions: room.visibility === 'private'
+      ? 'Private room: encrypt under room_key; set encrypted:true. Server never decrypts.'
+      : 'Public room MCP — tools scoped to this room_id. Dual-version: legacy initialize still accepted.',
+  };
+}
+
+function clientProtocolVersion(req, body) {
+  const meta = (body && body.params && body.params._meta)
+    || (body && body._meta)
+    || {};
+  const fromMeta = meta['io.modelcontextprotocol/protocolVersion']
+    || meta.protocolVersion;
+  const header = (req.headers['mcp-protocol-version'] || '').toString();
+  return fromMeta || header || null;
+}
+
 function mount(app, deps) {
   const {
     authAgent,
@@ -120,6 +197,7 @@ function mount(app, deps) {
     pushTo,
     ok,
     fail,
+    materializeRoomAwaiting,
     MAX_CONTENT_LEN = 32768,
   } = deps;
 
@@ -138,7 +216,6 @@ function mount(app, deps) {
       res.status(403).json(jsonRpcError(null, -32000, 'private room: membership required'));
       return null;
     }
-    // Public rooms: any authenticated agent may use MCP (same as HTTP post — membership optional).
     return { room, me };
   }
 
@@ -166,7 +243,6 @@ function mount(app, deps) {
     if (type === 'task-accept' && me.id !== room.creator) {
       throw Object.assign(new Error('only the room creator can accept a claim'), { status: 403 });
     }
-    // Same E2E guarantee as POST /api/rooms/:id/messages — never accept plaintext in private rooms.
     if (room.visibility === 'private' && !encrypted) {
       throw Object.assign(new Error(
         'private room messages must set encrypted:true (encrypt under room_key before post)',
@@ -199,18 +275,54 @@ function mount(app, deps) {
     return { message_id: msg.id, ts: msg.ts, encrypted: !!msg.encrypted };
   }
 
+  async function applyInputResponses(room, me, inputResponses) {
+    if (!inputResponses || typeof inputResponses !== 'object') return [];
+    const out = [];
+    for (const [askId, resp] of Object.entries(inputResponses)) {
+      const r = resp && typeof resp === 'object' ? resp : { content: String(resp) };
+      out.push(await postMessage(room, me, {
+        content: r.content,
+        encrypted: r.encrypted,
+        type: 'resolve',
+        ref: askId,
+      }));
+    }
+    return out;
+  }
+
   async function callTool(room, me, name, args) {
     const a = args && typeof args === 'object' ? args : {};
+
+    // M3 MRTR: inputResponses on retry of room_send / room_resolve / room_awaiting
+    if (a.inputResponses) {
+      const resolved = await applyInputResponses(room, me, a.inputResponses);
+      return toolComplete({ resolved, via: 'inputResponses' });
+    }
+
     if (name === 'room_send') {
-      return toolText(await postMessage(room, me, a));
+      const sent = await postMessage(room, me, a);
+      return toolComplete(sent);
     }
     if (name === 'room_resolve') {
-      return toolText(await postMessage(room, me, {
+      return toolComplete(await postMessage(room, me, {
         content: a.content,
         encrypted: a.encrypted,
         type: 'resolve',
         ref: a.ref,
       }));
+    }
+    if (name === 'room_awaiting') {
+      const open = (typeof materializeRoomAwaiting === 'function'
+        ? materializeRoomAwaiting(room.id)
+        : []).filter((ask) => roomAwaiting.askConcernsAgent(ask, me.id, me, room));
+      if (open.length === 1) return askAsInputRequired(open[0], me);
+      if (open.length > 1) {
+        // Degrade: primary MRTR for first; list others in extension meta
+        const primary = askAsInputRequired(open[0], me);
+        primary._meta[MOYE_ROOM_EXTENSION].additional_asks = open.slice(1).map((x) => x.id);
+        return primary;
+      }
+      return toolComplete({ room_id: room.id, awaiting: [] });
     }
     if (name === 'room_messages') {
       if (room.visibility === 'private' && !canReadRoom(room, me.id)) {
@@ -218,8 +330,7 @@ function mount(app, deps) {
       }
       const limit = Math.min(Math.max(parseInt(a.limit, 10) || 50, 1), 200);
       const all = store.getShared(roomChatKey(room.id)) || [];
-      // Return wire messages as stored — no server-side decrypt.
-      return toolText({ room_id: room.id, messages: all.slice(-limit) });
+      return toolComplete({ room_id: room.id, messages: all.slice(-limit) });
     }
     if (name === 'room_changes') {
       if (room.visibility === 'private' && !canReadRoom(room, me.id)) {
@@ -229,7 +340,7 @@ function mount(app, deps) {
       const msgs = (store.getShared(roomChatKey(room.id)) || [])
         .filter((m) => (m.ts || 0) > since)
         .slice(0, 200);
-      return toolText({ room_id: room.id, since, messages: msgs, new_messages: msgs.length });
+      return toolComplete({ room_id: room.id, since, messages: msgs, new_messages: msgs.length });
     }
     if (name === 'room_watch') {
       if (room.visibility === 'private' && !canReadRoom(room, me.id)) {
@@ -243,51 +354,69 @@ function mount(app, deps) {
         const hit = (store.getShared(roomChatKey(room.id)) || [])
           .filter((m) => (m.ts || 0) > since)
           .sort((x, y) => (x.ts - y.ts) || String(x.id).localeCompare(String(y.id)))[0];
-        if (hit) return toolText({ room_id: room.id, message: hit });
+        if (hit) {
+          if (hit.type === 'ask' && roomAwaiting.askConcernsAgent(hit, me.id, me, room)) {
+            return askAsInputRequired(hit, me);
+          }
+          return toolComplete({ room_id: room.id, message: hit });
+        }
         await new Promise((r) => setTimeout(r, 400));
       }
-      return toolText({ room_id: room.id, message: null, timed_out: true });
+      return toolComplete({ room_id: room.id, message: null, timed_out: true });
     }
     return toolError('unknown tool: ' + name);
   }
 
   async function handleRpc(req, res, room, me, body) {
     const { id, method, params } = body || {};
-    if (body.jsonrpc !== '2.0' || !method) {
+    // Allow method from Mcp-Method header (2026-07-28) when body omits it
+    const headerMethod = (req.headers['mcp-method'] || '').toString().trim();
+    const effectiveMethod = method || headerMethod;
+    if ((!body || body.jsonrpc !== '2.0') && !headerMethod) {
       return res.status(400).json(jsonRpcError(id, -32600, 'invalid JSON-RPC 2.0 request'));
     }
+    if (!effectiveMethod) {
+      return res.status(400).json(jsonRpcError(id, -32600, 'method required (body.method or Mcp-Method header)'));
+    }
 
-    if (method === 'initialize') {
+    const pv = clientProtocolVersion(req, body);
+
+    // M4: server/discover is MUST for 2026-07-28
+    if (effectiveMethod === 'server/discover') {
+      return res.json(jsonRpcResult(id, serverDiscover(room)));
+    }
+
+    // Legacy handshake — still accepted for old clients (dual-version).
+    // Return the legacy protocolVersion here so official @modelcontextprotocol/sdk (pre-2026)
+    // can connect; new clients use server/discover for 2026-07-28.
+    if (effectiveMethod === 'initialize') {
+      const disc = serverDiscover(room);
+      const wantLegacy = !pv || String(pv).startsWith('2025') || String(pv).startsWith('2024');
       return res.json(jsonRpcResult(id, {
-        protocolVersion: PROTOCOL_VERSION,
-        capabilities: { tools: { listChanged: false } },
-        serverInfo: {
-          name: `moye-room-${room.id}`,
-          version: '1.0.0',
-          title: `MOYE room ${room.name || room.id}`,
-        },
-        instructions: room.visibility === 'private'
-          ? 'Private room: encrypt message content under room_key before room_send/room_resolve; set encrypted:true. Server never decrypts.'
-          : 'Public room MCP surface — tools are scoped to this room_id only.',
+        protocolVersion: wantLegacy ? PROTOCOL_VERSION_LEGACY : PROTOCOL_VERSION_STATELESS,
+        capabilities: disc.capabilities,
+        serverInfo: disc.serverInfo,
+        instructions: disc.instructions,
       }));
     }
 
-    if (method === 'notifications/initialized' || method === 'initialized') {
+    if (effectiveMethod === 'notifications/initialized' || effectiveMethod === 'initialized') {
       return res.status(202).end();
     }
 
-    if (method === 'ping') {
+    if (effectiveMethod === 'ping') {
       return res.json(jsonRpcResult(id, {}));
     }
 
-    if (method === 'tools/list') {
+    if (effectiveMethod === 'tools/list') {
       return res.json(jsonRpcResult(id, toolsList(room.id)));
     }
 
-    if (method === 'tools/call') {
-      const name = params && params.name;
+    if (effectiveMethod === 'tools/call') {
+      const name = (params && params.name)
+        || (req.headers['mcp-name'] || '').toString().trim();
       const args = (params && params.arguments) || {};
-      if (!name) return res.status(400).json(jsonRpcError(id, -32602, 'tools/call requires params.name'));
+      if (!name) return res.status(400).json(jsonRpcError(id, -32602, 'tools/call requires params.name or Mcp-Name'));
       try {
         const result = await callTool(room, me, name, args);
         return res.json(jsonRpcResult(id, result));
@@ -300,10 +429,9 @@ function mount(app, deps) {
       }
     }
 
-    return res.status(400).json(jsonRpcError(id, -32601, 'method not found: ' + method));
+    return res.status(400).json(jsonRpcError(id, -32601, 'method not found: ' + effectiveMethod));
   }
 
-  // Discovery: machine-readable pointer (not full MCP session).
   app.get('/mcp/rooms/:id', async (req, res) => {
     const room = store.getRoom(req.params.id);
     if (!room) return fail(res, 404, 'room not found');
@@ -319,6 +447,8 @@ function mount(app, deps) {
       res.write(`event: moye.mcp.hello\ndata: ${JSON.stringify({
         ok: true, room_id: room.id, transport: 'streamable-http',
         post: `/mcp/rooms/${room.id}`,
+        methods: ['server/discover', 'initialize', 'tools/list', 'tools/call', 'ping'],
+        extension: MOYE_ROOM_EXTENSION,
       })}\n\n`);
       const ping = setInterval(() => {
         try { res.write(`: ping ${Date.now()}\n\n`); } catch { /* */ }
@@ -333,10 +463,12 @@ function mount(app, deps) {
       room_id: room.id,
       visibility: room.visibility || 'public',
       endpoint: `/mcp/rooms/${room.id}`,
-      methods: ['initialize', 'tools/list', 'tools/call', 'ping'],
+      protocol_versions: [PROTOCOL_VERSION_LEGACY, PROTOCOL_VERSION_STATELESS],
+      methods: ['server/discover', 'initialize', 'tools/list', 'tools/call', 'ping'],
       tools: toolsList(room.id).tools.map((t) => t.name),
+      extension: MOYE_ROOM_EXTENSION,
       auth: ['bearer', 'did'],
-      note: 'POST JSON-RPC 2.0 to this path. Private rooms require membership + client-side E2E (encrypted:true).',
+      note: 'Dual-version MCP. Prefer server/discover (2026-07-28). Legacy initialize still accepted.',
     });
   });
 
@@ -344,20 +476,19 @@ function mount(app, deps) {
     const ctx = await requireMember(req, res, req.params.id);
     if (!ctx) return;
     const { room, me } = ctx;
-    // Batch support (array of messages) — process sequentially, return last / array
     const body = req.body;
     if (Array.isArray(body)) {
-      const out = [];
-      for (const item of body) {
-        // Collect via mock — simpler: only support single for v1
-        out.push(item);
-      }
-      if (out.length !== 1) {
-        return res.status(400).json(jsonRpcError(null, -32600, 'batch requests: send one JSON-RPC object per POST in this version'));
-      }
+      return res.status(400).json(jsonRpcError(null, -32600, 'batch requests: send one JSON-RPC object per POST in this version'));
     }
-    return handleRpc(req, res, room, me, body);
+    return handleRpc(req, res, room, me, body || {});
   });
 }
 
-module.exports = { mount, PROTOCOL_VERSION, toolsList };
+module.exports = {
+  mount,
+  PROTOCOL_VERSION,
+  PROTOCOL_VERSION_LEGACY,
+  PROTOCOL_VERSION_STATELESS,
+  MOYE_ROOM_EXTENSION,
+  toolsList,
+};

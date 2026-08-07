@@ -21,6 +21,8 @@ const roomMcp = require('./lib/room_mcp');           // ADR-0031: room-as-MCP-se
 const roomAwaiting = require('./lib/room_awaiting'); // ADR-0027 D1/D3: multi-target + capability ask
 const attachments = require('./lib/attachments'); // N1: CID attachment metadata
 const verbs = require('./lib/verbs');             // ADR-0013: unified verb table
+const domainVerify = require('./lib/domain_verify'); // P4-4: _moye.<domain> TXT → verified name
+const mnemonicLib = require('./lib/mnemonic');       // P4-3: BIP-39 (exported for tests/tools)
 const path = require('path');
 
 // Fan every ledger append into the firehose (metadata only — ledger never stores plaintext bodies).
@@ -63,7 +65,7 @@ const RESERVED_SHARED_PREFIXES = ['revoke:', 'reputation:'];
 // soft-fork *signaling* than its activation mechanism (MOYE has no hashpower-equivalent objective
 // threshold; adoption data here is informational, not a trigger that flips anything on by itself).
 const PROTOCOL_VERSION = '1.6';
-const PROTOCOL_FEATURES = ['capability-schema', 'verifiable-credentials', 'message-signing', 'rich-crdt', 'a2a-jsonrpc-bridge', 'portable-address-attestation', 'capability-input-filter', 'seeds-multisig-governance', 'firehose', 'message-attachments', 'room-awaiting', 'node-did-federation-auth', 'room-fork', 'slip0010', 'identity-delegation', 'session-keys', 'resolve-at', 'agent-timeline', 'gravity-search', 'room-mcp', 'shard-route', 'query-directory'];
+const PROTOCOL_FEATURES = ['capability-schema', 'verifiable-credentials', 'message-signing', 'rich-crdt', 'a2a-jsonrpc-bridge', 'portable-address-attestation', 'capability-input-filter', 'seeds-multisig-governance', 'firehose', 'message-attachments', 'room-awaiting', 'node-did-federation-auth', 'room-fork', 'slip0010', 'identity-delegation', 'session-keys', 'resolve-at', 'agent-timeline', 'gravity-search', 'room-mcp', 'shard-route', 'query-directory', 'room-state-staleness', 'room-mcp-mrtr', 'room-pinning', 'room-consolidate', 'mnemonic-identity', 'domain-verify'];
 
 // Broadcast a newly-registered agent to peer nodes immediately (doesn't wait for the 15s reconcile cycle)
 function announceToPeers(agent) {
@@ -804,6 +806,142 @@ app.post('/api/agents/:id/rotate', async (req, res) => {
   // Token only ever lives in SQLite, never written to the public IPFS directory
   // (otherwise anyone could steal it via GET /api/agents/:id)
   ok(res, { agent_id: me.id, token });
+});
+
+// ---- P4-3 (ADR-0014 §6b): ledger-anchored recovery with veto delay ----
+// Client reconstructs the mnemonic offline (Shamir 2-of-3). These endpoints only record the
+// ceremony so a contested recovery can be vetoed before it completes. Threshold mirrors seeds
+// multisig: floor(n/2)+1 (documented on the response; share math is client-side).
+// estimated: RECOVERY_VETO_MS default 24h — no production recovery-ceremony data yet (2026-08-07).
+const RECOVERY_VETO_MS = Math.max(1000, parseInt(process.env.RECOVERY_VETO_MS || String(24 * 60 * 60 * 1000), 10));
+function recoveryKey(agentId) { return 'recovery:' + agentId; }
+
+app.post('/api/agents/:id/recovery/initiate', async (req, res) => {
+  const me = await authAgent(req);
+  if (!me) return fail(res, 401, 'Bearer token or DID sig required');
+  if (me.id !== req.params.id) return fail(res, 403, 'identity mismatch');
+  const agent = store.getAgent(me.id);
+  if (!agent) return fail(res, 404, 'agent not found');
+  const now = Date.now();
+  const pending = {
+    agent_id: me.id,
+    did: agent.did || null,
+    status: 'pending',
+    reason: String((req.body && req.body.reason) || '').slice(0, 500),
+    initiated_at: now,
+    complete_after: now + RECOVERY_VETO_MS,
+    veto_window_ms: RECOVERY_VETO_MS,
+    threshold_note: 'Client Shamir uses floor(n/2)+1 (2-of-3). Veto window estimated; env RECOVERY_VETO_MS.',
+    attestation: portableAttestation(req),
+  };
+  await store.putShared(recoveryKey(me.id), pending, now, me.id);
+  await ledger.append('agent.recovery_initiate', {
+    agent: me.id, did: agent.did || null, complete_after: pending.complete_after, ts: now,
+    attestation: pending.attestation,
+  }).catch(() => {});
+  ok(res, { recovery: pending, note: mnemonicLib.EXISTING_IDENTITY_NOTE });
+});
+
+app.post('/api/agents/:id/recovery/veto', async (req, res) => {
+  const me = await authAgent(req);
+  if (!me) return fail(res, 401, 'Bearer token or DID sig required');
+  if (me.id !== req.params.id) return fail(res, 403, 'identity mismatch');
+  const cur = store.getShared(recoveryKey(me.id));
+  if (!cur || cur.status !== 'pending') return fail(res, 404, 'no pending recovery');
+  const agent = store.getAgent(me.id);
+  const now = Date.now();
+  const next = { ...cur, status: 'vetoed', vetoed_at: now, vetoed_by: me.id };
+  await store.putShared(recoveryKey(me.id), next, now, me.id);
+  await ledger.append('agent.recovery_veto', {
+    agent: me.id, did: (agent && agent.did) || null, ts: now, attestation: portableAttestation(req),
+  }).catch(() => {});
+  ok(res, { recovery: next });
+});
+
+app.post('/api/agents/:id/recovery/complete', async (req, res) => {
+  const me = await authAgent(req);
+  if (!me) return fail(res, 401, 'Bearer token or DID sig required');
+  if (me.id !== req.params.id) return fail(res, 403, 'identity mismatch');
+  const cur = store.getShared(recoveryKey(me.id));
+  if (!cur || cur.status !== 'pending') return fail(res, 404, 'no pending recovery');
+  const now = Date.now();
+  if (now < Number(cur.complete_after || 0)) {
+    return fail(res, 409, 'veto window still open; wait until complete_after or call veto');
+  }
+  const next = { ...cur, status: 'completed', completed_at: now };
+  await store.putShared(recoveryKey(me.id), next, now, me.id);
+  const agent = store.getAgent(me.id);
+  if (agent) {
+    await store.putAgent(me.id, { ...agent, last_recovery_at: now });
+  }
+  await ledger.append('agent.recovery_complete', {
+    agent: me.id, did: (agent && agent.did) || null, ts: now, attestation: portableAttestation(req),
+  }).catch(() => {});
+  ok(res, { recovery: next });
+});
+
+app.get('/api/agents/:id/recovery', async (req, res) => {
+  const agent = store.getAgent(req.params.id);
+  if (!agent) return fail(res, 404, 'agent not found');
+  ok(res, { agent_id: agent.id, recovery: store.getShared(recoveryKey(agent.id)) || null });
+});
+
+// ---- P4-4 (ADR-0014 §6c): DNS domain verification (_moye.<domain> TXT) ----
+app.post('/api/agents/:id/domain-verify', async (req, res) => {
+  const me = await authAgent(req);
+  if (!me) return fail(res, 401, 'Bearer token or DID sig required');
+  if (me.id !== req.params.id) return fail(res, 403, 'identity mismatch');
+  const agent = store.getAgent(me.id);
+  if (!agent) return fail(res, 404, 'agent not found');
+  const body = req.body || {};
+  if (body.revoke) {
+    const updated = await store.putAgent(me.id, {
+      ...agent, verified_domain: null, verified_display: null, domain_verified_at: null,
+    });
+    await ledger.append('agent.domain_revoke', {
+      agent: me.id, did: agent.did || null, ts: Date.now(), attestation: portableAttestation(req),
+    }).catch(() => {});
+    if (PEERS.length) announceToPeers({ id: me.id, ...updated });
+    return ok(res, { agent_id: me.id, verified_domain: null, verified_display: null });
+  }
+  if (!agent.did) return fail(res, 400, 'agent has no DID — register with pubkey first');
+  const check = await domainVerify.verifyDomainDid(body.domain, agent.did);
+  if (!check.ok) return fail(res, 400, check.error || 'domain verification failed');
+  const verified_display = domainVerify.verifiedDisplayName(agent.name, check.domain);
+  const updated = await store.putAgent(me.id, {
+    ...agent,
+    verified_domain: check.domain,
+    verified_display,
+    domain_verified_at: Date.now(),
+  });
+  await ledger.append('agent.domain_verify', {
+    agent: me.id, did: agent.did, domain: check.domain, verified_display, ts: Date.now(),
+    attestation: portableAttestation(req),
+  }).catch(() => {});
+  if (PEERS.length) announceToPeers({ id: me.id, ...updated });
+  ok(res, {
+    agent_id: me.id,
+    verified_domain: check.domain,
+    verified_display,
+    host: check.host,
+    note: 'Optional and revocable: delete the TXT record and POST {revoke:true}, or DELETE /domain-verify.',
+  });
+});
+
+app.delete('/api/agents/:id/domain-verify', async (req, res) => {
+  const me = await authAgent(req);
+  if (!me) return fail(res, 401, 'Bearer token or DID sig required');
+  if (me.id !== req.params.id) return fail(res, 403, 'identity mismatch');
+  const agent = store.getAgent(me.id);
+  if (!agent) return fail(res, 404, 'agent not found');
+  const updated = await store.putAgent(me.id, {
+    ...agent, verified_domain: null, verified_display: null, domain_verified_at: null,
+  });
+  await ledger.append('agent.domain_revoke', {
+    agent: me.id, did: agent.did || null, ts: Date.now(), attestation: portableAttestation(req),
+  }).catch(() => {});
+  if (PEERS.length) announceToPeers({ id: me.id, ...updated });
+  ok(res, { agent_id: me.id, verified_domain: null, verified_display: null });
 });
 
 // ---- ADR-0010: portable, independently-verifiable DID->address attestations ----
@@ -2187,6 +2325,44 @@ app.get('/api/agents/:id/awaiting', async (req, res) => {
 
 // ---- ADR-0018 R2: room state document (single current snapshot, CRDT LWW) ----
 function roomStateKey(id) { return 'room-state:' + id; }
+
+/** R15 (ADR-0034): read-time only — how far the state doc lags the chat log. No scheduler. */
+async function roomStateStaleness(roomId, stateDoc) {
+  const msgs = store.getShared(roomChatKey(roomId)) || [];
+  const updatedAt = stateDoc && stateDoc.updated_at != null ? Number(stateDoc.updated_at) : 0;
+  const messages_since_update = msgs.filter((m) => (m.ts || 0) > updatedAt).length;
+  let last_checkpoint = null;
+  try {
+    const rows = await ledger.byType('room.checkpoint', 500);
+    for (let i = rows.length - 1; i >= 0; i--) {
+      const e = rows[i];
+      if (!e.data || e.data.room_id !== roomId) continue;
+      // Prefer an explicit consolidation pointer on the state doc when present (R16).
+      if (stateDoc && stateDoc.last_checkpoint_seq != null
+        && Number(stateDoc.last_checkpoint_seq) === Number(e.seq)) {
+        last_checkpoint = {
+          seq: e.seq, hash: e.hash, label: e.data.label || null, ts: e.data.ts || null,
+        };
+        break;
+      }
+      // Else: most recent checkpoint at or before the state write (or any if state never written).
+      const cpTs = e.data.ts || 0;
+      if (!updatedAt || cpTs <= updatedAt) {
+        last_checkpoint = {
+          seq: e.seq, hash: e.hash, label: e.data.label || null, ts: e.data.ts || null,
+        };
+        break;
+      }
+    }
+  } catch { /* ledger unavailable — leave null */ }
+  return {
+    messages_since_update,
+    message_count: msgs.length,
+    state_updated_at: updatedAt || null,
+    last_checkpoint,
+  };
+}
+
 app.get('/api/rooms/:id/state', async (req, res) => {
   const room = store.getRoom(req.params.id);
   if (!room) return fail(res, 404, 'room not found');
@@ -2203,7 +2379,8 @@ app.get('/api/rooms/:id/state', async (req, res) => {
     awaiting_remaining: m.awaiting_remaining || null, awaiting_mode: m.awaiting_mode || null,
     since: m.ts, ref: m.id, by: m.from_agent,
   }));
-  ok(res, { room_id: room.id, state: { ...stateDoc, awaiting: liveAwaiting } });
+  const staleness = await roomStateStaleness(room.id, stateDoc);
+  ok(res, { room_id: room.id, state: { ...stateDoc, awaiting: liveAwaiting }, staleness });
 });
 app.post('/api/rooms/:id/state', async (req, res) => {
   const me = await authAgent(req);
@@ -2221,9 +2398,99 @@ app.post('/api/rooms/:id/state', async (req, res) => {
     updated_at: Date.now(),
     updated_by: me.id,
   };
+  // R16 may pass last_checkpoint_seq when consolidating; preserve unless explicitly cleared.
+  if (body.last_checkpoint_seq != null) next.last_checkpoint_seq = Number(body.last_checkpoint_seq);
+  else if (prev.last_checkpoint_seq != null) next.last_checkpoint_seq = prev.last_checkpoint_seq;
   await store.putShared(roomStateKey(room.id), next, Date.now(), me.id);
   ledger.append('room.state_update', { room: room.id, by: me.id, ts: next.updated_at }).catch(() => {});
-  ok(res, { room_id: room.id, state: next });
+  ok(res, { room_id: room.id, state: next, staleness: await roomStateStaleness(room.id, next) });
+});
+
+// R16 (ADR-0034): volunteer consolidation — any member may submit; prior proposals stay visible.
+// Reuses schema/payload (R9). Does NOT require creator or N-of-M (user decision).
+app.post('/api/rooms/:id/consolidate', async (req, res) => {
+  const me = await authAgent(req);
+  if (!me) return fail(res, 401, 'Bearer token or DID sig required');
+  const room = store.getRoom(req.params.id);
+  if (!room) return fail(res, 404, 'room not found');
+  if (!isRoomMember(room, me.id) && room.creator !== me.id) return fail(res, 403, 'membership required');
+  const body = req.body || {};
+  const summary = body.summary != null ? String(body.summary).slice(0, 4000) : '';
+  const checkpointSeq = body.checkpoint_seq != null ? Number(body.checkpoint_seq) : null;
+  const prev = store.getShared(roomStateKey(room.id)) || {};
+  const proposals = Array.isArray(prev.consolidation_proposals) ? prev.consolidation_proposals.slice() : [];
+  const proposal = {
+    id: newId('cprop'),
+    by: me.id,
+    ts: Date.now(),
+    summary,
+    checkpoint_seq: checkpointSeq,
+    schema: body.schema || 'room-consolidate-v1',
+    payload: body.payload && typeof body.payload === 'object' ? body.payload : null,
+  };
+  proposals.push(proposal);
+  // Keep history visible (do not silently overwrite prior proposals). Cap length.
+  const trimmed = proposals.slice(-50);
+  const next = {
+    summary: summary || prev.summary || '',
+    decisions: Array.isArray(prev.decisions) ? prev.decisions : [],
+    open_questions: Array.isArray(prev.open_questions) ? prev.open_questions : [],
+    consolidation_proposals: trimmed,
+    updated_at: Date.now(),
+    updated_by: me.id,
+  };
+  if (checkpointSeq != null) next.last_checkpoint_seq = checkpointSeq;
+  else if (prev.last_checkpoint_seq != null) next.last_checkpoint_seq = prev.last_checkpoint_seq;
+  await store.putShared(roomStateKey(room.id), next, Date.now(), me.id);
+  // Also post a machine-readable room message so the immutable log carries the claim.
+  const wire = JSON.stringify({
+    schema: proposal.schema, proposal_id: proposal.id, summary, checkpoint_seq: checkpointSeq,
+  });
+  const msg = {
+    id: newId('rmsg'), from_agent: me.id, content: wire, encrypted: false,
+    sender_sig: null, type: null, ref: null, awaiting: null,
+    schema: proposal.schema, payload: { proposal_id: proposal.id, summary, checkpoint_seq: checkpointSeq },
+    attachments: null, ts: Date.now(),
+  };
+  await appendRoomMessage(room.id, msg);
+  ledger.append('room.consolidate', {
+    room: room.id, by: me.id, proposal_id: proposal.id, checkpoint_seq: checkpointSeq, ts: msg.ts,
+  }).catch(() => {});
+  ok(res, {
+    room_id: room.id, proposal, message_id: msg.id,
+    staleness: await roomStateStaleness(room.id, next),
+    note: 'Any member may submit; re-check against the room log. Prior proposals remain in consolidation_proposals.',
+  });
+});
+
+// R17: visible pin registry (ciphertext CIDs only). No contribution counters.
+app.post('/api/rooms/:id/pins', async (req, res) => {
+  const me = await authAgent(req);
+  if (!me) return fail(res, 401, 'Bearer token or DID sig required');
+  const room = store.getRoom(req.params.id);
+  if (!room) return fail(res, 404, 'room not found');
+  if (!isRoomMember(room, me.id) && room.creator !== me.id) return fail(res, 403, 'membership required');
+  const cids = Array.isArray(req.body && req.body.cids) ? req.body.cids : [];
+  const clean = cids.filter((c) => typeof c === 'string' && c.length >= 10 && c.length <= 128).slice(0, 64);
+  const key = 'room-pins:' + room.id;
+  const cur = store.getShared(key) || {};
+  const byAgent = cur.by_agent && typeof cur.by_agent === 'object' ? { ...cur.by_agent } : {};
+  const prev = new Set(Array.isArray(byAgent[me.id]) ? byAgent[me.id] : []);
+  for (const c of clean) prev.add(c);
+  byAgent[me.id] = [...prev].slice(-500);
+  const next = { by_agent: byAgent, updated_at: Date.now() };
+  await store.putShared(key, next, Date.now(), me.id);
+  ok(res, { room_id: room.id, agent_id: me.id, cids: byAgent[me.id] });
+});
+app.get('/api/rooms/:id/pins', async (req, res) => {
+  const room = store.getRoom(req.params.id);
+  if (!room) return fail(res, 404, 'room not found');
+  if (room.visibility === 'private') {
+    const me = await authAgent(req).catch(() => null);
+    if (!me || !canReadRoom(room, me.id)) return fail(res, 403, 'private room: membership required');
+  }
+  const cur = store.getShared('room-pins:' + room.id) || { by_agent: {} };
+  ok(res, { room_id: room.id, by_agent: cur.by_agent || {}, note: 'Ciphertext CID pins only; not a contribution scoreboard.' });
 });
 
 // ---- ADR-0018 R3: named checkpoint + changes-since ----
@@ -2373,7 +2640,7 @@ app.post('/api/rooms/:id/fork', async (req, res) => {
 // Mounted after room helpers (authAgent, isRoomMember, appendRoomMessage, …) exist.
 roomMcp.mount(app, {
   authAgent, store, isRoomMember, canReadRoom, roomChatKey, appendRoomMessage,
-  newId, ledger, pushTo, ok, fail, MAX_CONTENT_LEN,
+  newId, ledger, pushTo, ok, fail, materializeRoomAwaiting, MAX_CONTENT_LEN,
 });
 
 // ---- 8. Distribute a task to a room (requires auth: room creator) ----
