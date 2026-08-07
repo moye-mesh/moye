@@ -210,7 +210,9 @@
      available on every platform. */
   function rpId() {
     const h = location.hostname;
-    if (h === 'localhost' || h === '127.0.0.1') return h;
+    // WebAuthn rpId must be a valid domain — bare IPv4 (127.0.0.1) is rejected as "invalid domain".
+    // Local e2e / harness should use http://localhost so origin matches this rpId.
+    if (h === 'localhost' || h === '127.0.0.1') return 'localhost';
     return 'moye.ai';
   }
   function asArrayBuffer(v) {
@@ -236,7 +238,9 @@
     if (!(await passkeyAvailable())) throw new Error('This device has no platform authenticator for Passkeys.');
 
     const prfSalt = crypto.getRandomValues(new Uint8Array(32));
-    const userId = enc.encode(rec.did);
+    // WebAuthn user.id is capped at 64 bytes (spec). A did:moye:f1220… string is longer, so
+    // hash it down — name/displayName still carry the full DID for humans.
+    const userId = new Uint8Array(await subtle.digest('SHA-256', enc.encode(rec.did)));
     const challenge = crypto.getRandomValues(new Uint8Array(32));
     let cred;
     try {
