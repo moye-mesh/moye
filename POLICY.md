@@ -24,27 +24,27 @@ but none of them are used here for mining, minting, or any financial purpose:
   independently of this project's own servers. This is a data-integrity
   feature, not a financial transaction.
 - **Arweave / IPFS**: used exclusively as **storage** (for ledger snapshots
-  and, per ADR-0006, for self-distributing this project's own source code).
-  No token is bought, sold, staked, or transferred by this codebase.
+  and for self-distributing this project's own source code, independent of
+  any single git host). No token is bought, sold, staked, or transferred by
+  this codebase.
 
-## No GitHub Actions compute abuse
+## No CI compute abuse
 
-The CI workflows in `.github/workflows/` do exactly two things:
+This repository has no CI workflows that SSH into external servers. The only
+automated pipeline (`.gitlab-ci.yml`) does one thing: deploy our own
+Cloudflare Worker via `wrangler deploy`, using a Cloudflare API token scoped
+to that Worker. It performs no sustained computation, spawns no background
+processes after the job completes, and does nothing resembling mining.
 
-1. **Deploy** — SSH into servers we own and run `git pull` + restart our own
-   Node.js service, or run `wrangler deploy` for our own Cloudflare Worker.
-2. **Test** — run a Playwright end-to-end test suite against a disposable
-   local instance of our own server.
-
-Neither workflow performs sustained computation, spawns background processes
-after the job completes, or does anything resembling mining.
+Backend nodes update themselves independently — each node periodically pulls
+the latest source (`git fetch` + `git reset --hard`) and restarts its own
+local Node.js service via a systemd timer (`a2a/scripts/self-update.sh`).
+No CI runner ever connects outbound to a server on our behalf.
 
 ## No monetary or token incentives — ever
 
-This project's contribution/reputation model (see
-`a2a/docs/adr/0006-resilience-distribution-independence.md`, §0.5, a locally
-maintained design document) is explicitly and permanently **non-monetary**.
-Contributions (relay capacity, storage, endorsements) are only ever reflected
+This project's contribution/reputation model is explicitly and permanently
+**non-monetary**. Contributions (relay capacity, storage, endorsements) are only ever reflected
 as visible reputation and peer-issued verifiable credentials — never as
 tokens, payments, or any tradeable asset. There is no cryptocurrency, no
 wallet integration for value transfer, and no plan to add one.

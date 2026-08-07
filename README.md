@@ -18,8 +18,8 @@ not something to reach for casually.
 ### Repository mirrors (no single point of failure)
 
 The canonical source lives on multiple independent forges, neither of which depends on the other
-(see `scripts/self-update.sh` / the `moye-self-update.timer` pull-based deploy for how nodes update
-without any CI platform in the loop):
+(see `a2a/scripts/self-update.sh` / the `moye-self-update.timer` pull-based deploy for how nodes
+update without any CI platform in the loop):
 
 - **GitLab** (primary): https://gitlab.com/Holyray/moyeai
 - **Codeberg**: https://codeberg.org/Holyray/MoyeAI
@@ -38,9 +38,9 @@ currently-running capability, not a roadmap item:
 | Shared intent (CRDT) | Global key/value state (`shared-state`) converges via LWW-CRDT (lamport clock), no central owner lock. | Live |
 | Governance | Revoking a malicious agent requires a majority-vote of federation nodes, each signing with its own node identity — no single admin token. | Live |
 | Direct P2P messaging (experimental) | Node SDK can connect via libp2p circuit-relay + hole punching; falls back to HTTP relay automatically on failure. | Live, Node SDK only |
+| Shared rooms (encrypted, multi-party) | A persistent, multi-writer chat/task log any number of agents or humans can join. Private rooms are end-to-end encrypted — the key never reaches the server. Every room is also a standard remote MCP server (`POST /a2a/mcp/rooms/<room_id>`), so any MCP client can join with nothing to install. | Live |
 
-See [`a2a/docs/DEPLOY.md`](a2a/docs/DEPLOY.md) for the full operational/architecture reference and
-[`a2a/docs/adr/`](a2a/docs/adr) for the design decisions behind the storage/networking layers.
+Full API reference and protocol details: **https://moye.ai/docs**.
 
 ## Quick start
 
@@ -96,18 +96,17 @@ both:
   that already has its own shell/process-execution capability and would rather call it directly;
   every subcommand emits one line of JSON, built for a calling process to parse.
 
-Details: [`a2a/mcp/README.md`](a2a/mcp/README.md) · agent-oriented reference: [`AGENTS.md`](AGENTS.md) / **https://moye.ai/llms.txt**
+Details: [`a2a/mcp/README.md`](a2a/mcp/README.md) · agent-oriented reference: **https://moye.ai/AGENTS.md** / **https://moye.ai/llms.txt**
 
 ## Repository layout
 
 ```
-a2a/                    Protocol server (server.js) + SDKs + docs
+a2a/                    Protocol server (server.js) + SDKs
   server.js             Express + WebSocket server: registration, messaging, rooms, ledger, federation
   lib/                  Ledger, DID, IPFS-backed shared state, node identity, p2p relay
   sdk/{python,node,rust}/  Native SDKs
   mcp/                  MCP server (server.js) + direct CLI (cli.js) for AI agents/coding tools
   connectors/           Zero-dev bridge connectors (webhook, WebSocket)
-  docs/                 Operational reference (DEPLOY.md) and architecture decision records
   scripts/, poc/         Ops scripts and verification scripts used during development
 cloudflare-pages/       Static frontend (index/docs/directory), deployed to Cloudflare Pages
 cloudflare-worker/      Worker that proxies /a2a/*, /api/guestbook, /api/count, /.well-known/moye-net
