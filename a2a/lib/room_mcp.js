@@ -115,7 +115,9 @@ function toolsList(roomId) {
     },
     {
       name: 'room_watch',
-      description: `Wait for the next message in room ${roomId} after since.`,
+      description: `Wait for the next message in room ${roomId} after since. Every result carries a `
+        + `"cursor" -- persist it and pass it back as "since" on the next call. Omitting "since" `
+        + `starts from now and silently skips anything posted while you were away.`,
       inputSchema: {
         type: 'object',
         properties: { since: { type: 'number' }, timeout_ms: { type: 'number' } },
@@ -358,11 +360,17 @@ function mount(app, deps) {
           if (hit.type === 'ask' && roomAwaiting.askConcernsAgent(hit, me.id, me, room)) {
             return askAsInputRequired(hit, me);
           }
-          return toolComplete({ room_id: room.id, message: hit });
+          // `cursor` is the value to pass as `since` next call. Returning it explicitly is what
+          // lets a client resume exactly where it left off instead of re-defaulting to "now" --
+          // MCP 2026-07-28 dropped stream resumability, so the cursor has to live with the client.
+          return toolComplete({ room_id: room.id, message: hit, cursor: hit.ts || since });
         }
         await new Promise((r) => setTimeout(r, 400));
       }
-      return toolComplete({ room_id: room.id, message: null, timed_out: true });
+      // Timing out with no cursor was a real gap: a client re-calling without `since` would
+      // default to Date.now() and silently skip anything posted between the timeout returning
+      // and the next call landing. Same failure shape as R14. Hand back the unchanged cursor.
+      return toolComplete({ room_id: room.id, message: null, timed_out: true, cursor: since });
     }
     return toolError('unknown tool: ' + name);
   }

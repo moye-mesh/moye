@@ -183,6 +183,40 @@ async function signedPost(agent, urlPath, bodyObj) {
       'SECURITY: plaintext leaked through the pins endpoint');
     console.log('OK  R17: pins surface contains no plaintext');
 
+    // ---------- room_watch must always hand back a resumable cursor ----------
+    // MCP 2026-07-28 removed stream resumability, so the cursor has to live with the client.
+    // The dangerous case is a TIMEOUT: if the result carries no cursor, a client re-calling
+    // without `since` re-defaults to Date.now() and silently loses anything posted in the gap.
+    // That is the R14 failure shape; assert it cannot happen through the MCP surface.
+    const mcpCall = async (callerAgent, roomId, toolName, args) => {
+      const rpc = { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: toolName, arguments: args } };
+      const res = await fetch(`${BASE}/mcp/rooms/${roomId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...callerAgent._headers(callerAgent._didHeaders(rpc)) },
+        body: JSON.stringify(rpc),
+      });
+      const j = await res.json();
+      const text = j.result && j.result.content && j.result.content[0] && j.result.content[0].text;
+      try { return JSON.parse(text); } catch { return { raw: text }; }
+    };
+
+    const watchRoom = await owner.createRoom('adv-watch');
+    const timedOut = await mcpCall(owner, watchRoom.room_id, 'room_watch', { since: 1, timeout_ms: 600 });
+    assert(timedOut.timed_out === true, 'expected room_watch to time out on an idle room');
+    assert(typeof timedOut.cursor === 'number',
+      'REGRESSION RISK: room_watch timeout returned no cursor -- a client cannot resume without re-defaulting to now');
+    assert(timedOut.cursor === 1, 'timeout should hand back the unchanged cursor, got ' + timedOut.cursor);
+    console.log('OK  room_watch: timeout still returns a resumable cursor');
+
+    // And a hit must advance the cursor to that message, so the next call cannot re-deliver it.
+    await owner.sendRoomMessage(watchRoom.room_id, 'watch me');
+    const hit = await mcpCall(owner, watchRoom.room_id, 'room_watch', { since: 1, timeout_ms: 3000 });
+    assert(hit.message && hit.message.content === 'watch me', 'room_watch did not return the message');
+    assert(hit.cursor === hit.message.ts, 'cursor should equal the delivered message ts');
+    const afterHit = await mcpCall(owner, watchRoom.room_id, 'room_watch', { since: hit.cursor, timeout_ms: 600 });
+    assert(afterHit.timed_out === true, 'resuming from the returned cursor re-delivered an old message');
+    console.log('OK  room_watch: cursor advances correctly and does not re-deliver');
+
     console.log('\nADVERSARIAL_ALL_OK');
   } catch (e) {
     console.error('\nFAIL', e.message || e);
