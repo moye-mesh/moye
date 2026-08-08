@@ -29,6 +29,82 @@ function mnemonicLib() { return _mnemonicLib || (_mnemonicLib = require('../../l
 let _shamirLib = null;
 function shamirLib() { return _shamirLib || (_shamirLib = require('../../lib/shamir')); }
 
+// Deterministic JSON (recursively sorted keys) -- module-level so static methods (no `this`) can
+// use it too. Same algorithm as the instance _canonical() method and a2a/lib/agent_profile.js's
+// stableStringify -- must byte-match the server's canonicalization or signatures won't verify.
+function canonicalStringify(v) {
+  if (v === null || typeof v !== 'object') return JSON.stringify(v);
+  if (Array.isArray(v)) return '[' + v.map(canonicalStringify).join(',') + ']';
+  return '{' + Object.keys(v).sort().map((k) => JSON.stringify(k) + ':' + canonicalStringify(v[k])).join(',') + '}';
+}
+
+// ADR-0038 M8/M9 profile + webhook signing: inlined here (not required from a2a/lib/) so the
+// standalone SDK file keeps working for a single-file download -- the same reasoning as the
+// mnemonic/Shamir lazy-load above, but register() and verifyWebhookPush() are common/primary
+// paths (not an optional feature), so lazy-loading an unavailable lib/ file isn't good enough:
+// it would still throw the moment either is actually used, which for register() is almost always.
+function profileFields({ name, description, capabilities, endpoint, webhook_url }) {
+  return {
+    name: name || '',
+    description: description || '',
+    capabilities: Array.isArray(capabilities) ? capabilities : [],
+    endpoint: endpoint || '',
+    webhook_url: webhook_url || null,
+  };
+}
+function signProfileLocal(privatePem, fields) {
+  const msg = canonicalStringify(profileFields(fields));
+  return crypto.sign(null, Buffer.from(msg, 'utf8'), crypto.createPrivateKey(privatePem)).toString('base64');
+}
+function verifyProfileLocal(pubPem, fields, sigB64) {
+  if (!pubPem || !sigB64) return false;
+  try {
+    const msg = canonicalStringify(profileFields(fields));
+    return crypto.verify(null, Buffer.from(msg, 'utf8'), crypto.createPublicKey(pubPem), Buffer.from(sigB64, 'base64'));
+  } catch { return false; }
+}
+function contentHashLocal(content) {
+  if (content === undefined || content === null) return null;
+  return crypto.createHash('sha256').update(String(content)).digest('hex');
+}
+function attachmentsHashLocal(attachments) {
+  if (attachments === undefined || attachments === null) return null;
+  const arr = Array.isArray(attachments) ? attachments : [attachments];
+  if (!arr.length) return null;
+  return crypto.createHash('sha256').update(canonicalStringify(arr)).digest('hex');
+}
+function webhookSignedFields(payload) {
+  return {
+    event: payload.event || null,
+    id: payload.id || null,
+    from_agent: payload.from_agent || null,
+    to_agent: payload.to_agent || null,
+    content_hash: Object.prototype.hasOwnProperty.call(payload, 'content_hash')
+      ? payload.content_hash : contentHashLocal(payload.content),
+    attachments_hash: Object.prototype.hasOwnProperty.call(payload, 'attachments_hash')
+      ? payload.attachments_hash : attachmentsHashLocal(payload.attachments),
+    ts: payload.ts || null,
+  };
+}
+// Mirrors a2a/lib/webhook_sig.js verifyWebhook() exactly, including the round-3 fix: a signed
+// hash that's non-null requires the matching raw field to actually be present, so an attacker
+// who deletes (not just rewrites) content/attachments while leaving the original hash in place
+// is rejected the same way as one who rewrites it. Keep this in sync with lib/webhook_sig.js.
+function verifyWebhookLocal(nodePubPem, payload, sigB64) {
+  if (!nodePubPem || !sigB64) return false;
+  const fields = webhookSignedFields(payload);
+  if (fields.content_hash != null
+    && (!Object.prototype.hasOwnProperty.call(payload, 'content')
+      || contentHashLocal(payload.content) !== fields.content_hash)) return false;
+  if (fields.attachments_hash != null
+    && (!Object.prototype.hasOwnProperty.call(payload, 'attachments')
+      || attachmentsHashLocal(payload.attachments) !== fields.attachments_hash)) return false;
+  try {
+    return crypto.verify(null, Buffer.from(canonicalStringify(fields), 'utf8'),
+      crypto.createPublicKey(nodePubPem), Buffer.from(sigB64, 'base64'));
+  } catch { return false; }
+}
+
 function request(baseUrl, method, path, data, headers, timeoutMs) {
   return new Promise((resolve, reject) => {
     const url = new URL(baseUrl.replace(/\/$/, '') + path);
@@ -60,13 +136,14 @@ function request(baseUrl, method, path, data, headers, timeoutMs) {
 }
 
 class Agent {
-  constructor({ name, capabilities = [], description = '', endpoint = '', owner = '', baseUrl = 'https://moye.ai/a2a', agentId = null, token = null } = {}) {
+  constructor({ name, capabilities = [], description = '', endpoint = '', owner = '', webhookUrl = null, baseUrl = 'https://moye.ai/a2a', agentId = null, token = null } = {}) {
     if (!name) throw new MoyeError('name required');
     this.name = name;
     this.capabilities = capabilities;
     this.description = description;
     this.endpoint = endpoint;
     this.owner = owner;
+    this.webhookUrl = webhookUrl || null;
     this.baseUrl = baseUrl.replace(/\/$/, '');
     this.agentId = agentId;
     this.token = token;
@@ -279,7 +356,18 @@ class Agent {
       name: this.name, description: this.description,
       capabilities: this.capabilities, endpoint: this.endpoint, owner: this.owner,
     };
-    if (this._priv) payload.pubkey = this._pubkeyPem();
+    if (this.webhookUrl) payload.webhook_url = this.webhookUrl;
+    if (this._priv) {
+      payload.pubkey = this._pubkeyPem();
+      // ADR-0038 M8: agent DID signs profile fields at registration
+      payload.profile_sig = signProfileLocal(this._priv, {
+        name: this.name,
+        description: this.description,
+        capabilities: this.capabilities,
+        endpoint: this.endpoint,
+        webhook_url: this.webhookUrl || null,
+      });
+    }
     if (this._encPriv) payload.enc_pubkey = this._encPubkeyForRegister();
     // P3: optional field, this.p2pAddrs only gets set if sdk/node/p2p.js is installed and
     // attachP2P() is called -- doesn't affect this file's own zero-dependency nature, it's
@@ -290,6 +378,26 @@ class Agent {
     this.token = r.token;
     if (r.did) this.did = r.did;
     return this.agentId;
+  }
+
+  /** ADR-0038 M8: verify profile_sig on an agent record against its pubkey. */
+  static verifyAgentProfile(agent) {
+    if (!agent || !agent.pubkey || !agent.profile_sig) return null;
+    return verifyProfileLocal(agent.pubkey, {
+      name: agent.name,
+      description: agent.description,
+      capabilities: agent.capabilities,
+      endpoint: agent.endpoint,
+      webhook_url: agent.webhook_url || null,
+    }, agent.profile_sig);
+  }
+
+  /** ADR-0038 M9: verify an X-Moye-Sig webhook push against the sending node's pubkey (fetch it
+   *  from GET /api/node/identity). Pass the exact parsed JSON body -- content_hash/attachments_hash
+   *  travel on the wire, so nothing needs recomputing here. Rejects a signed hash whose matching
+   *  raw field was rewritten OR deleted, not just rewritten. */
+  static verifyWebhookPush(nodePubPem, wireBody, sigB64) {
+    return verifyWebhookLocal(nodePubPem, wireBody, sigB64);
   }
 
   // Fetches the recipient's encryption public key, encrypts the content, and sends it (E2E)

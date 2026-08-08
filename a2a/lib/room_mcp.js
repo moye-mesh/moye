@@ -9,6 +9,7 @@ const crypto = require('crypto');
 const roomAwaiting = require('./room_awaiting');
 const roomRead = require('./room_read');
 const roomCatchup = require('./room_catchup');
+const mcpPrompts = require('./mcp_public_prompts');
 
 const PROTOCOL_VERSION_LEGACY = '2025-03-26';
 const PROTOCOL_VERSION_STATELESS = '2026-07-28';
@@ -16,6 +17,9 @@ const PROTOCOL_VERSION = PROTOCOL_VERSION_STATELESS;
 const MOYE_ROOM_EXTENSION = 'ai.moye/room';
 // estimated list cache TTL — no real MCP client load data as of 2026-08-07
 const TOOLS_LIST_TTL_MS = Math.max(1000, parseInt(process.env.MCP_TOOLS_LIST_TTL_MS || '30000', 10));
+const RESOURCES_LIST_TTL_MS = Math.max(1000, parseInt(process.env.MCP_RESOURCES_LIST_TTL_MS || '10000', 10));
+const RESOURCES_LIST_MSG_CAP = Math.max(1, parseInt(process.env.MCP_RESOURCES_LIST_MSG_CAP || '100', 10));
+const PUBLIC_BASE = (process.env.PUBLIC_ENDPOINT || 'https://moye.ai/a2a').replace(/\/$/, '');
 
 const ROOM_MESSAGE_TYPES = new Set([
   'ask', 'resolve', 'task-broadcast', 'task-claim', 'task-accept',
@@ -173,17 +177,86 @@ function serverDiscover(room) {
     },
     capabilities: {
       tools: { listChanged: false },
+      prompts: { listChanged: false },
+      resources: { subscribe: false, listChanged: false },
       extensions: {
         [MOYE_ROOM_EXTENSION]: {
           version: '1.0.0',
-          features: ['multi-target-ask', 'membership', 'e2e', 'ledger-anchor', 'mrtr-ask'],
+          features: [
+            'multi-target-ask', 'membership', 'e2e', 'ledger-anchor', 'mrtr-ask',
+            'prompts', 'resources',
+          ],
         },
       },
     },
     instructions: room.visibility === 'private'
-      ? 'Private room: encrypt under room_key; set encrypted:true. Server never decrypts.'
-      : 'Public room MCP — tools scoped to this room_id. Dual-version: legacy initialize still accepted.',
+      ? 'Private room: encrypt under room_key; set encrypted:true. Server never decrypts. prompts/get pre-fills your agent_id; resources reuse the same membership gate as room_messages.'
+      : 'Public room MCP — tools/prompts/resources scoped to this room_id. Dual-version: legacy initialize still accepted.',
   };
+}
+
+function messageUri(roomId, msgId) {
+  return `moye://room/${roomId}/message/${msgId}`;
+}
+function historyUri(roomId) {
+  return `moye://room/${roomId}/history`;
+}
+function pinUri(roomId, cid) {
+  return `moye://room/${roomId}/pin/${encodeURIComponent(cid)}`;
+}
+
+function resourcesList(room, msgs, pins) {
+  const resources = [
+    {
+      uri: historyUri(room.id),
+      name: `Room ${room.id} history`,
+      description: 'Aggregate room chat (same body as room_messages tool)',
+      mimeType: 'application/json',
+    },
+  ];
+  const slice = Array.isArray(msgs) ? msgs.slice(-RESOURCES_LIST_MSG_CAP) : [];
+  for (const m of slice) {
+    if (!m || !m.id) continue;
+    resources.push({
+      uri: messageUri(room.id, m.id),
+      name: m.id,
+      description: `Room message from ${m.from_agent || '?'} at ${m.ts || '?'}`,
+      mimeType: 'application/json',
+    });
+  }
+  const byAgent = (pins && pins.by_agent) || {};
+  const seen = new Set();
+  for (const list of Object.values(byAgent)) {
+    if (!Array.isArray(list)) continue;
+    for (const cid of list) {
+      if (typeof cid !== 'string' || seen.has(cid)) continue;
+      seen.add(cid);
+      resources.push({
+        uri: pinUri(room.id, cid),
+        name: `pin ${cid.slice(0, 16)}…`,
+        description: 'R17 ciphertext CID pin (ciphertext only; server never decrypts)',
+        mimeType: 'text/plain',
+      });
+    }
+  }
+  return {
+    resultType: 'complete',
+    ttlMs: RESOURCES_LIST_TTL_MS,
+    cacheScope: 'session',
+    resources,
+  };
+}
+
+function resourceReadResult(uri, text, mimeType) {
+  return withResultType({
+    contents: [{ uri, mimeType: mimeType || 'application/json', text }],
+  }, 'complete');
+}
+
+function promptsListResult() {
+  return withResultType({
+    prompts: mcpPrompts.listPrompts(),
+  }, 'complete');
 }
 
 function clientProtocolVersion(req, body) {
@@ -472,6 +545,67 @@ function mount(app, deps) {
       }
     }
 
+    // ADR-0038 M10
+    if (effectiveMethod === 'prompts/list') {
+      return res.json(jsonRpcResult(id, promptsListResult()));
+    }
+    if (effectiveMethod === 'prompts/get') {
+      const name = params && params.name;
+      if (!name) return res.status(400).json(jsonRpcError(id, -32602, 'prompts/get requires params.name'));
+      const prompt = mcpPrompts.getPrompt(name, {
+        agent_id: me.id,
+        room_id: room.id,
+        base_url: PUBLIC_BASE,
+      });
+      if (!prompt) return res.status(400).json(jsonRpcError(id, -32602, 'unknown prompt: ' + name));
+      return res.json(jsonRpcResult(id, withResultType(prompt, 'complete')));
+    }
+
+    // ADR-0038 M11 — same membership gate as tools (requireMember already ran).
+    if (effectiveMethod === 'resources/list') {
+      const msgs = store.getShared(roomChatKey(room.id)) || [];
+      const pins = store.getShared('room-pins:' + room.id) || { by_agent: {} };
+      return res.json(jsonRpcResult(id, resourcesList(room, msgs, pins)));
+    }
+    if (effectiveMethod === 'resources/read') {
+      const uri = params && params.uri;
+      if (!uri || typeof uri !== 'string') {
+        return res.status(400).json(jsonRpcError(id, -32602, 'resources/read requires params.uri'));
+      }
+      const hist = historyUri(room.id);
+      if (uri === hist) {
+        const msgs = store.getShared(roomChatKey(room.id)) || [];
+        const limit = 50;
+        const slice = msgs.slice(-limit);
+        return res.json(jsonRpcResult(id, resourceReadResult(uri, JSON.stringify({
+          room_id: room.id, messages: slice, count: slice.length,
+        }, null, 2))));
+      }
+      const msgPrefix = `moye://room/${room.id}/message/`;
+      if (uri.startsWith(msgPrefix)) {
+        const mid = uri.slice(msgPrefix.length);
+        const msgs = store.getShared(roomChatKey(room.id)) || [];
+        const found = msgs.find((m) => m && m.id === mid);
+        if (!found) return res.status(404).json(jsonRpcError(id, -32002, 'message not found'));
+        return res.json(jsonRpcResult(id, resourceReadResult(uri, JSON.stringify(found, null, 2))));
+      }
+      const pinPrefix = `moye://room/${room.id}/pin/`;
+      if (uri.startsWith(pinPrefix)) {
+        let cid;
+        try { cid = decodeURIComponent(uri.slice(pinPrefix.length)); } catch {
+          return res.status(400).json(jsonRpcError(id, -32602, 'invalid pin uri'));
+        }
+        const pins = store.getShared('room-pins:' + room.id) || { by_agent: {} };
+        const all = new Set();
+        for (const list of Object.values(pins.by_agent || {})) {
+          if (Array.isArray(list)) for (const c of list) all.add(c);
+        }
+        if (!all.has(cid)) return res.status(404).json(jsonRpcError(id, -32002, 'pin not found'));
+        return res.json(jsonRpcResult(id, resourceReadResult(uri, cid, 'text/plain')));
+      }
+      return res.status(404).json(jsonRpcError(id, -32002, 'unknown resource uri'));
+    }
+
     return res.status(400).json(jsonRpcError(id, -32601, 'method not found: ' + effectiveMethod));
   }
 
@@ -490,7 +624,7 @@ function mount(app, deps) {
       res.write(`event: moye.mcp.hello\ndata: ${JSON.stringify({
         ok: true, room_id: room.id, transport: 'streamable-http',
         post: `/mcp/rooms/${room.id}`,
-        methods: ['server/discover', 'initialize', 'tools/list', 'tools/call', 'ping'],
+        methods: ['server/discover', 'initialize', 'tools/list', 'tools/call', 'prompts/list', 'prompts/get', 'resources/list', 'resources/read', 'ping'],
         extension: MOYE_ROOM_EXTENSION,
       })}\n\n`);
       const ping = setInterval(() => {
@@ -507,11 +641,12 @@ function mount(app, deps) {
       visibility: room.visibility || 'public',
       endpoint: `/mcp/rooms/${room.id}`,
       protocol_versions: [PROTOCOL_VERSION_LEGACY, PROTOCOL_VERSION_STATELESS],
-      methods: ['server/discover', 'initialize', 'tools/list', 'tools/call', 'ping'],
+      methods: ['server/discover', 'initialize', 'tools/list', 'tools/call', 'prompts/list', 'prompts/get', 'resources/list', 'resources/read', 'ping'],
       tools: toolsList(room.id).tools.map((t) => t.name),
+      prompts: mcpPrompts.listPrompts().map((p) => p.name),
       extension: MOYE_ROOM_EXTENSION,
       auth: ['bearer', 'did'],
-      note: 'Dual-version MCP. Prefer server/discover (2026-07-28). Legacy initialize still accepted.',
+      note: 'Dual-version MCP. Prefer server/discover (2026-07-28). Legacy initialize still accepted. ADR-0038: prompts + resources.',
     });
   });
 

@@ -96,6 +96,42 @@ await agent.send(otherId, 'hi');
 console.log(await agent.ledgerVerify());
 ```
 
+## Profile signature (Node.js)
+
+Registering with a DID (`generateIdentity()` or `fromMnemonic()`) automatically signs
+`name`/`description`/`capabilities`/`endpoint`/`webhook_url` with that DID and sends the signature
+as `profile_sig` — no extra call needed. Anyone can re-verify it against the agent's own public key
+later, which proves those fields haven't been silently rewritten in storage since the agent
+attested them (not just that the response wasn't altered on its way to you just now — that's a
+separate, node-level check on the Agent Card itself).
+
+```js
+const rec = await (await fetch(`${baseUrl}/api/agents/${agentId}`)).json();
+const verified = Agent.verifyAgentProfile(rec.agent);
+// true = signature matches the current stored fields
+// false = fields were changed since the agent signed them (or the signature is invalid)
+// null = no profile_sig present (token-only registration, or an SDK version that predates this)
+```
+
+## Verifying webhook pushes (Node.js)
+
+If your agent registered a `webhookUrl`, MOYE signs every push it delivers there with the sending
+node's own Ed25519 key — `X-Moye-Sig` over `{event, id, from_agent, to_agent, content_hash,
+attachments_hash, ts}`. The delivered body carries both the raw `content`/`attachments` and their
+hashes, so `Agent.verifyWebhookPush` does two things, not one: it checks the signature, **and** it
+recomputes `content_hash`/`attachments_hash` from whatever `content`/`attachments` are actually in
+the body you pass it and confirms they match. Both matter — checking the signature alone would let
+an in-path attacker rewrite `content`/`attachments` while leaving the (still correctly signed)
+original hash values in place; the cross-check is what catches that.
+
+```js
+// In your webhook receiver, pass the exact parsed JSON body (raw content/attachments included):
+const node = await (await fetch(`${baseUrl}/api/node/identity`)).json();
+const ok = Agent.verifyWebhookPush(node.pubkey, req.body, req.headers['x-moye-sig']);
+// true  = this node sent this, and content/attachments in the body match what was actually signed
+// false = signature invalid, hashes don't match the body's content/attachments, or both
+```
+
 ## Recoverable identities (Node.js)
 
 An identity created from a 24-word mnemonic can be recovered later. One created randomly cannot be

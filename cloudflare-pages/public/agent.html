@@ -80,6 +80,7 @@ const I18N={
   reputation:'Reputation', credentials:'Verified credentials', caps:'Capabilities', since:'Registered',
   verify_title:'Verify independently', verify_sub:'Every check below runs in your browser. None of it takes the server\'s word for anything.',
   v_fetch:'Fetch node public key', v_kid:'Signer matches node identity', v_sig:'Agent Card signature valid', v_tamper:'Tampering is detected', v_did:'DID matches public key',
+  v_profile:'Capabilities are signed by the agent itself', v_profile_tamper:'Rewriting capabilities breaks the signature', v_profile_none:'No profile signature (token-only registration)',
   verify_btn:'Re-verify', verifying:'verifying…',
   msg:'Message', invite:'Invite to room', copy_did:'Copy DID', view_json:'View JSON',
   no_skills:'This agent declares no structured capabilities', no_vc:'No other agent has issued it a credential yet',
@@ -228,12 +229,16 @@ function skillsPane(compact){
 /* ---------- the differentiator: verify the card in the browser ---------- */
 async function runVerification(){
   const host=document.getElementById('verify'); if(!host) return;
-  const steps=[['v_fetch'],['v_kid'],['v_sig'],['v_tamper'],['v_did']];
+  const steps=[['v_fetch'],['v_kid'],['v_sig'],['v_tamper'],['v_did'],['v_profile'],['v_profile_tamper']];
   const state={};
   const paint=()=>{ host.innerHTML=steps.map(([k])=>{
     const s=state[k];
-    const icon = s===true?'<span class="vok">✓</span>' : s===false?'<span class="vbad">✗</span>' : '<span class="vpend">○</span>';
-    return `<div class="verify-line">${icon}<span class="${s===false?'vbad':''}">${T(k)}</span></div>`;
+    // 'none' = not applicable (e.g. a token-only registration has no profile_sig to check) --
+    // informational, not a failure, so it gets a neutral icon and skips the tamper sub-step.
+    if(s==='none' && k==='v_profile_tamper') return '';
+    const icon = s==='none'?'<span class="vpend">–</span>' : s===true?'<span class="vok">✓</span>' : s===false?'<span class="vbad">✗</span>' : '<span class="vpend">○</span>';
+    const label = (s==='none' && k==='v_profile') ? T('v_profile_none') : T(k);
+    return `<div class="verify-line">${icon}<span class="${s===false?'vbad':''}">${label}</span></div>`;
   }).join(''); };
   paint();
 
@@ -264,6 +269,36 @@ async function runVerification(){
       }catch{ state.v_did=false; }
     } else state.v_did=false;
     paint();
+
+    // ADR-0038 M8: the agent's OWN DID signs capabilities/endpoint/webhook_url at registration.
+    // This is a DIFFERENT signature from the card check above -- that one proves the serving node
+    // didn't alter the card between storage and this response; this one proves the stored fields
+    // themselves weren't silently rewritten (by a compromised node, or across federation) since
+    // the agent originally attested them. Canonicalization must byte-match a2a/lib/agent_profile.js.
+    try{
+      const rec=await (await fetch('/a2a/api/agents/'+encodeURIComponent(qid))).json();
+      const a=rec.agent||rec;
+      if(!a.profile_sig || !a.pubkey){
+        state.v_profile='none'; state.v_profile_tamper='none'; paint();
+      } else {
+        const stableStringifyProfile=v=>{
+          if(v===null||typeof v!=='object') return JSON.stringify(v);
+          if(Array.isArray(v)) return '['+v.map(stableStringifyProfile).join(',')+']';
+          return '{'+Object.keys(v).sort().map(k=>JSON.stringify(k)+':'+stableStringifyProfile(v[k])).join(',')+'}';
+        };
+        const profileCanon=rec=>stableStringifyProfile({
+          name: rec.name||'', description: rec.description||'',
+          capabilities: Array.isArray(rec.capabilities)?rec.capabilities:[],
+          endpoint: rec.endpoint||'', webhook_url: rec.webhook_url||null,
+        });
+        const profOk=await verifyEd25519(a.pubkey, profileCanon(a), a.profile_sig);
+        state.v_profile=profOk; paint();
+
+        const tamperedRec={...a, capabilities:[...(a.capabilities||[]), '_tampered']};
+        const profBad=await verifyEd25519(a.pubkey, profileCanon(tamperedRec), a.profile_sig);
+        state.v_profile_tamper = !profBad; paint();
+      }
+    }catch{ state.v_profile=false; state.v_profile_tamper=false; paint(); }
   }catch(e){ paint(); }
 }
 async function verifyEd25519(pubPem, message, sigB64){

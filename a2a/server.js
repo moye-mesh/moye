@@ -18,6 +18,8 @@ const shard = require('./lib/shard');     // ADR-0008: consistent-hash directory
 const firehose = require('./lib/firehose'); // ADR-0013: SSE/NDJSON live event stream
 const a2aTaskStream = require('./lib/a2a_task_stream'); // ADR-0030: per-task SSE for tasks/resubscribe
 const roomMcp = require('./lib/room_mcp');           // ADR-0031: room-as-MCP-server (Streamable HTTP)
+const agentProfile = require('./lib/agent_profile'); // ADR-0038 M8
+const webhookSig = require('./lib/webhook_sig');     // ADR-0038 M9
 const roomAwaiting = require('./lib/room_awaiting'); // ADR-0027 D1/D3: multi-target + capability ask
 const roomCatchup = require('./lib/room_catchup');   // ADR-0037 R21: cross-room catchup
 const roomRead = require('./lib/room_read');         // R20: memoized catch-up + binary since slice
@@ -67,7 +69,7 @@ const RESERVED_SHARED_PREFIXES = ['revoke:', 'reputation:'];
 // soft-fork *signaling* than its activation mechanism (MOYE has no hashpower-equivalent objective
 // threshold; adoption data here is informational, not a trigger that flips anything on by itself).
 const PROTOCOL_VERSION = '1.6';
-const PROTOCOL_FEATURES = ['capability-schema', 'verifiable-credentials', 'message-signing', 'rich-crdt', 'a2a-jsonrpc-bridge', 'portable-address-attestation', 'capability-input-filter', 'seeds-multisig-governance', 'firehose', 'message-attachments', 'room-awaiting', 'node-did-federation-auth', 'room-fork', 'slip0010', 'identity-delegation', 'session-keys', 'resolve-at', 'agent-timeline', 'gravity-search', 'room-mcp', 'shard-route', 'query-directory', 'room-state-staleness', 'room-mcp-mrtr', 'room-pinning', 'room-consolidate', 'mnemonic-identity', 'domain-verify', 'room-read-cache', 'agent-catchup', 'ask-deadline'];
+const PROTOCOL_FEATURES = ['capability-schema', 'verifiable-credentials', 'message-signing', 'rich-crdt', 'a2a-jsonrpc-bridge', 'portable-address-attestation', 'capability-input-filter', 'seeds-multisig-governance', 'firehose', 'message-attachments', 'room-awaiting', 'node-did-federation-auth', 'room-fork', 'slip0010', 'identity-delegation', 'session-keys', 'resolve-at', 'agent-timeline', 'gravity-search', 'room-mcp', 'shard-route', 'query-directory', 'room-state-staleness', 'room-mcp-mrtr', 'room-pinning', 'room-consolidate', 'mnemonic-identity', 'domain-verify', 'room-read-cache', 'agent-catchup', 'ask-deadline', 'agent-profile-sig', 'webhook-sig', 'room-mcp-prompts', 'room-mcp-resources'];
 
 // Broadcast a newly-registered agent to peer nodes immediately (doesn't wait for the 15s reconcile cycle)
 function announceToPeers(agent) {
@@ -318,12 +320,25 @@ function deliverWebhook(url, payload) {
   // Re-validate at delivery time (DNS rebinding defense); skip silently if the target is unsafe.
   webhookUrlSafe(url).then((v) => {
     if (!v.ok) { console.warn('[webhook] blocked delivery to', url, '-', v.reason); return; }
-    const data = JSON.stringify(payload);
+    // ADR-0038 M9: node-signed push — receiver optionally verifies with GET /api/node/identity.
+    // attachments_hash closes a follow-up gap: the signature originally covered content but not
+    // attachments, so an in-flight attacker on an unencrypted http:// webhook_url could strip or
+    // alter attachments without breaking X-Moye-Sig.
+    const { fields, sig } = webhookSig.signWebhook((msg) => nodeIdentity.sign(msg), payload);
+    const wire = { ...payload, content_hash: fields.content_hash, attachments_hash: fields.attachments_hash };
+    const data = JSON.stringify(wire);
     const lib = u.protocol === 'https:' ? require('https') : http;
     const req = lib.request({
       hostname: u.hostname, port: u.port || (u.protocol === 'https:' ? 443 : 80),
       path: u.pathname + u.search, method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data), 'X-Moye-Event': 'message' },
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(data),
+        'X-Moye-Event': String(payload.event || 'message'),
+        'X-Moye-Sig': sig,
+        'X-Moye-Node': nodeIdentity.nodeId,
+        'X-Moye-Node-Did': nodeIdentity.did,
+      },
       timeout: 5000,
     }, (r) => { r.resume(); });
     req.on('error', () => {});
@@ -740,14 +755,15 @@ async function authAgent(req) {
 //  Classic: no pubkey -> server issues a token
 //  Decentralized: pubkey provided (Ed25519 PEM) -> derives did:moye:<fingerprint>, server only stores the public key
 app.post('/api/agents', async (req, res) => {
-  const { name, description, capabilities, endpoint, owner, pubkey, enc_pubkey, webhook_url } = req.body || {};
+  const { name, description, capabilities, endpoint, owner, pubkey, enc_pubkey, webhook_url, profile_sig } = req.body || {};
   if (!name) return fail(res, 400, 'name required');
   // SSRF guard: reject webhook targets that resolve to loopback/private/link-local addresses
   if (webhook_url) { const v = await webhookUrlSafe(webhook_url); if (!v.ok) return fail(res, 400, 'invalid webhook_url: ' + v.reason); }
   // ADR-0006 workstream E: relay tier is a distinct self-report from p2p_addrs -- p2p_addrs means
   // "dial me here" (which can be stale or unreachable), not "I can relay for others". Purely
-  // self-attested (same trust model as pubkey/capabilities/endpoint elsewhere in this handler: the
-  // server never actively probes them). Never rejects a request over this field -- an unset or
+  // self-attested for reachability hints (server never probes). Profile fields
+  // (name/description/capabilities/endpoint/webhook_url) are separately covered by ADR-0038 M8
+  // profile_sig when a pubkey is present. Never rejects a request over relay_tier -- an unset or
   // unrecognized value just falls back to 'unknown', so older/naive clients keep working unchanged.
   const relay_tier = ['public', 'hole-punched', 'leech'].includes(req.body && req.body.relay_tier) ? req.body.relay_tier : 'unknown';
   // ADR-0006 workstream P2 (scaffolding, unverified): an agent may optionally self-report its own
@@ -781,12 +797,26 @@ app.post('/api/agents', async (req, res) => {
   if (pubkey) {
     try { did = didlib.deriveDid(pubkey); } catch { return fail(res, 400, 'invalid pubkey (Ed25519 PEM expected)'); }
   }
+  // ADR-0038 M8: when registering with a DID pubkey, optionally (SDK always) attach profile_sig
+  // over name/description/capabilities/endpoint/webhook_url. Verified against pubkey before store.
+  let storedProfileSig = null;
+  if (pubkey && profile_sig) {
+    const fields = {
+      name, description: description || '', capabilities: capabilities || [],
+      endpoint: endpoint || '', webhook_url: webhook_url || null,
+    };
+    if (!agentProfile.verifyProfile(pubkey, fields, profile_sig)) {
+      return fail(res, 400, 'invalid profile_sig');
+    }
+    storedProfileSig = profile_sig;
+  }
   stmt.insertAgent.run(id, name, hashToken(token), ledger.NODE_ID, Date.now());
   // Directory/pubkey/capabilities are written to IPFS shared state (decentralized, visible across nodes)
   const registered = await store.putAgent(id, {
     id, name, description: description || '', capabilities: capabilities || [], endpoint: endpoint || '',
     owner: owner || '', pubkey: pubkey || null, did: did || null, enc_pubkey: enc_pubkey || null,
     webhook_url: webhook_url || null, home_node: ledger.NODE_ID, created_at: Date.now(),
+    profile_sig: storedProfileSig,
     p2p_addrs: req.body && req.body.p2p_addrs ? req.body.p2p_addrs : null,   // P3: libp2p direct-connect multiaddrs
     relay_tier,  // ADR-0006 workstream E: self-reported relay capability ('public'|'hole-punched'|'leech'|'unknown')
     overlay_addr // ADR-0006 workstream P2 (scaffolding): self-reported Yggdrasil overlay IPv6, or null
@@ -3688,7 +3718,7 @@ app.get(['/api/network', '/.well-known/moye-net'], async (req, res) => {
       room_at: '/api/rooms/:id/at?ts=|checkpoint=',
       // ADR-0031: per-room MCP Streamable HTTP (JSON-RPC initialize|tools/list|tools/call).
       // Coexists with stdio MCP at /mcp-dist — scoped to one room_id; no create/join tools.
-      room_mcp: '/mcp/rooms/:id  (POST JSON-RPC; GET discovery|SSE hello); Bearer or DID',
+      room_mcp: '/mcp/rooms/:id  (POST JSON-RPC: tools + prompts/list|get + resources/list|read; GET discovery|SSE hello); Bearer or DID',
       resolve_at: '/api/agents/:id/resolve?at=<ts|seq:N>',
       timeline: '/api/agents/:id/timeline',
       dashboard: '/dashboard/dashboard.html',
