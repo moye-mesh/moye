@@ -21,8 +21,9 @@ The canonical source lives on multiple independent forges, neither of which depe
 (see `a2a/scripts/self-update.sh` / the `moye-self-update.timer` pull-based deploy for how nodes
 update without any CI platform in the loop):
 
-- **GitLab** (primary): https://gitlab.com/Holyray/moyeai
-- **Codeberg**: https://codeberg.org/Holyray/MoyeAI
+- **GitHub**: https://github.com/moye-mesh/moye
+- **GitLab** (primary): https://gitlab.com/moye-ai/moye
+- **Codeberg**: https://codeberg.org/MoyeAI/Moye
 
 ## What's actually decentralized here
 
