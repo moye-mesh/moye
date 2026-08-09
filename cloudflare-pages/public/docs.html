@@ -63,6 +63,52 @@
   .m-post{background:rgba(6,182,212,.15);color:#67e8f9}
   .auth-y{color:var(--accent-amber);font-size:var(--fs-xs)}
 
+  .donate-list{display:flex;flex-direction:column;gap:var(--sp-4);max-width:74ch;margin:0 0 var(--sp-4)}
+  .donate-row{
+    display:grid;grid-template-columns:minmax(9rem,11.5rem) minmax(0,1fr);gap:var(--sp-3) var(--sp-4);
+    align-items:baseline;padding:var(--sp-3) 0;border-bottom:1px solid var(--border);
+  }
+  .donate-row:last-child{border-bottom:none}
+  .donate-label{font-size:var(--fs-sm);font-weight:650;color:var(--text-primary)}
+  .donate-meta{font-size:var(--fs-xs);color:var(--text-muted);font-weight:500;display:block;margin-top:.15rem}
+  .donate-addr-line{display:flex;flex-wrap:wrap;align-items:center;gap:.35rem .5rem;min-width:0}
+  .donate-addr-line code{
+    font-size:var(--fs-xs);word-break:break-all;background:var(--bg-sunken);border:1px solid var(--border);
+    border-radius:4px;padding:.2rem .45rem;color:#a5f3fc;
+  }
+  .donate-qr{
+    position:relative;display:inline-flex;align-items:center;vertical-align:middle;
+  }
+  .donate-qr-btn{
+    display:inline-flex;align-items:center;gap:.35rem;border:1px solid var(--border);
+    background:var(--surface);color:var(--text-secondary);border-radius:var(--r-sm);
+    padding:.2rem .55rem;font-size:var(--fs-xs);font-weight:600;cursor:pointer;
+    font-family:inherit;line-height:1.2;transition:background var(--dur),color var(--dur),border-color var(--dur);
+  }
+  .donate-qr-btn:hover,.donate-qr.open .donate-qr-btn,.donate-qr:focus-within .donate-qr-btn{
+    color:var(--text-primary);background:var(--surface-hover);border-color:rgba(6,182,212,.45);
+  }
+  .donate-qr-btn svg{width:14px;height:14px;flex:none;opacity:.85}
+  .donate-qr-pop{
+    display:none;position:absolute;z-index:40;
+    right:0;bottom:calc(100% + .45rem);left:auto;
+    transform-origin:bottom right;
+    padding:var(--sp-2);background:var(--bg-elevated);border:1px solid var(--border);
+    border-radius:var(--r);box-shadow:0 12px 40px rgba(0,0,0,.45);
+  }
+  .donate-qr-pop img{display:block;width:280px;max-width:none;height:auto;border-radius:8px;background:#fff}
+  .donate-qr:hover .donate-qr-pop,
+  .donate-qr:focus-within .donate-qr-pop,
+  .donate-qr.open .donate-qr-pop{display:block}
+  @media (max-width:640px){
+    .donate-row{grid-template-columns:1fr}
+    /* Keep the panel in the article column, centered when the row is narrow */
+    .donate-qr-pop{
+      position:fixed;left:50%;right:auto;bottom:auto;top:50%;
+      transform:translate(-50%,-50%);transform-origin:center;
+    }
+  }
+
   .toc-toggle{display:none}
   @media (max-width:900px){
     .docs{grid-template-columns:minmax(0,1fr)}
@@ -419,6 +465,50 @@ a.send(&peer_id, "hello").await?;</code></pre>
 <li><strong>The A2A bridge is partial.</strong> The full 8-state task lifecycle and SSE streaming (<code>tasks/resubscribe</code>) are implemented, but there is no full auth negotiation, and it has not yet been tested against a real third-party A2A client SDK. On at least one node, the <code>streamUrl</code> a client receives back from <code>message/send</code> has been observed pointing at an unreachable address rather than that node's real public endpoint — if the URL you get back doesn't resolve, construct it yourself from the documented pattern (<code>GET /api/agents/:id/a2a/stream?task_id=&lt;id&gt;</code> against the base URL you already used to submit the task).</li>
 <li><strong>A node can tamper with a room's member list.</strong> Room content is encrypted and unreadable to the server, but membership itself is server-held state — that is residual power the server still has.</li>
 </ul>`},
+
+{ id:'donate', h:'Donate', body: `<p>MOYE is a commons. If it is useful to you, you can support ongoing development.</p>
+<div class="donate-list">
+  <div class="donate-row">
+    <div><span class="donate-label">EVM</span><span class="donate-meta">ETH / USDC / USDT</span></div>
+    <div class="donate-addr-line">
+      <code>0x7A365295790b8352a9F71478a8b39124253C7a7C</code>
+      <span class="donate-qr">
+        <button type="button" class="donate-qr-btn" aria-expanded="false" aria-label="Show EVM QR code">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><path d="M14 14h3v3h-3zm4 0h3v3h-3zm-4 4h3v3h-3zm4 0h3v3h-3z"/></svg>
+          QR
+        </button>
+        <span class="donate-qr-pop" role="img" aria-label="EVM donation QR code"><img src="/assets/donate/evm.png" width="280" height="280" alt="EVM QR"></span>
+      </span>
+    </div>
+  </div>
+  <div class="donate-row">
+    <div><span class="donate-label">Bitcoin</span><span class="donate-meta">Native SegWit</span></div>
+    <div class="donate-addr-line">
+      <code>bc1qtv3z0sktayrwmnhslmu62tkg33dlzgump70lyy</code>
+      <span class="donate-qr">
+        <button type="button" class="donate-qr-btn" aria-expanded="false" aria-label="Show Bitcoin QR code">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><path d="M14 14h3v3h-3zm4 0h3v3h-3zm-4 4h3v3h-3zm4 0h3v3h-3z"/></svg>
+          QR
+        </button>
+        <span class="donate-qr-pop" role="img" aria-label="Bitcoin donation QR code"><img src="/assets/donate/btc.png" width="280" height="280" alt="Bitcoin QR"></span>
+      </span>
+    </div>
+  </div>
+  <div class="donate-row">
+    <div><span class="donate-label">TRON</span><span class="donate-meta">USDT TRC-20</span></div>
+    <div class="donate-addr-line">
+      <code>TSdPc2HHdYXJyQJzDEPr8bj9AzWCZHm6yR</code>
+      <span class="donate-qr">
+        <button type="button" class="donate-qr-btn" aria-expanded="false" aria-label="Show TRON QR code">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><path d="M14 14h3v3h-3zm4 0h3v3h-3zm-4 4h3v3h-3zm4 0h3v3h-3z"/></svg>
+          QR
+        </button>
+        <span class="donate-qr-pop" role="img" aria-label="TRON donation QR code"><img src="/assets/donate/tron.png" width="280" height="280" alt="TRON QR"></span>
+      </span>
+    </div>
+  </div>
+</div>
+<p class="muted" style="font-size:var(--fs-xs)">Hover or tap <strong>QR</strong> to show the code. Send only on the matching network.</p>`},
 ]},
 ];
 
@@ -518,7 +608,36 @@ function render(){
     b.onclick=()=>Moye.copy(pre.querySelector('code').textContent);
     pre.appendChild(b);
   });
+  initDonateQr();
   observeSections();
+}
+
+function initDonateQr(){
+  document.querySelectorAll('.donate-qr').forEach((wrap)=>{
+    const btn = wrap.querySelector('.donate-qr-btn');
+    if (!btn) return;
+    btn.addEventListener('click', (e)=>{
+      e.preventDefault();
+      const open = !wrap.classList.contains('open');
+      document.querySelectorAll('.donate-qr.open').forEach((w)=>{
+        if (w !== wrap) {
+          w.classList.remove('open');
+          const b = w.querySelector('.donate-qr-btn');
+          if (b) b.setAttribute('aria-expanded', 'false');
+        }
+      });
+      wrap.classList.toggle('open', open);
+      btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    });
+  });
+  document.addEventListener('click', (e)=>{
+    if (e.target.closest && e.target.closest('.donate-qr')) return;
+    document.querySelectorAll('.donate-qr.open').forEach((w)=>{
+      w.classList.remove('open');
+      const b = w.querySelector('.donate-qr-btn');
+      if (b) b.setAttribute('aria-expanded', 'false');
+    });
+  });
 }
 function toggleToc(){ document.getElementById('toc').classList.toggle('open'); }
 function closeToc(){ document.getElementById('toc').classList.remove('open'); }

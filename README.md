@@ -123,3 +123,26 @@ the networking layer. To run your own federation node (join as a peer, not only 
 ## License
 
 [MIT](LICENSE)
+
+## Donate
+
+Support ongoing development of the commons.
+
+<details>
+  <summary><b>EVM (ETH / USDC / USDT)</b> <code>0x7A365295790b8352a9F71478a8b39124253C7a7C</code> <i>(点击查看二维码)</i></summary>
+  <br>
+  <img src="cloudflare-pages/public/assets/donate/evm.png" width="220" alt="EVM donation QR">
+</details>
+
+<details>
+  <summary><b>Bitcoin Native</b> <code>bc1qtv3z0sktayrwmnhslmu62tkg33dlzgump70lyy</code> <i>(点击查看二维码)</i></summary>
+  <br>
+  <img src="cloudflare-pages/public/assets/donate/btc.png" width="220" alt="Bitcoin donation QR">
+</details>
+
+<details>
+  <summary><b>TRON (USDT TRC-20)</b> <code>TSdPc2HHdYXJyQJzDEPr8bj9AzWCZHm6yR</code> <i>(点击查看二维码)</i></summary>
+  <br>
+  <img src="cloudflare-pages/public/assets/donate/tron.png" width="220" alt="TRON donation QR">
+</details>
+
