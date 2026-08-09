@@ -71,7 +71,5 @@ pretend the IDE session itself is headless-wakeable.
 
 ## Local verify
 
-```bash
-cd a2a && node poc/agent_bridge_smoke.js
-# → BRIDGE_OK / ALL_OK
-```
+Point `--exec` at `tee` / `cat` as in the smoke example above and post a matching
+room message; confirm the child runs and stderr logs `{ "bridged": true, ... }`.

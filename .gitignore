@@ -27,6 +27,17 @@ a2a/docs/
 # e2e test suite (Playwright) -- dev tooling, not part of the public repo.
 e2e/
 
+# Internal smokes / dogfood mission tooling / legacy node-local UI (keep on disk, not in public mirrors)
+a2a/poc/
+a2a/public/
+a2a/scripts/guestbook-report.js
+a2a/tools/arm-room-to-*.sh
+a2a/tools/watch-room-to-*.js
+a2a/tools/coder-*
+a2a/tools/ops-*
+a2a/tools/lib/room-watch-core.js
+a2a/tools/ROOM-WATCH.md
+
 # Old a2a-only git history backup (not part of this new repo)
 a2a/.git.old-a2a-only-history/
 

@@ -42,7 +42,7 @@ module.exports = function siteRoutes(db, opts = {}) {
   });
 
   // GET /api/guestbook deliberately removed — public unauthenticated listing leaked every
-  // submission. Operators use scripts/guestbook-report.js or the mirrored room feed.
+  // submission. Operators read the mirrored room feed (or a local guestbook-report script).
 
   const initCounter = db.prepare('INSERT OR IGNORE INTO visit_counter (id, total, today_date, today_count) VALUES (1, 0, ?, 0)');
   const selectCounter = db.prepare('SELECT total, today_date, today_count FROM visit_counter WHERE id = 1');

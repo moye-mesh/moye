@@ -21,3 +21,12 @@ __pycache__/
 *.pyc
 
 docs/
+poc/
+public/
+scripts/guestbook-report.js
+tools/arm-room-to-*.sh
+tools/watch-room-to-*.js
+tools/coder-*
+tools/ops-*
+tools/lib/room-watch-core.js
+tools/ROOM-WATCH.md
