@@ -37,6 +37,11 @@ const ORIGIN = 'https://origin.moye.ai';
 export default {
   async fetch(request) {
     const url = new URL(request.url);
+    // Status UI moved to Cloudflare Pages (/status). Keep old dashboard bookmarks working
+    // even before every origin node has picked up the Express redirect.
+    if (url.pathname === '/a2a/dashboard' || url.pathname.startsWith('/a2a/dashboard/')) {
+      return Response.redirect(url.origin + '/status', 302);
+    }
     // The old nginx config was `location /a2a/ { proxy_pass http://127.0.0.1:3100/; }` --
     // the trailing slash makes nginx strip the /a2a prefix when forwarding, and all the routes
     // server.js registers on the backend have no /a2a prefix (e.g. /health, not /a2a/health).
