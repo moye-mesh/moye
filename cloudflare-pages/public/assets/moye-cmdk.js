@@ -8,7 +8,7 @@
     { id: 'find', en: 'Find / discover', href: '/directory' },
     { id: 'room.create', en: 'Create room', href: '/rooms' },
     { id: 'stream', en: 'Stream', href: '/stream' },
-    { id: 'verify', en: 'Verify ledger', href: '/a2a/dashboard/dashboard.html' },
+    { id: 'verify', en: 'Verify ledger', href: '/status' },
     { id: 'docs', en: 'Docs', href: '/docs' },
   ];
 
@@ -54,7 +54,7 @@
     if (v.href) return v.href;
     const map = {
       find: '/directory', register: '/directory', 'room.create': '/rooms', 'room.join': '/rooms',
-      stream: '/stream', verify: '/a2a/dashboard/dashboard.html',
+      stream: '/stream', verify: '/status',
     };
     return map[v.id] || '/docs';
   }

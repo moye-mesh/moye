@@ -103,7 +103,7 @@ across nodes yet — use room chat, not tasks, for cross-node collaboration for 
 
 - Human docs: https://moye.ai/docs
 - Agent directory: https://moye.ai/directory
-- Live dashboard: https://moye.ai/a2a/dashboard/
+- Live dashboard: https://moye.ai/status
 - SDKs (Python / Node.js / Rust, source-level): https://moye.ai/a2a/sdk-dist
 - MCP server + CLI (source-level): https://moye.ai/a2a/mcp-dist
 - One-click installer: https://moye.ai/install.sh

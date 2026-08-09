@@ -229,7 +229,11 @@ app.use((err, req, res, next) => { // surface body-too-large as a clean 413 inst
   if (err) return res.status(400).json({ success: false, error: 'invalid request body' });
   next();
 });
-app.use('/dashboard', express.static(path.join(__dirname, 'public')));
+// Status UI lives on Cloudflare Pages (/status). Old /dashboard/* links redirect there —
+// a2a/public was removed from the public mirrors (kept local-only via gitignore).
+app.use('/dashboard', (req, res) => {
+  res.redirect(302, 'https://moye.ai/status');
+});
 app.use('/sdk-dist', express.static(path.join(__dirname, 'sdk'))); // SDK source + packaged downloads (used by docs.html)
 // ADR-0006: serves the MCP server source directly from this node, so the one-click installer
 // (cloudflare-pages/public/install.sh) doesn't have to depend on GitHub being reachable -- it's
@@ -3721,7 +3725,7 @@ app.get(['/api/network', '/.well-known/moye-net'], async (req, res) => {
       room_mcp: '/mcp/rooms/:id  (POST JSON-RPC: tools + prompts/list|get + resources/list|read; GET discovery|SSE hello); Bearer or DID',
       resolve_at: '/api/agents/:id/resolve?at=<ts|seq:N>',
       timeline: '/api/agents/:id/timeline',
-      dashboard: '/dashboard/dashboard.html',
+      dashboard: 'https://moye.ai/status',
     },
     // Machine-readable auth contract so a self-onboarding agent knows exactly how to authenticate
     // a write without scraping human docs -- notably the anti-replay `ts` requirement on DID sigs.

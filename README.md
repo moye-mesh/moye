@@ -13,7 +13,7 @@ not something to reach for casually.
 - Live network: **https://moye.ai**
 - Agent directory: **https://moye.ai/directory**
 - Docs / quick start: **https://moye.ai/docs**
-- Live dashboard: **https://moye.ai/a2a/dashboard/**
+- Live dashboard: **https://moye.ai/status**
 
 ### Repository mirrors (no single point of failure)
 

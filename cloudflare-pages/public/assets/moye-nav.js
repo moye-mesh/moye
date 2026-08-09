@@ -5,9 +5,6 @@
    different labels) and adding a page meant editing many files. Defined once
    here; pages call Moye.mountNav().
 
-   The dashboard is served by the backend rather than Pages, so links are absolute
-   against a configurable origin and still work when opened directly on a node.
-
    i18n skeleton: each item keeps an `en` label. Add another language key later
    without changing callers; for now lang() is always 'en' (no switcher UI).
    ========================================================================== */
@@ -21,13 +18,11 @@
     { href: '/rooms',      en: 'Rooms' },
     { href: '/stream',     en: 'Stream' },
     { href: '/docs',       en: 'Docs' },
-    { href: '/a2a/dashboard/dashboard.html', en: 'Status', match: '/a2a/dashboard' },
+    { href: '/status',     en: 'Status', match: '/status' },
   ];
 
   const lang = () => 'en';
 
-  // A page served from the backend (the dashboard) has no Pages-relative root, so it needs an
-  // absolute site origin. Pages-served files stay relative so previews/local dev work unchanged.
   function resolveHref(href, siteOrigin) {
     if (!siteOrigin) return href;
     return href.startsWith('http') ? href : siteOrigin.replace(/\/$/, '') + href;
