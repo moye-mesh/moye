@@ -107,7 +107,10 @@ async function main() {
       const visibility = flag('visibility', 'public');
       const secret = flag('secret', null); // optional: bring your own secret instead of a random one
       const result = await agent.createRoom(name, { members, visibility, secret });
-      if (result.secret) result.warning = 'save this secret now -- it is never shown again and the server never stored it; share it out-of-band with whoever should join';
+      if (result.secret) {
+        result.warning = 'secret also saved to local room vault; sealed wraps published for --members when possible';
+        result.vault = agent._roomSecretStore && agent._roomSecretStore.vaultFile;
+      }
       return out(result);
     }
 
@@ -116,22 +119,57 @@ async function main() {
       const secret = flag('secret', null);
       if (!roomId) return fail('usage: join-room <room_id> [--secret <secret>]');
       if (!agent.agentId) return fail('not registered yet -- run: register --name <name>');
-      return out(await agent.joinRoom(roomId, secret));
+      const r = await agent.joinRoom(roomId, secret);
+      return out({ ...r, vault: agent._roomSecretStore && agent._roomSecretStore.vaultFile });
     }
 
     case 'room-send': {
       const [roomId, ...contentParts] = rest;
       const content = contentParts.join(' ');
-      if (!roomId || !content) return fail('usage: room-send <room_id> <content>');
+      if (!roomId || !content) return fail('usage: room-send <room_id> <content> [--secret <s>]');
       if (!agent.agentId) return fail('not registered yet -- run: register --name <name>');
+      const secret = flag('secret', null);
+      if (secret) agent.rememberRoomSecret(roomId, secret);
       return out({ message_id: await agent.sendRoomMessage(roomId, content) });
     }
 
     case 'room-messages': {
       const [roomId] = rest;
-      if (!roomId) return fail('usage: room-messages <room_id> [--limit N]');
+      if (!roomId) return fail('usage: room-messages <room_id> [--limit N] [--secret <s>]');
       const limit = parseInt(flag('limit', '100'), 10);
+      const secret = flag('secret', null);
+      if (secret) agent.rememberRoomSecret(roomId, secret);
       return out({ messages: await agent.roomMessages(roomId, limit) });
+    }
+
+    case 'room-invite': {
+      const [roomId] = rest;
+      const members = csv(flag('members', ''));
+      if (!roomId || !members.length) return fail('usage: room-invite <room_id> --members id1,id2 [--secret <s>]');
+      if (!agent.agentId) return fail('not registered yet -- run: register --name <name>');
+      const secret = flag('secret', null);
+      if (secret) agent.rememberRoomSecret(roomId, secret);
+      return out(await agent.inviteToRoom(roomId, members));
+    }
+
+    case 'room-accept': {
+      const [roomId] = rest;
+      if (!roomId) return fail('usage: room-accept <room_id>');
+      if (!agent.agentId) return fail('not registered yet -- run: register --name <name>');
+      try { await agent._ensureEncReady(); } catch (_) { /* best effort */ }
+      return out(await agent.acceptRoomInvite(roomId));
+    }
+
+    case 'room-rotate': {
+      const [roomId] = rest;
+      if (!roomId) return fail('usage: room-rotate <room_id> --wrap id1,id2 [--show-secret 1]');
+      if (!agent.agentId) return fail('not registered yet -- run: register --name <name>');
+      const wrap = csv(flag('wrap', ''));
+      const secretOverride = flag('secret', null);
+      if (secretOverride) agent.rememberRoomSecret(roomId, secretOverride);
+      const r = await agent.rotateRoomKey(roomId, { wrapAgentIds: wrap });
+      if (flag('show-secret', null) == null) delete r.secret;
+      return out(r);
     }
 
     // ADR-0025: live room subscribe (backfill + WS + reconnect). Prints one JSON object per
@@ -257,7 +295,10 @@ async function main() {
           'send <to> <content>', 'inbox [--limit N]',
           'delegate --capability <n> <task description...>',
           'create-room --name <n> [--members a,b] [--visibility public|private] [--secret <s>]',
-          'join-room <room_id> [--secret <s>]', 'room-send <room_id> <content>', 'room-messages <room_id> [--limit N]',
+          'join-room <room_id> [--secret <s>]', 'room-send <room_id> <content> [--secret <s>]',
+          'room-messages <room_id> [--limit N] [--secret <s>]',
+          'room-invite <room_id> --members a,b', 'room-accept <room_id>',
+          'room-rotate <room_id> --wrap a,b [--show-secret 1]',
           'room-watch <room_id> [--since <ms>] [--secret <s>]',
           'room-broadcast-task <room_id> <task...>', 'room-claim-task <room_id> <broadcast_msg_id> [note...]',
           'room-accept-claim <room_id> <claim_msg_id> [note...] (room creator only)',

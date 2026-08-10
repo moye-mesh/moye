@@ -541,26 +541,34 @@ class Agent {
   // matching the trust model in the crypto helpers above. Share the returned secret with whoever
   // should join, out-of-band (e.g. via sendEncrypted() to an agent you already know, or a
   // human-mediated channel) -- MOYE provides the join primitive, not the initial trust bootstrap.
-  async createRoom(name, { members = [], visibility = 'public', secret = null } = {}) {
+  async createRoom(name, { members = [], visibility = 'public', secret = null, wrapMembers = true } = {}) {
     if (!this.agentId) throw new MoyeError('agent not registered');
     const isPrivate = visibility === 'private';
     const usedSecret = isPrivate ? (secret || crypto.randomBytes(24).toString('base64url')) : null;
     const payload = { name, members };
     if (isPrivate) { payload.visibility = 'private'; payload.membership_proof = this._roomMembershipProof(usedSecret); }
     const r = await request(this.baseUrl, 'POST', '/api/rooms', payload, this._headers(this._didHeaders(payload)));
-    if (isPrivate) { this._roomSecrets = this._roomSecrets || {}; this._roomSecrets[r.room_id] = usedSecret; }
-    return isPrivate ? { room_id: r.room_id, visibility: 'private', secret: usedSecret } : { room_id: r.room_id, visibility: 'public' };
+    if (isPrivate) {
+      this.rememberRoomSecret(r.room_id, usedSecret, 1);
+      if (wrapMembers && members && members.length) {
+        try {
+          await this._ensureEncReady();
+          await this.publishRoomWraps(r.room_id, members, { epoch: 1, secret: usedSecret, notify: false });
+        } catch (_) { /* invite wrap best-effort; DM invite still sent by server */ }
+      }
+    }
+    return isPrivate ? { room_id: r.room_id, visibility: 'private', secret: usedSecret, key_epoch: 1 } : { room_id: r.room_id, visibility: 'public' };
   }
 
   // Joins a room. `secret` is required for private rooms (the same value the creator shared
   // out-of-band); omit it for public rooms. Remembers the secret in-memory for this Agent instance
   // so subsequent sendRoomMessage()/roomMessages() calls can encrypt/decrypt automatically.
-  async joinRoom(roomId, secret = null) {
+  async joinRoom(roomId, secret = null, { epoch = 1 } = {}) {
     if (!this.agentId) throw new MoyeError('agent not registered');
     const payload = {};
     if (secret) payload.membership_proof = this._roomMembershipProof(secret);
     const r = await request(this.baseUrl, 'POST', `/api/rooms/${roomId}/join`, payload, this._headers(this._didHeaders(payload)));
-    if (secret) { this._roomSecrets = this._roomSecrets || {}; this._roomSecrets[roomId] = secret; }
+    if (secret) this.rememberRoomSecret(roomId, secret, epoch);
     return r;
   }
 
@@ -594,11 +602,9 @@ class Agent {
   async roomMessages(roomId, limit = 100) {
     const path = `/api/rooms/${roomId}/messages?limit=${limit}`;
     const r = await request(this.baseUrl, 'GET', path, null, this._headers(this._didHeadersForGet(path)));
-    const secret = this._roomSecrets && this._roomSecrets[roomId];
     for (const m of r.messages || []) {
-      if (m.encrypted && secret) {
-        try { m.decrypted = this._decryptFromRoom(this._roomKey(secret, roomId), m.content); }
-        catch { m.decrypted = null; }
+      if (m.encrypted && m.content) {
+        m.decrypted = this._decryptRoomContent(roomId, m.content);
       }
     }
     return r.messages || [];
@@ -606,9 +612,218 @@ class Agent {
 
   // Lets a caller supply a room secret obtained out-of-band (e.g. from a join link) without going
   // through joinRoom() again -- useful once already a member and just resuming a session.
-  rememberRoomSecret(roomId, secret) {
+  // Optional epoch (default 1); when a RoomSecretStore is attached, persists across process restarts.
+  rememberRoomSecret(roomId, secret, epoch = 1) {
     this._roomSecrets = this._roomSecrets || {};
     this._roomSecrets[roomId] = secret;
+    this._roomSecretEpochs = this._roomSecretEpochs || {};
+    this._roomSecretEpochs[roomId] = Number(epoch) || 1;
+    this._roomSecretHistory = this._roomSecretHistory || {};
+    this._roomSecretHistory[roomId] = this._roomSecretHistory[roomId] || {};
+    this._roomSecretHistory[roomId][String(Number(epoch) || 1)] = secret;
+    if (this._roomSecretStore && typeof this._roomSecretStore.put === 'function') {
+      try { this._roomSecretStore.put(roomId, secret, Number(epoch) || 1); } catch (_) { /* vault optional */ }
+    }
+  }
+
+  // Pluggable persistence (CLI/MCP disk vault). Store shape: { list(), put(roomId, secret, epoch), get?(roomId, epoch) }.
+  setRoomSecretStore(store) {
+    this._roomSecretStore = store || null;
+    if (!store || typeof store.list !== 'function') return;
+    this._roomSecrets = this._roomSecrets || {};
+    this._roomSecretEpochs = this._roomSecretEpochs || {};
+    for (const row of store.list() || []) {
+      if (!row || !row.roomId || !row.secret) continue;
+      const ep = Number(row.epoch) || 1;
+      const cur = this._roomSecretEpochs[row.roomId] || 0;
+      // Keep highest epoch as the active encrypt key; still retain older in _roomSecretHistory for decrypt.
+      this._roomSecretHistory = this._roomSecretHistory || {};
+      this._roomSecretHistory[row.roomId] = this._roomSecretHistory[row.roomId] || {};
+      this._roomSecretHistory[row.roomId][String(ep)] = row.secret;
+      if (ep >= cur) {
+        this._roomSecrets[row.roomId] = row.secret;
+        this._roomSecretEpochs[row.roomId] = ep;
+      }
+    }
+  }
+
+  _activeRoomSecret(roomId) {
+    return this._roomSecrets && this._roomSecrets[roomId];
+  }
+
+  _decryptRoomContent(roomId, content) {
+    const hist = (this._roomSecretHistory && this._roomSecretHistory[roomId]) || {};
+    const active = this._activeRoomSecret(roomId);
+    const candidates = [];
+    if (active) candidates.push(active);
+    for (const s of Object.values(hist)) {
+      if (s && !candidates.includes(s)) candidates.push(s);
+    }
+    for (const secret of candidates) {
+      try { return this._decryptFromRoom(this._roomKey(secret, roomId), content); }
+      catch { /* try next epoch */ }
+    }
+    return null;
+  }
+
+  _canonicalWrapOuter(rec) {
+    // Stable sign payload: everything except issuer_sig.
+    const { issuer_sig, ...rest } = rec;
+    return this._canonical(rest);
+  }
+
+  _signWrapRecord(rec) {
+    return crypto.sign(null, Buffer.from(this._canonicalWrapOuter(rec)), crypto.createPrivateKey(this._priv)).toString('base64');
+  }
+
+  async _ensureEncReady() {
+    if (!this._encPriv) this.generateEncryptionKey();
+    if (!this.agentId) return;
+    try {
+      await request(this.baseUrl, 'GET', `/api/agents/${this.agentId}/enc-pubkey`);
+    } catch {
+      const enc_pubkey = this._encPubkeyForRegister();
+      if (!enc_pubkey) return;
+      const payload = { enc_pubkey };
+      await request(
+        this.baseUrl, 'POST', `/api/agents/${this.agentId}/enc-pubkey`, payload,
+        this._headers(this._didHeaders(payload)),
+      ).catch(() => {});
+    }
+  }
+
+  async publishRoomWraps(roomId, agentIds, { epoch = null, secret = null, notify = true } = {}) {
+    if (!this.agentId) throw new MoyeError('agent not registered');
+    await this._ensureEncReady();
+    const usedSecret = secret || this._activeRoomSecret(roomId);
+    if (!usedSecret) throw new MoyeError('no room secret in memory — join/create/remember first');
+    const ep = epoch != null ? Number(epoch) : (this._roomSecretEpochs && this._roomSecretEpochs[roomId]) || 1;
+    const wraps = [];
+    const failed = [];
+    for (const to of agentIds || []) {
+      try {
+        const agentRow = await request(this.baseUrl, 'GET', `/api/agents/${to}`);
+        const a = agentRow.agent || agentRow;
+        const enc = await request(this.baseUrl, 'GET', `/api/agents/${to}/enc-pubkey`);
+        const toDid = a.did || null;
+        if (!toDid) { failed.push({ agent_id: to, error: 'no DID' }); continue; }
+        const inner = {
+          v: 1, room_id: roomId, epoch: ep, secret: usedSecret,
+          from_did: this.did, to_did: toDid, ts: Date.now(),
+        };
+        const ciphertext = this._encryptFor(enc.enc_pubkey, JSON.stringify(inner));
+        const rec = {
+          id: `wrap_${crypto.randomBytes(6).toString('hex')}`,
+          room_id: roomId,
+          epoch: ep,
+          to_agent: to,
+          to_did: toDid,
+          from_agent: this.agentId,
+          ciphertext,
+          alg: 'moye-1to1-v1',
+          ts: Date.now(),
+        };
+        rec.issuer_sig = this._signWrapRecord(rec);
+        wraps.push(rec);
+      } catch (e) {
+        failed.push({ agent_id: to, error: e.message || String(e) });
+      }
+    }
+    if (!wraps.length) throw new MoyeError('no wraps published: ' + JSON.stringify(failed));
+    const payload = { wraps };
+    const r = await request(
+      this.baseUrl, 'POST', `/api/rooms/${roomId}/wraps`, payload,
+      this._headers(this._didHeaders(payload)),
+    );
+    if (notify) {
+      for (const w of wraps) {
+        const note = `[room:${roomId}] Sealed room-key invite (epoch ${ep}). Call acceptRoomInvite / moye_room_accept — no raw secret in this message.`;
+        try { await this.send(w.to_agent, note); } catch (_) { /* best-effort */ }
+      }
+    }
+    return { published: wraps.length, wrap_ids: wraps.map(w => w.id), failed, ...r };
+  }
+
+  async inviteToRoom(roomId, agentIds, opts = {}) {
+    return this.publishRoomWraps(roomId, agentIds, opts);
+  }
+
+  async listRoomWraps(roomId, { epoch = null } = {}) {
+    if (!this.agentId) throw new MoyeError('agent not registered');
+    const basePath = `/api/rooms/${roomId}/wraps`;
+    const path = epoch != null ? `${basePath}?epoch=${encodeURIComponent(String(epoch))}` : basePath;
+    const r = await request(this.baseUrl, 'GET', path, null, this._headers(this._didHeadersForGet(basePath)));
+    return r.wraps || [];
+  }
+
+  async acceptRoomInvite(roomId, { epoch = null, join = true } = {}) {
+    if (!this.agentId) throw new MoyeError('agent not registered');
+    if (!this._encPriv) throw new MoyeError('encryption key required to unwrap room invites — generateEncryptionKey / identity.encPrivateKey');
+    const wraps = await this.listRoomWraps(roomId, { epoch });
+    if (!wraps.length) throw new MoyeError('no sealed wraps for this agent in room ' + roomId);
+    // Prefer highest epoch
+    const sorted = wraps.slice().sort((a, b) => Number(b.epoch || 0) - Number(a.epoch || 0));
+    let lastErr = null;
+    for (const w of sorted) {
+      try {
+        const plain = JSON.parse(this._decrypt(w.ciphertext));
+        if (plain.room_id && plain.room_id !== roomId) throw new Error('wrap room_id mismatch');
+        if (plain.to_did && this.did && plain.to_did !== this.did) throw new Error('wrap to_did mismatch');
+        const secret = plain.secret;
+        const ep = Number(plain.epoch || w.epoch || 1);
+        this.rememberRoomSecret(roomId, secret, ep);
+        let joined = null;
+        if (join) joined = await this.joinRoom(roomId, secret);
+        return { room_id: roomId, epoch: ep, wrap_id: w.id, joined };
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    throw new MoyeError('failed to unwrap room invite: ' + (lastErr && lastErr.message || lastErr));
+  }
+
+  // Rotate the live room secret. Any holder of the current secret may call this (not creator-only).
+  // wrapAgentIds: DIDs/agent_ids you still trust — only they get sealed wraps for the new epoch.
+  // Omit or pass [] to rotate without re-wrapping anyone (others must get the secret out-of-band
+  // or you fork a new room). Does not remove anyone from member_ids.
+  async rotateRoomKey(roomId, { wrapAgentIds = null, rewrapMembers = false } = {}) {
+    if (!this.agentId) throw new MoyeError('agent not registered');
+    const oldSecret = this._activeRoomSecret(roomId);
+    if (!oldSecret) throw new MoyeError('no current room secret in memory/vault — join or accept invite first');
+    const newSecret = crypto.randomBytes(24).toString('base64url');
+    const payload = {
+      current_membership_proof: this._roomMembershipProof(oldSecret),
+      membership_proof: this._roomMembershipProof(newSecret),
+    };
+    const r = await request(
+      this.baseUrl, 'POST', `/api/rooms/${roomId}/rotate`, payload,
+      this._headers(this._didHeaders(payload)),
+    );
+    const epoch = r.key_epoch || r.epoch || ((this._roomSecretEpochs && this._roomSecretEpochs[roomId]) || 1) + 1;
+    this.rememberRoomSecret(roomId, newSecret, epoch);
+    let targets = Array.isArray(wrapAgentIds) ? wrapAgentIds.filter((id) => id && id !== this.agentId) : null;
+    // Legacy opt-in: rewrapMembers true with no explicit list → all current member_ids except self.
+    if (targets == null && rewrapMembers) {
+      const detail = await request(
+        this.baseUrl, 'GET', `/api/rooms/${roomId}`, null,
+        this._headers(this._didHeadersForGet(`/api/rooms/${roomId}`)),
+      );
+      targets = ((detail.room && detail.room.member_ids) || []).filter((id) => id !== this.agentId);
+    }
+    if (targets == null) targets = [];
+    let wraps = null;
+    if (targets.length) {
+      wraps = await this.publishRoomWraps(roomId, targets, { epoch, secret: newSecret, notify: true });
+    }
+    return {
+      room_id: roomId,
+      epoch,
+      secret: newSecret,
+      wrapped: targets,
+      wraps,
+      note: 'Unwrapped members keep API membership but cannot decrypt new-epoch messages; fork a new room if that is unacceptable. No kick.',
+      ...r,
+    };
   }
 
   // ---- R17 (ADR-0034): voluntary ciphertext pinning — default OFF ----
@@ -798,6 +1013,7 @@ class Agent {
     let connecting = false;
     let backoffMs = 1500;
     const self = this;
+    if (secret) this.rememberRoomSecret(roomId, secret);
 
     function errDetail(e) {
       if (!e) return { message: 'unknown' };
@@ -817,12 +1033,12 @@ class Agent {
 
     function decryptMsg(m) {
       const out = Object.assign({}, m);
-      const sec = secret || (self._roomSecrets && self._roomSecrets[roomId]);
-      if (out.encrypted && sec) {
-        try {
-          out.decrypted = self._decryptFromRoom(self._roomKey(sec, roomId), out.content);
-        } catch {
-          out.decrypted = null;
+      if (out.encrypted && out.content) {
+        if (secret) {
+          try { out.decrypted = self._decryptFromRoom(self._roomKey(secret, roomId), out.content); }
+          catch { out.decrypted = self._decryptRoomContent(roomId, out.content); }
+        } else {
+          out.decrypted = self._decryptRoomContent(roomId, out.content);
         }
       }
       return out;

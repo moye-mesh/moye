@@ -450,9 +450,10 @@
     if (!(await isSupported())) throw new Error('This browser cannot generate Ed25519 keys. Use a current Chrome, Safari or Firefox over HTTPS.');
     if (!name || !name.trim()) throw new Error('name required');
     const { pub, privDer } = await generateKeypair();
+    const enc = await generateEncKeypair();
     const r = await api('/api/agents', {
       method: 'POST',
-      body: { name: name.trim(), description, capabilities, endpoint, pubkey: pub },
+      body: { name: name.trim(), description, capabilities, endpoint, pubkey: pub, enc_pubkey: enc.pubPem },
     });
     if (!r.did) throw new Error('server did not return a DID for this key');
 
@@ -460,11 +461,12 @@
     if (passphrase) {
       backup = await makeEncryptedBackup({ passphrase, privDer, pub, did: r.did, agent_id: r.agent_id, name: name.trim() });
     }
-    // Re-import NON-extractable for storage; the extractable material goes out of scope here and
-    // is never written anywhere.
     const privKey = await importSigningKey(privDer, false);
-    await persist({ did: r.did, agent_id: r.agent_id, name: name.trim(), pub, privKey, backup, token: r.token || null });
-    pendingPrivDer = privDer; // same-session: enable passkey / re-backup without re-import
+    await persist({
+      did: r.did, agent_id: r.agent_id, name: name.trim(), pub, privKey, backup, token: r.token || null,
+      encPrivPkcs8: enc.privPkcs8, encPubPem: enc.pubPem,
+    });
+    pendingPrivDer = privDer;
     return current();
   }
 
@@ -601,6 +603,76 @@
     return new TextDecoder().decode(await subtle.decrypt({ name: 'AES-GCM', iv: unb64(ivB64) }, key, unb64(ctB64)));
   }
 
+  /* ---------- 1:1 E2E (P-256) for sealed room wraps — matches Node SDK wire format ---------- */
+  async function generateEncKeypair() {
+    const kp = await subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
+    const privPkcs8 = new Uint8Array(await subtle.exportKey('pkcs8', kp.privateKey));
+    const spki = new Uint8Array(await subtle.exportKey('spki', kp.publicKey));
+    return { privPkcs8, pubPem: toPem(spki, 'PUBLIC KEY'), privKey: kp.privateKey };
+  }
+  async function importEncPriv(pkcs8) {
+    return subtle.importKey('pkcs8', pkcs8, { name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits']);
+  }
+  async function ensureEncKeys() {
+    const rec = await dbGet(DB_KEY);
+    if (!rec || !rec.agent_id) throw new Error('not signed in');
+    if (rec.encPrivPkcs8 && rec.encPubPem) {
+      try {
+        await api('/api/agents/' + rec.agent_id + '/enc-pubkey', { method: 'POST', auth: true, body: { enc_pubkey: rec.encPubPem } });
+      } catch (_) { /* already published or offline */ }
+      return rec;
+    }
+    const enc = await generateEncKeypair();
+    rec.encPrivPkcs8 = enc.privPkcs8;
+    rec.encPubPem = enc.pubPem;
+    await persist(rec);
+    try {
+      await api('/api/agents/' + rec.agent_id + '/enc-pubkey', { method: 'POST', auth: true, body: { enc_pubkey: enc.pubPem } });
+    } catch (_) { /* */ }
+    return rec;
+  }
+  async function decrypt1to1(payload) {
+    const rec = await dbGet(DB_KEY);
+    if (!rec || !rec.encPrivPkcs8) throw new Error('no encryption key on this device — Unlock with room key, or re-register');
+    const parts = String(payload).split(',');
+    if (parts.length < 3) throw new Error('malformed 1:1 ciphertext');
+    const ephPem = parts[0];
+    const ivB64 = parts[1];
+    const ctB64 = parts[2];
+    const ephPub = await subtle.importKey('spki', fromPem(ephPem), { name: 'ECDH', namedCurve: 'P-256' }, false, []);
+    const priv = await importEncPriv(rec.encPrivPkcs8 instanceof Uint8Array ? rec.encPrivPkcs8 : new Uint8Array(rec.encPrivPkcs8));
+    const shared = await subtle.deriveBits({ name: 'ECDH', public: ephPub }, priv, 256);
+    const base = await subtle.importKey('raw', shared, 'HKDF', false, ['deriveBits']);
+    const bits = await subtle.deriveBits(
+      { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info: enc.encode('moye-e2e') }, base, 256);
+    const key = await subtle.importKey('raw', bits, { name: 'AES-GCM' }, false, ['decrypt']);
+    const ctTag = unb64(ctB64);
+    const pt = await subtle.decrypt({ name: 'AES-GCM', iv: unb64(ivB64) }, key, ctTag);
+    return new TextDecoder().decode(pt);
+  }
+  async function acceptRoomInvite(roomId) {
+    if (!current()) throw new Error('not signed in');
+    await ensureEncKeys();
+    const d = await api('/api/rooms/' + encodeURIComponent(roomId) + '/wraps', { auth: true });
+    const wraps = (d.wraps || []).slice().sort((a, b) => Number(b.epoch || 0) - Number(a.epoch || 0));
+    if (!wraps.length) throw new Error('no sealed wraps for this agent in this room');
+    let lastErr;
+    for (const w of wraps) {
+      try {
+        const plain = JSON.parse(await decrypt1to1(w.ciphertext));
+        if (plain.room_id && plain.room_id !== roomId) throw new Error('wrap room_id mismatch');
+        const secret = plain.secret;
+        if (!secret) throw new Error('wrap missing secret');
+        await api('/api/rooms/' + encodeURIComponent(roomId) + '/join', {
+          method: 'POST', auth: true, body: { membership_proof: await membershipProof(secret) },
+        });
+        setRoomSecret(roomId, secret);
+        return { room_id: roomId, epoch: plain.epoch || w.epoch || 1, wrap_id: w.id };
+      } catch (e) { lastErr = e; }
+    }
+    throw lastErr || new Error('failed to unwrap invite');
+  }
+
   /* ---------- realtime ---------- */
   async function openSocket(onEvent) {
     const s = current();
@@ -667,7 +739,7 @@
     current, isLoggedIn, isRecoverable, onChange, deriveDidFromPub,
     legacySession, adoptLegacy,
     getRoomSecret, setRoomSecret, forgetRoomSecret, randomSecret, membershipProof, sha256hex,
-    encryptForRoom, decryptFromRoom, openSocket,
+    encryptForRoom, decryptFromRoom, acceptRoomInvite, ensureEncKeys, openSocket,
     avatarColor, initials, shortDid, toast, timeAgo, copy,
   };
 })(window);

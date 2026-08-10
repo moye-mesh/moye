@@ -2018,31 +2018,15 @@ async function appendRoomMessage(roomId, msg) {
   await store.putShared(key, { crdt: 'rga', nodes }, L, ledger.NODE_ID);
 }
 
-// Site widgets (guestbook + visit counter). Guestbook POST mirrors into the dogfood room so
-// ops/dev/coder see submissions without a public list endpoint (privacy fix 2026-08-06).
+// Site widgets (guestbook + visit counter). Guestbook POST mirrors into the ops-only feedback
+// room (GUESTBOOK_ROOM_ID / siteRoutes.DEFAULT_MIRROR_ROOM) — never the mission dogfood room.
 app.use(siteRoutes(db, {
   onGuestbook: async ({ agent_name, content }) => {
     const roomId = process.env.GUESTBOOK_ROOM_ID || siteRoutes.DEFAULT_MIRROR_ROOM;
-    let room = store.getRoom(roomId);
+    const room = store.getRoom(roomId);
+    // Do not auto-seed a public stand-in: guestbook targets a private ops room created out-of-band.
     if (!room) {
-      // Seed an empty public room when the configured mirror id is missing (smoke / fresh node).
-      // Production dogfood room already exists; this is a no-op there.
-      await store.putRoom(roomId, {
-        id: roomId,
-        name: 'guestbook-mirror',
-        description: 'Auto-seeded guestbook mirror target',
-        creator: '(site-guestbook)',
-        status: 'open',
-        home_node: ledger.NODE_ID,
-        created_at: Date.now(),
-        visibility: 'public',
-        membership_proof_hash: null,
-        member_ids: [],
-      });
-      room = store.getRoom(roomId);
-    }
-    if (!room) {
-      console.log(`[guestbook] mirror skipped: could not open room ${roomId}`);
+      console.log(`[guestbook] mirror skipped: room ${roomId} not found on this node`);
       return;
     }
     const text = `New feedback from ${agent_name}: ${content}`;
@@ -2150,6 +2134,7 @@ app.post('/api/rooms', async (req, res) => {
     home_node: ledger.NODE_ID, created_at: Date.now(),
     visibility: isPrivate ? 'private' : 'public',
     membership_proof_hash: isPrivate ? roomMembershipHash(membership_proof) : null,
+    key_epoch: isPrivate ? 1 : null,
     member_ids: [me.id],
   });
   if (Array.isArray(members)) {
@@ -2158,7 +2143,7 @@ app.post('/api/rooms', async (req, res) => {
       stmt.insertMessage.run(mid, me.id, m, `[room:${id}] Invited you to join collaboration room "${name}"`, 'pending', 0, null, null, null, Date.now());
     }
   }
-  ok(res, { room_id: id, visibility: isPrivate ? 'private' : 'public' });
+  ok(res, { room_id: id, visibility: isPrivate ? 'private' : 'public', key_epoch: isPrivate ? 1 : null });
 });
 
 // ---- 7b. Join a room (requires auth). Public: open. Private: requires membership_proof. ----
@@ -2167,7 +2152,7 @@ app.post('/api/rooms/:id/join', async (req, res) => {
   if (!me) return fail(res, 401, 'Bearer token or DID sig required');
   const room = store.getRoom(req.params.id);
   if (!room) return fail(res, 404, 'room not found');
-  if (isRoomMember(room, me.id)) return ok(res, { room_id: room.id, already_member: true });
+  if (isRoomMember(room, me.id)) return ok(res, { room_id: room.id, already_member: true, key_epoch: room.key_epoch || 1 });
   if (room.visibility === 'private') {
     const { membership_proof } = req.body || {};
     if (!membership_proof || roomMembershipHash(membership_proof) !== room.membership_proof_hash) {
@@ -2176,7 +2161,171 @@ app.post('/api/rooms/:id/join', async (req, res) => {
   }
   const member_ids = [...(room.member_ids || []), me.id];
   await store.putRoom(room.id, { ...room, member_ids });
-  ok(res, { room_id: room.id, joined: true });
+  // Soft signal: joined with secret proof but never received a sealed wrap (possible leak path).
+  let join_via_proof_only = false;
+  if (room.visibility === 'private') {
+    const meRec = store.getAgent(me.id);
+    const myDid = meRec && meRec.did;
+    const hadWrap = materializeRoomWraps(room.id).some(
+      (w) => w && (w.to_agent === me.id || (myDid && w.to_did === myDid)),
+    );
+    join_via_proof_only = !hadWrap;
+    if (join_via_proof_only) {
+      ledger.append('room.join_proof_only', {
+        room: room.id, agent: me.id, epoch: room.key_epoch || 1, ts: Date.now(),
+      }).catch(() => {});
+    }
+  }
+  ok(res, {
+    room_id: room.id, joined: true, key_epoch: room.key_epoch || 1,
+    ...(join_via_proof_only ? { join_via_proof_only: true } : {}),
+  });
+});
+
+// ---- 7c. Sealed room-key wraps (ciphertext only; server never sees room secret) ----
+function roomWrapsKey(roomId) { return 'room-wraps:' + roomId; }
+function materializeRoomWraps(roomId) {
+  const cur = store.getShared(roomWrapsKey(roomId));
+  return Array.isArray(cur) ? cur : [];
+}
+async function appendRoomWrap(roomId, wrap) {
+  const key = roomWrapsKey(roomId);
+  const cur = store.getShared(key);
+  const nodes = (Array.isArray(cur) ? cur : []).map((elem, i) => ({ id: elem.id || `n${i}`, elem, deleted: false }));
+  nodes.push({ id: wrap.id, elem: wrap, deleted: false });
+  await store.putShared(key, { crdt: 'rga', nodes }, Date.now(), ledger.NODE_ID);
+}
+function verifyWrapIssuerSig(wrap) {
+  if (!wrap || !wrap.issuer_sig || !wrap.from_agent) return false;
+  const issuer = store.getAgent(wrap.from_agent);
+  if (!issuer || !issuer.pubkey) return false;
+  const { issuer_sig, ...rest } = wrap;
+  const canon = (function canonical(v) {
+    if (v === null || typeof v !== 'object') return JSON.stringify(v);
+    if (Array.isArray(v)) return '[' + v.map(canonical).join(',') + ']';
+    return '{' + Object.keys(v).sort().map(k => JSON.stringify(k) + ':' + canonical(v[k])).join(',') + '}';
+  })(rest);
+  try {
+    return crypto.verify(null, Buffer.from(canon), crypto.createPublicKey(issuer.pubkey), Buffer.from(issuer_sig, 'base64'));
+  } catch { return false; }
+}
+
+app.post('/api/rooms/:id/wraps', async (req, res) => {
+  const me = await authAgent(req);
+  if (!me) return fail(res, 401, 'Bearer token or DID sig required');
+  const room = store.getRoom(req.params.id);
+  if (!room) return fail(res, 404, 'room not found');
+  if (!isRoomMember(room, me.id)) {
+    return fail(res, 403, 'membership required to publish wraps');
+  }
+  const wrapsIn = Array.isArray(req.body && req.body.wraps) ? req.body.wraps : [];
+  if (!wrapsIn.length) return fail(res, 400, 'wraps array required');
+  if (wrapsIn.length > 50) return fail(res, 413, 'too many wraps (max 50)');
+  const accepted = [];
+  for (const w of wrapsIn) {
+    if (!w || typeof w !== 'object') continue;
+    if (w.room_id && w.room_id !== room.id) return fail(res, 400, 'wrap.room_id mismatch');
+    if (!w.to_agent || !w.to_did || !w.ciphertext || !w.issuer_sig) {
+      return fail(res, 400, 'each wrap needs to_agent, to_did, ciphertext, issuer_sig');
+    }
+    if (String(w.ciphertext).length > 32_000) return fail(res, 413, 'wrap ciphertext too large');
+    const rec = {
+      id: w.id || newId('wrap'),
+      room_id: room.id,
+      epoch: Number(w.epoch) || Number(room.key_epoch) || 1,
+      to_agent: String(w.to_agent),
+      to_did: String(w.to_did),
+      from_agent: me.id,
+      ciphertext: String(w.ciphertext),
+      alg: w.alg || 'moye-1to1-v1',
+      ts: Number(w.ts) || Date.now(),
+      issuer_sig: String(w.issuer_sig),
+    };
+    // Issuer must be the authenticated caller (prevents forging from_agent).
+    if (w.from_agent && w.from_agent !== me.id) return fail(res, 403, 'from_agent must be self');
+    if (!verifyWrapIssuerSig(rec)) return fail(res, 401, 'invalid issuer_sig on wrap');
+    await appendRoomWrap(room.id, rec);
+    accepted.push({ id: rec.id, to_agent: rec.to_agent, epoch: rec.epoch });
+    ledger.append('room.wrap', {
+      room: room.id, wrap: rec.id, to: rec.to_agent, epoch: rec.epoch,
+      content_hash: crypto.createHash('sha256').update(rec.ciphertext).digest('hex'),
+      ts: rec.ts,
+    }).catch(() => {});
+  }
+  ok(res, { published: accepted.length, wraps: accepted });
+});
+
+app.get('/api/rooms/:id/wraps', async (req, res) => {
+  const me = await authAgent(req);
+  if (!me) return fail(res, 401, 'Bearer token or DID sig required');
+  const room = store.getRoom(req.params.id);
+  if (!room) return fail(res, 404, 'room not found');
+  const meRec = store.getAgent(me.id);
+  const myDid = meRec && meRec.did;
+  // Any authenticated agent may fetch wraps addressed to them (pre-join acceptRoomInvite).
+  const epochFilter = req.query.epoch != null ? Number(req.query.epoch) : null;
+  const all = materializeRoomWraps(room.id);
+  const mine = all.filter((w) => {
+    if (!w) return false;
+    if (w.to_agent !== me.id && !(myDid && w.to_did === myDid)) return false;
+    if (epochFilter != null && Number(w.epoch) !== epochFilter) return false;
+    return true;
+  });
+  ok(res, { wraps: mine, key_epoch: room.key_epoch || 1 });
+});
+
+// ---- 7d. Rotate room membership secret (any holder of the CURRENT secret).
+// ADR-0040 revised: not creator-only — equality. Prove you hold the live key via
+// current_membership_proof, then install membership_proof for the NEW secret.
+// Does NOT alter member_ids (no kick). Callers re-wrap only DIDs they still trust.
+app.post('/api/rooms/:id/rotate', async (req, res) => {
+  const me = await authAgent(req);
+  if (!me) return fail(res, 401, 'Bearer token or DID sig required');
+  const room = store.getRoom(req.params.id);
+  if (!room) return fail(res, 404, 'room not found');
+  if (room.visibility !== 'private') return fail(res, 400, 'only private rooms rotate keys');
+  const { membership_proof, current_membership_proof } = req.body || {};
+  if (!current_membership_proof || typeof current_membership_proof !== 'string') {
+    return fail(res, 400, 'current_membership_proof required (proves you hold the live room secret)');
+  }
+  if (!membership_proof || typeof membership_proof !== 'string') {
+    return fail(res, 400, 'membership_proof for the NEW secret required');
+  }
+  if (!room.membership_proof_hash
+      || roomMembershipHash(current_membership_proof) !== room.membership_proof_hash) {
+    return fail(res, 403, 'current_membership_proof does not match live room secret');
+  }
+  if (roomMembershipHash(membership_proof) === room.membership_proof_hash) {
+    return fail(res, 400, 'new membership_proof must differ from the current secret');
+  }
+  const nextEpoch = (Number(room.key_epoch) || 1) + 1;
+  const updated = {
+    ...room,
+    membership_proof_hash: roomMembershipHash(membership_proof),
+    key_epoch: nextEpoch,
+  };
+  await store.putRoom(room.id, updated);
+  ledger.append('room.rotate', {
+    room: room.id, epoch: nextEpoch, by: me.id, ts: Date.now(),
+    proof_hash: updated.membership_proof_hash,
+  }).catch(() => {});
+  ok(res, { room_id: room.id, key_epoch: nextEpoch, epoch: nextEpoch });
+});
+
+// Self-service encryption pubkey publish (needed for sealed room wraps / 1:1 E2E).
+app.post('/api/agents/:id/enc-pubkey', async (req, res) => {
+  const me = await authAgent(req);
+  if (!me) return fail(res, 401, 'Bearer token or DID sig required');
+  if (me.id !== req.params.id) return fail(res, 403, 'identity mismatch');
+  const enc_pubkey = req.body && req.body.enc_pubkey;
+  if (!enc_pubkey || typeof enc_pubkey !== 'string' || !enc_pubkey.includes('BEGIN PUBLIC KEY')) {
+    return fail(res, 400, 'enc_pubkey PEM required');
+  }
+  const agent = store.getAgent(me.id);
+  if (!agent) return fail(res, 404, 'agent not found');
+  const updated = await store.putAgent(me.id, { ...agent, enc_pubkey });
+  if (PEERS.length) announceToPeers({ id: me.id, ...updated });
+  ok(res, { agent_id: me.id, enc_pubkey: true });
 });
 
 // ---- 8. List rooms (private rooms only shown to members; auth optional, best-effort) ----

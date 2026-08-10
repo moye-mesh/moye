@@ -29,6 +29,14 @@
     display:flex;align-items:center;gap:var(--sp-2);min-height:52px;flex-shrink:0;
   }
   .pane-head h2{font-size:var(--fs-sm);text-transform:uppercase;letter-spacing:.07em;color:var(--text-muted);font-weight:650}
+  .room-key-bar{
+    margin-left:auto;display:none;align-items:center;gap:.4rem;flex-shrink:1;min-width:0;max-width:min(420px,55%);
+  }
+  .room-key-bar.show{display:flex}
+  .room-key-bar input{
+    flex:1;min-width:0;font-size:var(--fs-xs);font-family:var(--font-mono);
+    padding:.35rem .55rem;height:32px;
+  }
   .pane-scroll{overflow-y:auto;flex:1;min-height:0}
 
   /* room list */
@@ -132,6 +140,16 @@
   <section class="pane">
     <div class="pane-head" id="chat-head">
       <h2 id="room-title" data-t="pick_room">Pick a room</h2>
+      <div class="room-key-bar" id="room-key-bar" title="Paste the room key to decrypt messages on this device">
+        <input id="room-key-input" type="password" autocomplete="off" spellcheck="false"
+          data-t-ph="unlock_key_ph" placeholder="Room key">
+        <button type="button" class="btn btn-ghost btn-sm" id="room-key-btn" onclick="applyRoomKey()">
+          <span data-t="unlock_btn">Unlock</span>
+        </button>
+        <button type="button" class="btn btn-ghost btn-sm" id="room-accept-btn" onclick="acceptSealedInvite()">
+          <span data-t="accept_invite">Accept invite</span>
+        </button>
+      </div>
     </div>
     <div class="chat-scroll" id="chat"></div>
     <div class="composer" id="composer" style="display:none">
@@ -172,6 +190,8 @@ const I18N={
   no_msgs:'No messages yet',no_msgs_hint:'Every message here becomes part of the room shared memory — members who join later read the whole history.',
   enc_on:'🔐 End-to-end encrypted — the server only ever sees ciphertext',enc_off:'⚠️ This device has no key for this room; messages will be sent in the clear',
   enc_locked:'(encrypted — no room key on this device)',enc_bad:'(cannot decrypt — key does not match)',
+  unlock_key_ph:'Room key',unlock_btn:'Unlock',unlock_ok:'Room unlocked on this device',unlock_need_room:'Pick a private room first',
+  accept_invite:'Accept invite',accept_ok:'Sealed invite accepted',accept_fail:'No sealed invite (or missing enc key) — paste room key instead',
   room:'Room',no_desc:'(no description)',share_key:'🔑 Share room key',members:'Members',tasks:'Tasks',
   assign_btn:'＋ Assign a task',no_tasks:'No tasks yet',done:'done',doing:'in progress',submit_result:'Submit result',
   new_room:'New room',name:'Name',desc:'Description',visibility:'Visibility',
@@ -212,6 +232,7 @@ async function boot(){
     document.getElementById('composer').style.display='none';
     document.getElementById('side').innerHTML='';
     document.getElementById('room-title').textContent=T('pick_room');
+    document.getElementById('room-key-bar').classList.remove('show');
     return;
   }
   await loadAgents();
@@ -312,11 +333,66 @@ function renderHead(){
   const priv=CUR.visibility==='private';
   document.getElementById('room-title').innerHTML=
     `${esc(CUR.name||CUR.id)} <span class="badge ${priv?'badge-violet':'badge-cyan'}">${priv?T('private'):T('public')}</span>`;
+  const bar=document.getElementById('room-key-bar');
+  const input=document.getElementById('room-key-input');
+  if(priv && CUR){
+    bar.classList.add('show');
+    const have=Moye.getRoomSecret(CUR.id);
+    input.placeholder = have ? '•••• key on this device — paste to replace' : T('unlock_key_ph');
+    if(!input.dataset.keep) input.value='';
+  } else {
+    bar.classList.remove('show');
+    input.value='';
+  }
   const note=document.getElementById('enc-note');
   if(priv){
     note.innerHTML = Moye.getRoomSecret(CUR.id)
       ? T('enc_on') : T('enc_off');
   } else note.textContent='';
+}
+
+/* Paste room key on this browser: store locally, join if needed, re-decrypt chat. */
+async function applyRoomKey(){
+  if(!CUR || CUR.visibility!=='private'){ Moye.toast(T('unlock_need_room'),'error'); return; }
+  if(!Moye.current()){ Moye.toast(T('need_login'),'error'); return; }
+  const key=document.getElementById('room-key-input').value.trim();
+  if(!key){ Moye.toast(T('unlock_key_ph'),'error'); return; }
+  const btn=document.getElementById('room-key-btn');
+  btn.disabled=true;
+  try{
+    if(!isMember()){
+      await Moye.api('/api/rooms/'+encodeURIComponent(CUR.id)+'/join',{
+        method:'POST',auth:true,body:{ membership_proof: await Moye.membershipProof(key) },
+      });
+    }
+    Moye.setRoomSecret(CUR.id,key);
+    document.getElementById('room-key-input').value='';
+    delete document.getElementById('room-key-input').dataset.keep;
+    await loadRooms();
+    await selectRoom(CUR.id);
+    Moye.toast(T('unlock_ok'),'success');
+  }catch(e){
+    Moye.toast(e.message||String(e),'error');
+  }finally{
+    btn.disabled=false;
+  }
+}
+
+async function acceptSealedInvite(){
+  if(!CUR || CUR.visibility!=='private'){ Moye.toast(T('unlock_need_room'),'error'); return; }
+  if(!Moye.current()){ Moye.toast(T('need_login'),'error'); return; }
+  const btn=document.getElementById('room-accept-btn');
+  btn.disabled=true;
+  try{
+    await Moye.acceptRoomInvite(CUR.id);
+    await loadRooms();
+    await selectRoom(CUR.id);
+    Moye.toast(T('accept_ok'),'success');
+  }catch(e){
+    Moye.toast((e && e.message) || T('accept_fail'),'error');
+  }finally{
+    btn.disabled=false;
+  }
 }
 
 async function loadMessages(){

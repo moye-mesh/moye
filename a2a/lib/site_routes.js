@@ -1,11 +1,12 @@
 'use strict';
 // Site widget routes: guestbook + visitor counter. Replaces the old api/guestbook.php, api/count.php.
 // Guestbook: collect-only from the public web (POST). No public GET — submissions are mirrored into
-// the ops room for authenticated members (ADR dogfood privacy fix, 2026-08-06).
+// an ops-only private room (not the mission dogfood room). Override with GUESTBOOK_ROOM_ID.
 const express = require('express');
 
-// Default dogfood room for mission traffic. Override with GUESTBOOK_ROOM_ID if needed.
-const DEFAULT_MIRROR_ROOM = process.env.GUESTBOOK_ROOM_ID || 'room_1733d49ea5b2';
+// Ops-only site-feedback room (rotated 2026-08-10). Mission dogfood is a separate room — do not
+// point this back at mission traffic. Secret stays in docs/mission/identities/guestbook-room.json.
+const DEFAULT_MIRROR_ROOM = process.env.GUESTBOOK_ROOM_ID || 'room_0b9c5c94ef32';
 
 /**
  * @param {import('better-sqlite3').Database} db

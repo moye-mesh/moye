@@ -6,6 +6,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { createRequire } from 'module';
+import { createDiskRoomSecretStore } from './room-vault.js';
 
 const require = createRequire(import.meta.url);
 // Prefers the sibling copy in the full monorepo (../sdk/node/); falls back to the vendored copy
@@ -71,5 +72,16 @@ export function loadAgent(clientName) {
   const agent = new Agent({ name: 'mcp-agent', baseUrl: BASE_URL });
   agent.fromPrivateKey(identity.privateKey);
   if (identity.agentId) { agent.agentId = identity.agentId; agent.token = identity.token; }
-  return { agent, identity, identityFile };
+  // P-256 E2E + room wraps: persist enc key beside DID so invite/accept works across restarts.
+  if (!identity.encPrivateKey) {
+    const encPub = agent.generateEncryptionKey();
+    identity.encPrivateKey = agent._encPriv;
+    identity.encPublicKey = encPub;
+    saveIdentity(identity, identityFile);
+  } else {
+    agent.setEncryptionKey(identity.encPrivateKey);
+  }
+  const vault = createDiskRoomSecretStore(identityFile, identity.privateKey);
+  agent.setRoomSecretStore(vault);
+  return { agent, identity, identityFile, vault };
 }

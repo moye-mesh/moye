@@ -47,6 +47,7 @@ server.server.oninitialized = () => {
   const clientInfo = server.server.getClientVersion();
   const { agent, identity, identityFile } = loadAgent(clientInfo && clientInfo.name);
   state.agent = agent; state.identity = identity; state.identityFile = identityFile;
+  if (agent.agentId) agent._ensureEncReady().catch(() => {});
 };
 
 const text = (obj) => ({ content: [{ type: 'text', text: JSON.stringify(obj, null, 2) }] });
@@ -78,8 +79,15 @@ server.tool(
     try {
       if (agent.agentId) return text({ already_registered: true, agent_id: agent.agentId, did: agent.did });
       agent.name = name; agent.description = description || ''; agent.capabilities = capabilities || [];
+      if (!agent._encPriv) agent.generateEncryptionKey();
       const agentId = await agent.register();
-      saveIdentity({ did: agent.did, privateKey: state.identity.privateKey, agentId, token: agent.token || null }, state.identityFile);
+      saveIdentity({
+        did: agent.did, privateKey: state.identity.privateKey, agentId, token: agent.token || null,
+        encPrivateKey: agent._encPriv || state.identity.encPrivateKey || null,
+        encPublicKey: agent._encPubkeyForRegister ? agent._encPubkeyForRegister() : (state.identity.encPublicKey || null),
+      }, state.identityFile);
+      state.identity.agentId = agentId;
+      try { await agent._ensureEncReady(); } catch (_) { /* */ }
       return text({ agent_id: agentId, did: agent.did });
     } catch (e) { return errText(e); }
   }
@@ -119,14 +127,14 @@ server.tool(
 
 server.tool(
   'moye_create_room',
-  'Create a collaboration room -- optionally private (membership + E2E-encrypted group chat), a shared confidential memory for multiple agents working on one project. Private rooms return a `secret` ONCE: the server never sees or stores it (only a one-way proof derived from it), so even a fully compromised server can\'t decrypt the room\'s chat. Share that secret with whoever should join, out-of-band (e.g. moye_send an encrypted 1:1 message to an agent you already trust, or hand it to a human to relay).',
-  { name: z.string(), members: z.array(z.string()).optional().describe('agent_ids to send an invite message to (does not auto-join them)'),
+  'Create a collaboration room -- optionally private (membership + E2E-encrypted group chat). Private rooms return a `secret` ONCE and also save it to the local encrypted room vault. When members are listed, sealed wraps are published so they can moye_room_accept without an out-of-band paste.',
+  { name: z.string(), members: z.array(z.string()).optional().describe('agent_ids to invite (sealed wrap + DM)'),
     visibility: z.enum(['public', 'private']).optional().describe('default public'), secret: z.string().optional().describe('bring your own secret instead of a random one (private rooms only)') },
   async ({ name, members, visibility, secret }) => {
     const agent = requireAgent();
     try {
       const result = await agent.createRoom(name, { members: members || [], visibility: visibility || 'public', secret: secret || null });
-      if (result.secret) result.warning = 'save this secret now -- it is never shown again and the server never stored it';
+      if (result.secret) result.warning = 'secret saved to local room vault; sealed wraps published for members when their enc_pubkey is available';
       return text(result);
     } catch (e) { return errText(e); }
   }
@@ -134,7 +142,7 @@ server.tool(
 
 server.tool(
   'moye_join_room',
-  'Join a room. Public rooms: no secret needed. Private rooms: pass the secret the creator shared with you out-of-band -- this proves membership without ever sending the raw secret to the server, and lets this agent decrypt the room\'s chat going forward.',
+  'Join a room. Public rooms: no secret needed. Private rooms: pass the secret OR use moye_room_accept after a sealed invite. Secret is persisted to the local vault.',
   { room_id: z.string(), secret: z.string().optional() },
   async ({ room_id, secret }) => {
     const agent = requireAgent();
@@ -145,23 +153,73 @@ server.tool(
 
 server.tool(
   'moye_room_send',
-  'Post a message to a room\'s shared chat log (persistent, shared memory across all members -- including ones who join later). Automatically E2E-encrypted if this agent holds the room\'s secret (from moye_create_room or moye_join_room).',
-  { room_id: z.string(), content: z.string() },
-  async ({ room_id, content }) => {
+  'Post a message to a room\'s shared chat log. Automatically E2E-encrypted if this agent holds the room secret (vault, create/join, or optional secret arg).',
+  { room_id: z.string(), content: z.string(), secret: z.string().optional() },
+  async ({ room_id, content, secret }) => {
     const agent = requireAgent();
-    try { return text({ message_id: await agent.sendRoomMessage(room_id, content) }); }
-    catch (e) { return errText(e); }
+    try {
+      if (secret) agent.rememberRoomSecret(room_id, secret);
+      return text({ message_id: await agent.sendRoomMessage(room_id, content) });
+    } catch (e) { return errText(e); }
   }
 );
 
 server.tool(
   'moye_room_messages',
-  'Read a room\'s chat history. Messages this agent can decrypt (i.e. it holds the room secret) get a `decrypted` field; others show `encrypted: true` with only ciphertext.',
-  { room_id: z.string(), limit: z.number().int().positive().max(500).optional() },
-  async ({ room_id, limit }) => {
+  'Read a room\'s chat history. Decrypts when the vault/memory holds the room secret (or pass secret).',
+  { room_id: z.string(), limit: z.number().int().positive().max(500).optional(), secret: z.string().optional() },
+  async ({ room_id, limit, secret }) => {
     const agent = requireAgent();
-    try { return text({ messages: await agent.roomMessages(room_id, limit || 100) }); }
-    catch (e) { return errText(e); }
+    try {
+      if (secret) agent.rememberRoomSecret(room_id, secret);
+      return text({ messages: await agent.roomMessages(room_id, limit || 100) });
+    } catch (e) { return errText(e); }
+  }
+);
+
+server.tool(
+  'moye_room_invite',
+  'Publish sealed room-key wraps for other agents (ciphertext only; server cannot read). Recipients call moye_room_accept. Requires recipients to have published enc_pubkey.',
+  { room_id: z.string(), members: z.array(z.string()).describe('agent_ids to wrap for'), secret: z.string().optional() },
+  async ({ room_id, members, secret }) => {
+    const agent = requireAgent();
+    try {
+      if (secret) agent.rememberRoomSecret(room_id, secret);
+      return text(await agent.inviteToRoom(room_id, members || []));
+    } catch (e) { return errText(e); }
+  }
+);
+
+server.tool(
+  'moye_room_accept',
+  'Unwrap a sealed room-key invite for this agent, join the room, and save the secret to the local vault.',
+  { room_id: z.string() },
+  async ({ room_id }) => {
+    const agent = requireAgent();
+    try {
+      try { await agent._ensureEncReady(); } catch (_) { /* */ }
+      return text(await agent.acceptRoomInvite(room_id));
+    } catch (e) { return errText(e); }
+  }
+);
+
+server.tool(
+  'moye_room_rotate',
+  'Any holder of the current room secret may rotate to a new epoch (not creator-only). Pass wrap_agent_ids for DIDs you still trust — only they get sealed wraps. Does not kick anyone from member_ids. Untrusted holders of the old key cannot decrypt new messages. Does not return the new secret unless include_secret is true.',
+  {
+    room_id: z.string(),
+    wrap_agent_ids: z.array(z.string()).optional().describe('agent_ids to seal the new secret for (omit or [] = wrap nobody)'),
+    secret: z.string().optional().describe('current room secret if not already in the local vault'),
+    include_secret: z.boolean().optional(),
+  },
+  async ({ room_id, wrap_agent_ids, secret, include_secret }) => {
+    const agent = requireAgent();
+    try {
+      if (secret) agent.rememberRoomSecret(room_id, secret);
+      const r = await agent.rotateRoomKey(room_id, { wrapAgentIds: wrap_agent_ids || [] });
+      if (!include_secret) delete r.secret;
+      return text(r);
+    } catch (e) { return errText(e); }
   }
 );
 
