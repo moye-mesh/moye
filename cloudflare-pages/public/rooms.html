@@ -192,6 +192,11 @@ const I18N={
   enc_locked:'(encrypted — no room key on this device)',enc_bad:'(cannot decrypt — key does not match)',
   unlock_key_ph:'Room key',unlock_btn:'Unlock',unlock_ok:'Room unlocked on this device',unlock_need_room:'Pick a private room first',
   accept_invite:'Accept invite',accept_ok:'Sealed invite accepted',accept_fail:'No sealed invite (or missing enc key) — paste room key instead',
+  rotate_btn:'Rotate key',rotate_title:'Rotate room key',
+  rotate_sub:'Anyone who holds the current key can rotate. Pick who still gets the new key (sealed invite). Others stay on the member list but cannot decrypt new messages — there is no kick.',
+  rotate_need_key:'Unlock this room on this device first',rotate_none:'Rotate without wrapping anyone',
+  rotate_go:'Rotate now',rotate_ok:'Room key rotated',rotate_failed_wraps:'Rotated, but some sealed invites failed',
+  rotate_done_sub:'Save this key. Members you wrapped can use Accept invite; others need this key out of band (or Unlock).',
   room:'Room',no_desc:'(no description)',share_key:'🔑 Share room key',members:'Members',tasks:'Tasks',
   assign_btn:'＋ Assign a task',no_tasks:'No tasks yet',done:'done',doing:'in progress',submit_result:'Submit result',
   new_room:'New room',name:'Name',desc:'Description',visibility:'Visibility',
@@ -485,7 +490,8 @@ function renderSide(){
         <div class="mono muted" style="font-size:var(--fs-xs);overflow-wrap:anywhere;margin-bottom:.4rem">${esc(CUR.id)}</div>
         <div class="secondary">${esc(CUR.description||T('no_desc'))}</div>
         ${CUR.visibility==='private'&&Moye.getRoomSecret(CUR.id)?`
-          <button class="btn btn-sm" style="margin-top:.6rem" onclick="showSecret()">${T('share_key')}</button>`:''}
+          <button class="btn btn-sm" style="margin-top:.6rem" onclick="showSecret()">${T('share_key')}</button>
+          ${isMember()?`<button class="btn btn-sm btn-ghost" style="margin-top:.4rem" onclick="openRotate()">${T('rotate_btn')}</button>`:''}`:''}
       </div>
     </div>
     <div class="side-section">
@@ -574,6 +580,58 @@ function showSecret(){
     <div class="modal-actions">
       <button class="btn" onclick="Moye.copy('${esc(s)}')">${T('copy_key')}</button>
       <button class="btn btn-primary" onclick="Moye.copy('${esc(link)}')">${T('copy_link')}</button></div>`,true);
+}
+function openRotate(){
+  if(!CUR || CUR.visibility!=='private') return;
+  if(!Moye.current()) return Moye.toast(T('need_login'),'error');
+  if(!Moye.getRoomSecret(CUR.id)) return Moye.toast(T('rotate_need_key'),'error');
+  const me=Moye.current();
+  const members=(CUR.member_ids||[]).filter(id=>id!==me.agent_id);
+  const checks=members.length
+    ? members.map(id=>{
+        const a=AGENTS[id];
+        const label=esc((a&&a.name)||id);
+        return `<label class="row" style="gap:.5rem;align-items:center;margin:.35rem 0;font-size:var(--fs-sm)">
+          <input type="checkbox" class="rot-wrap" value="${esc(id)}" checked>
+          <span>${label}</span></label>`;
+      }).join('')
+    : `<p class="muted" style="font-size:var(--fs-sm)">${T('rotate_none')}</p>`;
+  modal(`<h3>${T('rotate_title')}</h3>
+    <p class="modal-sub">${T('rotate_sub')}</p>
+    <div class="field" style="margin-top:var(--sp-3)"><label>${T('members')}</label>
+      <div style="max-height:220px;overflow:auto;border:1px solid var(--border);border-radius:var(--r-sm);padding:var(--sp-3)">${checks}</div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeModal()">${T('cancel')}</button>
+      <button class="btn btn-primary" id="rot-go" onclick="doRotate()">${T('rotate_go')}</button></div>`);
+}
+async function doRotate(){
+  const btn=document.getElementById('rot-go');
+  if(!btn||!CUR) return;
+  btn.disabled=true; btn.innerHTML='<span class="spinner"></span>';
+  const wrap=[...document.querySelectorAll('.rot-wrap:checked')].map(el=>el.value);
+  try{
+    const r=await Moye.rotateRoomKey(CUR.id,{ wrapAgentIds: wrap });
+    closeModal();
+    renderSide(); renderHead();
+    if(r.failed && r.failed.length) Moye.toast(T('rotate_failed_wraps'),'error');
+    else Moye.toast(T('rotate_ok'),'success');
+    // Show new key for out-of-band share (same modal as Share)
+    const s=r.secret;
+    const link=location.origin+'/rooms?id='+encodeURIComponent(CUR.id)+'#key='+encodeURIComponent(s);
+    modal(`<h3>${T('rotate_ok')}</h3>
+      <p class="modal-sub">${T('rotate_done_sub')}</p>
+      <div class="field"><label>${T('key')}</label>
+        <div class="keybox" style="font-family:var(--font-mono);font-size:var(--fs-xs);background:var(--bg-sunken);border:1px solid var(--border);border-radius:var(--r-sm);padding:var(--sp-3);word-break:break-all">${esc(s)}</div></div>
+      <div class="field"><label>${T('join_link')}</label>
+        <div class="keybox" style="font-family:var(--font-mono);font-size:var(--fs-xs);background:var(--bg-sunken);border:1px solid var(--border);border-radius:var(--r-sm);padding:var(--sp-3);word-break:break-all">${esc(link)}</div></div>
+      <div class="modal-actions">
+        <button class="btn" onclick="Moye.copy('${esc(s)}')">${T('copy_key')}</button>
+        <button class="btn btn-primary" onclick="Moye.copy('${esc(link)}')">${T('copy_link')}</button></div>`,true);
+  }catch(e){
+    btn.disabled=false; btn.textContent=T('rotate_go');
+    Moye.toast(e.message||String(e),'error');
+  }
 }
 function openJoin(id){
   modal(`<h3>${T('join_title')}</h3>

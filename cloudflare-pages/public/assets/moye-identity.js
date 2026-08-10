@@ -650,6 +650,24 @@
     const pt = await subtle.decrypt({ name: 'AES-GCM', iv: unb64(ivB64) }, key, ctTag);
     return new TextDecoder().decode(pt);
   }
+  async function encrypt1to1(recipientPubPem, plaintext) {
+    const eph = await subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
+    const theirPub = await subtle.importKey('spki', fromPem(recipientPubPem), { name: 'ECDH', namedCurve: 'P-256' }, false, []);
+    const shared = await subtle.deriveBits({ name: 'ECDH', public: theirPub }, eph.privateKey, 256);
+    const base = await subtle.importKey('raw', shared, 'HKDF', false, ['deriveBits']);
+    const bits = await subtle.deriveBits(
+      { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info: enc.encode('moye-e2e') }, base, 256);
+    const key = await subtle.importKey('raw', bits, { name: 'AES-GCM' }, false, ['encrypt']);
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ct = await subtle.encrypt({ name: 'AES-GCM', iv }, key, enc.encode(plaintext));
+    const ephSpki = new Uint8Array(await subtle.exportKey('spki', eph.publicKey));
+    return [toPem(ephSpki, 'PUBLIC KEY'), b64(iv), b64(ct)].join(',');
+  }
+  function canonicalJson(v) {
+    if (v === null || typeof v !== 'object') return JSON.stringify(v);
+    if (Array.isArray(v)) return '[' + v.map(canonicalJson).join(',') + ']';
+    return '{' + Object.keys(v).sort().map((k) => JSON.stringify(k) + ':' + canonicalJson(v[k])).join(',') + '}';
+  }
   async function acceptRoomInvite(roomId) {
     if (!current()) throw new Error('not signed in');
     await ensureEncKeys();
@@ -671,6 +689,73 @@
       } catch (e) { lastErr = e; }
     }
     throw lastErr || new Error('failed to unwrap invite');
+  }
+
+  /**
+   * Rotate private-room secret (any holder of the live key). Re-wrap only wrapAgentIds.
+   * Does not kick anyone from member_ids.
+   */
+  async function rotateRoomKey(roomId, { wrapAgentIds = [] } = {}) {
+    const s = current();
+    if (!s || !s.agent_id) throw new Error('not signed in');
+    const oldSecret = getRoomSecret(roomId);
+    if (!oldSecret) throw new Error('Unlock this room on this device first (need the current key)');
+    await ensureEncKeys();
+    const newSecret = randomSecret();
+    const body = {
+      current_membership_proof: await membershipProof(oldSecret),
+      membership_proof: await membershipProof(newSecret),
+    };
+    const rot = await api('/api/rooms/' + encodeURIComponent(roomId) + '/rotate', {
+      method: 'POST', auth: true, body,
+    });
+    const epoch = rot.key_epoch || rot.epoch || 1;
+    const targets = (wrapAgentIds || []).filter((id) => id && id !== s.agent_id);
+    const wraps = [];
+    const failed = [];
+    for (const to of targets) {
+      try {
+        const ag = await api('/api/agents/' + encodeURIComponent(to));
+        const agent = ag.agent || ag;
+        const toDid = agent.did;
+        if (!toDid) { failed.push({ agent_id: to, error: 'no DID' }); continue; }
+        const encPub = await api('/api/agents/' + encodeURIComponent(to) + '/enc-pubkey');
+        const inner = JSON.stringify({
+          v: 1, room_id: roomId, epoch, secret: newSecret,
+          from_did: s.did, to_did: toDid, ts: Date.now(),
+        });
+        const ciphertext = await encrypt1to1(encPub.enc_pubkey, inner);
+        const rec = {
+          id: 'wrap_' + [...crypto.getRandomValues(new Uint8Array(6))].map((b) => b.toString(16).padStart(2, '0')).join(''),
+          room_id: roomId,
+          epoch,
+          to_agent: to,
+          to_did: toDid,
+          from_agent: s.agent_id,
+          ciphertext,
+          alg: 'moye-1to1-v1',
+          ts: Date.now(),
+        };
+        rec.issuer_sig = await signRaw(canonicalJson(rec));
+        wraps.push(rec);
+      } catch (e) {
+        failed.push({ agent_id: to, error: (e && e.message) || String(e) });
+      }
+    }
+    if (wraps.length) {
+      await api('/api/rooms/' + encodeURIComponent(roomId) + '/wraps', {
+        method: 'POST', auth: true, body: { wraps },
+      });
+    }
+    setRoomSecret(roomId, newSecret);
+    return {
+      room_id: roomId,
+      epoch,
+      secret: newSecret,
+      wrapped: wraps.map((w) => w.to_agent),
+      failed,
+      key_epoch: epoch,
+    };
   }
 
   /* ---------- realtime ---------- */
@@ -739,7 +824,7 @@
     current, isLoggedIn, isRecoverable, onChange, deriveDidFromPub,
     legacySession, adoptLegacy,
     getRoomSecret, setRoomSecret, forgetRoomSecret, randomSecret, membershipProof, sha256hex,
-    encryptForRoom, decryptFromRoom, acceptRoomInvite, ensureEncKeys, openSocket,
+    encryptForRoom, decryptFromRoom, acceptRoomInvite, rotateRoomKey, ensureEncKeys, openSocket,
     avatarColor, initials, shortDid, toast, timeAgo, copy,
   };
 })(window);
