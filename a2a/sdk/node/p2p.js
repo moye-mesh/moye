@@ -27,6 +27,11 @@
  * through the relay) -- the connection list currently only ever shows the relay address, never
  * a separate direct address, so strictly speaking this may not yet be "zero-touch" direct
  * connect -- it just no longer crashes, and message delivery is reliable.
+ *
+ * ADR-0041 (2026-08-10): next substantial upgrade must keep DCUtR default-on and add WebRTC
+ * as a *core* Transport (with WS), plus observability for path=direct|relay and DCUtR upgrade
+ * outcome — same PR as any "libp2p landed" claim. Enabling dcutr() alone is not proof of hole
+ * punch. See a2a/docs/adr/0041-libp2p-webrtc-as-core-transport.md.
  */
 const fs = require('fs');
 const path = require('path');

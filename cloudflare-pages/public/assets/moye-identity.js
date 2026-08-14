@@ -443,6 +443,36 @@
     return data;
   }
 
+  /* ---------- session keys (ADR-0014 §2.4 / ADR-0043) ----------
+     Mints a short-lived, narrowly-scoped Ed25519 keypair and self-issues a session-key VC for it,
+     the exact same mechanism the Node SDK's Agent#createSession() uses (see
+     sdk/node/moye-agent-sdk.js) -- kept here so a page can hand the resulting private_key to
+     another process (e.g. the Telegram bridge relay) without that process ever touching this
+     device's own non-extractable master key. The master key signs the VC once, then the session
+     key is on its own. */
+  async function createSession({ scope = ['room.read', 'room.post'], expiresInMs = 7 * 24 * 3600 * 1000 } = {}) {
+    const rec = await dbGet(DB_KEY);
+    if (!rec || !rec.privKey || !rec.did) throw new Error('not signed in with a usable key');
+    const kp = await subtle.generateKey({ name: 'Ed25519' }, true, ['sign', 'verify']);
+    const spki = new Uint8Array(await subtle.exportKey('spki', kp.publicKey));
+    const pkcs8 = new Uint8Array(await subtle.exportKey('pkcs8', kp.privateKey));
+    const pubPem = toPem(spki, 'PUBLIC KEY');
+    const privPem = toPem(pkcs8, 'PRIVATE KEY');
+    const sessionDid = await deriveDidFromPub(pubPem);
+    const expires = Date.now() + Math.max(60000, Number(expiresInMs) || 0);
+    const claim = {
+      type: 'session-key', session_did: sessionDid, pubkey: pubPem,
+      scope: Array.isArray(scope) ? scope.slice() : ['*'], expires,
+    };
+    const vc = { type: 'moye/vc', issuer: rec.did, subject: sessionDid, claim, issued_at: Date.now(), expires_at: expires };
+    vc.sig = await signRaw(canonicalJson(vc));
+    await api('/api/credentials', { method: 'POST', auth: true, body: { credential: vc } });
+    return {
+      master_did: rec.did, agent_id: rec.agent_id, session_did: sessionDid,
+      private_key: privPem, pubkey: pubPem, scope: claim.scope, expires,
+    };
+  }
+
   /* ---------- register ----------
      Registering with a pubkey takes the DID self-attestation path, so no proof-of-work
      round-trip is needed and the identity is key-controlled (recoverable) from the start. */
@@ -821,7 +851,7 @@
     register, loginWithKey, loginWithBackupFile, inspectBackupFile, logout, forgetDevice, lockSession,
     setBackupPassphrase, downloadBackup, hasBackup, hasPasskey, isLocked,
     passkeyAvailable, enablePasskey, unlockWithPasskey, disablePasskey,
-    current, isLoggedIn, isRecoverable, onChange, deriveDidFromPub,
+    current, isLoggedIn, isRecoverable, onChange, deriveDidFromPub, createSession,
     legacySession, adoptLegacy,
     getRoomSecret, setRoomSecret, forgetRoomSecret, randomSecret, membershipProof, sha256hex,
     encryptForRoom, decryptFromRoom, acceptRoomInvite, rotateRoomKey, ensureEncKeys, openSocket,

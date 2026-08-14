@@ -4,6 +4,12 @@
 // The relay's libp2p identity (PeerId) is a separate persisted keypair, distinct from the
 // DID/Ed25519-PEM identity in lib/node_identity.js -- don't conflate the two.
 //
+// ADR-0041 (2026-08-10): core libp2p stack for MOYE = WebRTC + WebSockets transports, plus
+// circuit-relay-v2 and DCUtR (clients default-on; this relay keeps providing circuit-relay-v2).
+// Next substantial upgrade / "libp2p fully landed" PR must deliver WebRTC + DCUtR observability
+// in the *same* change set — do not ship WS-only permanent-relay and call the stack complete.
+// See a2a/docs/adr/0041-libp2p-webrtc-as-core-transport.md.
+//
 // Update (2026-07-23): the dcutr incompatibility once suspected here turned out to be a callback
 // signature bug in the client-side SDK (sdk/node/p2p.js), not a relay-side issue -- see that file's
 // header comment for details. This relay module itself never used dcutr in the first place; it only

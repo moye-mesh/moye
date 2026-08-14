@@ -212,6 +212,29 @@ class Agent {
     return crypto.sign(null, Buffer.from(JSON.stringify(payload)), crypto.createPrivateKey(this._priv)).toString('base64');
   }
 
+  /** ADR-0043 gap 2: let the master identity's signing happen OUTSIDE this process -- e.g. a
+   *  browser wallet extension or hardware key -- so the master private key never needs to be
+   *  loaded here at all. this.did is set directly (a DID is public, shareable); every signature
+   *  the master identity would normally produce with this._priv is instead requested via
+   *  signFn(bytes) => Promise<string> (base64 signature). Scoped narrowly to the ADR-0043 use
+   *  case (minting a scoped session key without a browser tab ever holding the master key) --
+   *  wired into issueCredential()/createSession() only. Every other method on this class still
+   *  requires this._priv exactly as before; this does not turn Agent into a general remote-signer.
+   */
+  useExternalSigner(did, signFn) {
+    if (!did) throw new MoyeError('useExternalSigner requires the master did');
+    if (typeof signFn !== 'function') throw new MoyeError('signFn must be (bytes: Buffer) => Promise<string> (base64 signature)');
+    this.did = did;
+    this._externalSign = signFn;
+    return this;
+  }
+
+  async _masterSign(bytes) {
+    if (this._externalSign) return this._externalSign(bytes);
+    if (!this._priv) throw new MoyeError('no signing capability: call fromPrivateKey()/generateIdentity() or useExternalSigner() first');
+    return crypto.sign(null, bytes, crypto.createPrivateKey(this._priv)).toString('base64');
+  }
+
   // Header-only DID signing for GET requests (no body at all) -- see inbox()'s history comment for
   // why: signing a body on GET doesn't survive the production Cloudflare Worker (Fetch spec forbids
   // a body on GET/HEAD). Shared by inbox() and roomMessages(); matches server.js authAgent()'s
@@ -905,18 +928,30 @@ class Agent {
   // then attach `sig`. Found missing across all SDKs during the 2026-07-24 ADR/spec gap audit --
   // the server-side endpoint existed but no client could call it without hand-rolling this signing.
   async issueCredential(subjectDid, claim, { expiresAt = null } = {}) {
-    if (!this.did || !this._priv) throw new MoyeError('issuing a credential requires a DID identity');
+    if (!this.did || (!this._priv && !this._externalSign)) {
+      throw new MoyeError('issuing a credential requires a DID identity (loaded key or useExternalSigner())');
+    }
     if (this._sessionDid) throw new MoyeError('session keys cannot issue credentials');
     const vc = { type: 'moye/vc', issuer: this.did, subject: subjectDid, claim, issued_at: Date.now(), expires_at: expiresAt };
-    vc.sig = crypto.sign(null, Buffer.from(this._canonical(vc)), crypto.createPrivateKey(this._priv)).toString('base64');
-    const body = { credential: vc };
-    return request(this.baseUrl, 'POST', '/api/credentials', body, this._headers(this._didHeaders(body)));
+    // Two independent signatures, both from the master identity, matching what _didHeaders()
+    // would have produced when this._priv was loaded directly:
+    //   1. vc.sig -- over the VC's own canonical (sorted-key) form, verified by vcVerify() server-side.
+    //   2. the outer request envelope -- over plain (insertion-order) JSON.stringify(body), same as
+    //      _sign()/_didHeaders() everywhere else. `ts` lives inside `body` because that is what gets
+    //      both signed and sent -- same "one object, both purposes" pattern _didHeaders() documents.
+    vc.sig = await this._masterSign(Buffer.from(this._canonical(vc)));
+    const body = { credential: vc, ts: Date.now() };
+    const outerSig = await this._masterSign(Buffer.from(JSON.stringify(body)));
+    const headers = this._headers({ 'X-Moye-Did': this.did, 'X-Moye-Sig': outerSig });
+    return request(this.baseUrl, 'POST', '/api/credentials', body, headers);
   }
 
   // ADR-0014 §2.4: mint a scoped/expiring session key. Returns the hot private key once —
   // the network only ever sees the session pubkey inside the VC claim.
   async createSession({ scope = ['send', 'inbox', 'room.post', 'room.read'], expiresInMs = 7 * 24 * 3600 * 1000 } = {}) {
-    if (!this.did || !this._priv || !this.agentId) throw new MoyeError('createSession requires a registered DID identity');
+    if (!this.did || (!this._priv && !this._externalSign) || !this.agentId) {
+      throw new MoyeError('createSession requires a registered DID identity (loaded key or useExternalSigner()) and agentId');
+    }
     if (this._sessionDid) throw new MoyeError('a session key cannot mint further sessions');
     const { privateKey, publicKey } = crypto.generateKeyPairSync('ed25519');
     const privPem = privateKey.export({ type: 'pkcs8', format: 'pem' });
@@ -1069,10 +1104,15 @@ class Agent {
       u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:';
       if (self._priv && self.did) {
         const ts = Date.now();
+        // When self._sessionDid is set (fromSession()), self._priv is the SESSION's own key --
+        // this already signs with the right key. What was missing (ADR-0043) is telling the
+        // server it's looking at a session signature at all: without the `session` param, the
+        // server tried to verify this signature against the MASTER's pubkey and always failed.
         const sig = self._sign({ method: 'WS', path: '/ws', ts });
         u.searchParams.set('did', self.did);
         u.searchParams.set('sig', sig);
         u.searchParams.set('ts', String(ts));
+        if (self._sessionDid) u.searchParams.set('session', self._sessionDid);
       } else if (self.token) {
         u.searchParams.set('agent', self.agentId);
         u.searchParams.set('token', self.token);

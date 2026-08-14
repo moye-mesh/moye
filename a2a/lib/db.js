@@ -132,6 +132,38 @@ CREATE TABLE IF NOT EXISTS visit_counter (
   today_date TEXT NOT NULL,
   today_count INTEGER NOT NULL DEFAULT 0
 );
+
+-- Telegram bridge (ADR-0044): a room member mints a longer-lived invite; anyone who opens it in
+-- Telegram gets their own real MOYE identity (or reuses one already signed in on their device) and
+-- their own session key -- never a shared bot identity. See docs/adr/0044.
+CREATE TABLE IF NOT EXISTS telegram_invites (
+  invite_code TEXT PRIMARY KEY,
+  room_id TEXT NOT NULL,
+  created_by TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+
+-- One row per (telegram_chat, room) link attempt. 'pending_web' is created the instant the bot
+-- sees /start <invite_code> from a real Telegram chat (so telegram_chat_id is Telegram-authenticated
+-- from the start, never a browser-supplied claim); 'active' once the browser step completes and a
+-- verified live session-key VC (findLiveSessionKey) backs the submitted session_private_key.
+CREATE TABLE IF NOT EXISTS telegram_pairings (
+  pairing_code TEXT PRIMARY KEY,
+  room_id TEXT NOT NULL,
+  telegram_chat_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending_web',
+  agent_id TEXT,
+  master_did TEXT,
+  session_did TEXT,
+  session_private_key TEXT,
+  session_expires_at INTEGER,
+  delivered_to_relay INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  activated_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_telegram_pairings_relay ON telegram_pairings(status, delivered_to_relay);
 `);
 
 // Migration: the old database (created 2026-07-15 during the MySQL -> SQLite cutover) stored a
