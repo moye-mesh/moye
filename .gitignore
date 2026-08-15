@@ -55,6 +55,7 @@ npm-debug.log*
 
 # Local tool config + self-referencing symlinks (legacy links pointing at . itself, not project source)
 .claude/
+.cursor/
 /moye
 /www
 /api/
