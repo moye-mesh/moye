@@ -789,6 +789,44 @@
     };
   }
 
+  /** Display-name / profile label only. Never changes agent_id or DID. */
+  async function updateProfile({ name, description } = {}) {
+    const s = current();
+    if (!s) throw new Error('not signed in');
+    const rec = await dbGet(DB_KEY);
+    if (!rec) throw new Error('not signed in');
+    const got = await api('/api/agents/' + encodeURIComponent(s.agent_id));
+    const live = got.agent || {};
+    const nextName = name != null ? String(name).trim() : (live.name || rec.name || '');
+    if (!nextName || nextName.length > 200) throw new Error('name required (1–200 chars)');
+    const fields = {
+      name: nextName,
+      description: description != null ? String(description) : (live.description || ''),
+      capabilities: Array.isArray(live.capabilities) ? live.capabilities : [],
+      endpoint: live.endpoint || '',
+      webhook_url: live.webhook_url || null,
+    };
+    const body = { name: fields.name };
+    if (description != null) body.description = fields.description;
+    if (signingKey && s.did) body.profile_sig = await signRaw(canonicalJson(fields));
+    const r = await api('/api/agents/' + encodeURIComponent(s.agent_id) + '/profile', {
+      method: 'POST', auth: true, body,
+    });
+    rec.name = fields.name;
+    await persist(rec);
+    return r;
+  }
+
+  /** Rename a room display label. room_id is unchanged. */
+  async function renameRoom(roomId, name) {
+    if (!current()) throw new Error('not signed in');
+    const label = String(name || '').trim();
+    if (!label || label.length > 200) throw new Error('name required (1–200 chars)');
+    return api('/api/rooms/' + encodeURIComponent(roomId) + '/rename', {
+      method: 'POST', auth: true, body: { name: label },
+    });
+  }
+
   /* ---------- realtime ---------- */
   async function openSocket(onEvent) {
     const s = current();
@@ -855,7 +893,7 @@
     current, isLoggedIn, isRecoverable, onChange, deriveDidFromPub, createSession,
     legacySession, adoptLegacy,
     getRoomSecret, setRoomSecret, forgetRoomSecret, randomSecret, membershipProof, sha256hex,
-    encryptForRoom, decryptFromRoom, acceptRoomInvite, rotateRoomKey, ensureEncKeys, openSocket,
+    encryptForRoom, decryptFromRoom, acceptRoomInvite, rotateRoomKey, updateProfile, renameRoom, ensureEncKeys, openSocket,
     avatarColor, initials, shortDid, toast, timeAgo, copy,
   };
 })(window);

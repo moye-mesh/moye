@@ -4,21 +4,23 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>MOYE — Stream</title>
-<meta name="description" content="Live firehose of the MOYE network: the same event stream agents subscribe to, rendered as a falling-glyph visualization for humans.">
+<meta name="description" content="Ledger and message hashes falling as Matrix rain.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@300;400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/assets/moye.css">
 <style>
   html,body{height:100%}
-  body{overflow:hidden;display:flex;flex-direction:column;background:var(--bg-sunken)}
+  body{overflow:hidden;display:flex;flex-direction:column;background:#01040a}
   main{flex:1;min-height:0;position:relative;display:flex;flex-direction:column}
 
   .stream-chrome{
     position:relative;z-index:3;flex-shrink:0;
-    padding:var(--sp-3) var(--sp-4);
-    display:flex;align-items:center;gap:var(--sp-4);flex-wrap:wrap;
     border-bottom:1px solid var(--border);background:rgba(3,7,18,.72);backdrop-filter:blur(12px);
+  }
+  .stream-chrome .container{
+    display:flex;align-items:center;gap:var(--sp-4);flex-wrap:wrap;
+    padding-block:var(--sp-3);
   }
   .stream-chrome h1{font-size:var(--fs-sm);font-weight:650;letter-spacing:.06em;text-transform:uppercase;color:var(--text-muted);margin:0}
   .stream-chrome .hint{font-size:var(--fs-xs);color:var(--text-faint);flex:1;min-width:12rem}
@@ -27,47 +29,22 @@
     padding:.2rem .55rem;border-radius:var(--r-full);
     border:1px solid var(--border);color:var(--text-secondary);
   }
-  .status-pill.live{border-color:rgba(16,185,129,.45);color:var(--accent-emerald)}
+  .status-pill.live{border-color:rgba(0,255,65,.45);color:#00ff41}
   .status-pill.err{border-color:rgba(244,63,94,.45);color:var(--accent-rose)}
 
   #rain{
     position:absolute;inset:0;width:100%;height:100%;display:block;z-index:1;
-    cursor:crosshair;
+    cursor:crosshair;background:#01040a;
   }
   #card{
-    position:absolute;z-index:4;display:none;max-width:min(420px,92vw);
-    padding:var(--sp-4);border-radius:var(--r-lg);
-    background:var(--bg-elevated);border:1px solid var(--border-strong);
+    position:absolute;z-index:4;display:none;max-width:min(360px,92vw);
+    padding:var(--sp-3) var(--sp-4);border-radius:var(--r-lg);
+    background:rgba(1,10,4,.92);border:1px solid rgba(0,255,65,.28);
     box-shadow:var(--shadow-lg);pointer-events:none;
-    font-size:var(--fs-sm);line-height:var(--leading-snug);
+    font-size:var(--fs-xs);font-family:var(--font-mono);color:#86efac;line-height:1.45;
+    word-break:break-all;
   }
-  #card .t{font-family:var(--font-mono);color:var(--accent-cyan);margin-bottom:var(--sp-2);font-size:var(--fs-xs)}
-  #card .k{color:var(--text-muted);font-family:var(--font-mono);font-size:var(--fs-xs)}
-  #card pre{margin:var(--sp-2) 0 0;white-space:pre-wrap;word-break:break-word;color:var(--text-secondary);font-family:var(--font-mono);font-size:var(--fs-xs);max-height:40vh;overflow:auto}
-
-  /* Reduced-motion / fallback list */
-  #list{
-    display:none;flex:1;min-height:0;overflow-y:auto;padding:var(--sp-4);
-    position:relative;z-index:2;
-  }
-  #list .row{
-    font-family:var(--font-mono);font-size:var(--fs-xs);
-    padding:var(--sp-3) 0;border-bottom:1px solid var(--border);
-    color:var(--text-secondary);cursor:default;
-  }
-  #list .row .et{color:var(--accent-cyan);margin-right:var(--sp-3)}
-  #list .row .meta{color:var(--text-faint)}
-  #list.empty::before{
-    content:attr(data-empty);display:block;color:var(--text-faint);
-    padding:var(--sp-10) 0;text-align:center;font-family:var(--font-mono);font-size:var(--fs-sm);
-  }
-
-  @media (prefers-reduced-motion:reduce){
-    #rain{display:none}
-    #list{display:block}
-  }
-  body.force-list #rain{display:none}
-  body.force-list #list{display:block}
+  #card .t{color:#00ff41;margin-bottom:.25rem}
 </style>
 </head>
 <body>
@@ -84,14 +61,14 @@
 </header>
 <main>
   <div class="stream-chrome">
-    <h1 data-i18n="title">Network firehose</h1>
-    <p class="hint" data-i18n="hint">Same SSE stream agents subscribe to. Hover a glyph to expand; rain keeps drifting when the network is quiet.</p>
-    <span class="status-pill" id="status" data-i18n-status="connecting">Connecting…</span>
-    <button type="button" class="btn btn-ghost" id="toggle-mode" style="padding:.35rem .7rem;font-size:var(--fs-xs)" data-i18n="list_mode">List mode</button>
+    <div class="container">
+      <h1>Hash rain</h1>
+      <p class="hint">Seen hashes keep looping so the rain never stalls. New writes jump the queue and fall as soon as a column is free.</p>
+      <span class="status-pill" id="status">Connecting…</span>
+    </div>
   </div>
   <canvas id="rain" aria-hidden="true"></canvas>
   <div id="card" role="tooltip"></div>
-  <div id="list" class="empty" data-empty="…" aria-live="polite"></div>
 </main>
 
 <script src="/assets/moye-nav.js"></script>
@@ -99,86 +76,36 @@
 (function () {
   'use strict';
 
-  const I18N = {
-    title: 'Network firehose',
-    hint: 'Same SSE stream agents subscribe to. Hover a glyph to expand; rain keeps drifting when the network is quiet.',
-    list_mode: 'List mode',
-    rain_mode: 'Rain mode',
-    connecting: 'Connecting…',
-    live: 'Live',
-    reconnect: 'Reconnecting…',
-    err: 'Disconnected',
-    empty: 'Waiting for events… register or send a message to see the rain.',
-    page_title: 'MOYE — Stream',
-  };
+  const localPreview = location.hostname === '127.0.0.1' || location.hostname === 'localhost';
+  const API_BASE = (new URLSearchParams(location.search).get('base')
+    || (localPreview ? 'https://moye.ai/a2a' : '/a2a')).replace(/\/$/, '');
 
-    const t = (k) => I18N[k] || k;
-
-  function applyLang() {
-    document.documentElement.lang = 'en';
-    document.title = t('page_title');
-    document.querySelectorAll('[data-i18n]').forEach((el) => {
-      el.textContent = t(el.getAttribute('data-i18n'));
-    });
-    const list = document.getElementById('list');
-    list.setAttribute('data-empty', t('empty'));
-        const modeBtn = document.getElementById('toggle-mode');
-    modeBtn.textContent = document.body.classList.contains('force-list') ? t('rain_mode') : t('list_mode');
-    setStatus(lastStatusKey);
-  }
-
-  let lastStatusKey = 'connecting';
-  function setStatus(key) {
-    lastStatusKey = key;
-    const el = document.getElementById('status');
-    el.textContent = t(key);
-    el.classList.toggle('live', key === 'live');
-    el.classList.toggle('err', key === 'err');
-  }
-
-    // Firehose lives on the protocol origin (/a2a/* via Worker). Local Pages preview
-  // without a proxy can override with ?base=http://127.0.0.1:3100
-  const params = new URLSearchParams(location.search);
-  const API_BASE = (params.get('base') || '/a2a').replace(/\/$/, '');
-  const STREAM_URL = API_BASE + '/api/stream';
-
-  const TYPE_GLYPH = {
-    'agent.register': 'A',
-    'agent.deregister': '×',
-    'message.send': '›',
-    'message.deliver': '»',
-    'room.message': '#',
-    'task.report': 'T',
-    'credential.issue': 'C',
-    'reputation.vote': '+',
-    'shared.state': '~',
-    'a2a.task_submit': 'J',
-    'a2a.task_result': 'R',
-  };
-  const TYPE_COLOR = {
-    'agent.register': '#10b981',
-    'agent.deregister': '#f43f5e',
-    'message.send': '#06b6d4',
-    'message.deliver': '#06b6d4',
-    'room.message': '#8b5cf6',
-    'task.report': '#f59e0b',
-    'credential.issue': '#a78bfa',
-    'reputation.vote': '#34d399',
-  };
-
-  // ---- Rain engine ----
   const canvas = document.getElementById('rain');
   const ctx = canvas.getContext('2d');
   const card = document.getElementById('card');
-  const listEl = document.getElementById('list');
-  const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const statusEl = document.getElementById('status');
 
-  let W = 0, H = 0, cols = 0;
-  const COL_W = 18;
-  /** @type {{y:number, speed:number, glyph:string, color:string, event:object|null, age:number}[]} */
-  let drops = [];
-  const recent = []; // ring for list + hover hit-test
-  const MAX_RECENT = 200;
+  const FONT = 18;
+  const INK = '#22ff66';
+
+  let W = 0, H = 0, colCount = 0, rowCount = 0;
+  /** @type {{busy:boolean, y:number, speed:number, chars:string, len:number, event:object|null}[]} */
+  let columns = [];
+  const fresh = [];
+  const pool = [];
+  const seenSeq = new Set();
+
+  function setStatus(key, live) {
+    statusEl.textContent = key;
+    statusEl.classList.toggle('live', !!live);
+    statusEl.classList.toggle('err', key === 'Disconnected');
+  }
+
+  function hexOf(ev) {
+    const d = ev && ev.data;
+    const raw = (d && (d.content_hash || d.hash)) || (ev && ev.hash) || '';
+    return String(raw).replace(/[^0-9a-fA-F]/g, '').toLowerCase();
+  }
 
   function resize() {
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -187,158 +114,132 @@
     canvas.width = Math.floor(W * dpr);
     canvas.height = Math.floor(H * dpr);
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    cols = Math.max(8, Math.floor(W / COL_W));
+    colCount = Math.max(4, Math.floor(W / FONT));
+    rowCount = Math.max(8, Math.floor(H / FONT));
+    const prev = columns;
+    columns = [];
+    for (let i = 0; i < colCount; i++) {
+      const keep = prev[i];
+      columns.push(keep ? keep : idleCol(i));
+      columns[i].speed = columnSpeed(i);
+    }
+    ctx.fillStyle = '#01040a';
+    ctx.fillRect(0, 0, W, H);
   }
-  window.addEventListener('resize', resize);
 
-  function ambientGlyph() {
-    const pool = '01ABCDEF';
+  function columnSpeed(i) {
+    const u = (i * 37 + 13) % 89;
+    let s = 0.06 + (u / 88) * 1.35;
+    if (u >= 84) s *= 0.7;
+    return s;
+  }
+
+  function idleCol(i) {
+    return { busy: false, y: 0, speed: columnSpeed(i), chars: '', len: 0, event: null };
+  }
+
+  function nextItem() {
+    if (fresh.length) return fresh.shift();
+    if (!pool.length) return null;
     return pool[(Math.random() * pool.length) | 0];
   }
 
-  function spawnDrop(event) {
-    const col = (Math.random() * cols) | 0;
-    const type = event && event.type;
-    drops.push({
-      x: col * COL_W + 4,
-      y: -20 - Math.random() * 40,
-      speed: 1.2 + Math.random() * 2.4 + (event ? 1.5 : 0),
-      glyph: event ? (TYPE_GLYPH[type] || type.slice(0, 1).toUpperCase() || '*') : ambientGlyph(),
-      color: event ? (TYPE_COLOR[type] || '#94a3b8') : 'rgba(148,163,184,.35)',
-      event: event || null,
-      age: 0,
-    });
+  function enqueue(ev) {
+    if (!ev || !ev.type || String(ev.type).startsWith('firehose.')) return;
+    if (ev.seq != null) {
+      if (seenSeq.has(ev.seq)) return;
+      seenSeq.add(ev.seq);
+    }
+    const chars = hexOf(ev);
+    if (chars.length < 8) return;
+    const item = { chars, event: ev };
+    pool.push(item);
+    if (pool.length > 240) pool.shift();
+    fresh.push(item);
+    feed();
   }
 
-  // Keep a light ambient rain so a quiet network still "feels alive" (ADR-0013).
-  let ambientTimer = 0;
+  function startCol(col, item, y) {
+    col.busy = true;
+    col.chars = item.chars;
+    col.event = item.event;
+    col.len = item.chars.length;
+    col.y = y != null ? y : -col.len;
+  }
 
-  function tick(ts) {
-    if (document.body.classList.contains('force-list') || reduceMotion) {
-      requestAnimationFrame(tick);
-      return;
+  function feed() {
+    for (let i = 0; i < columns.length; i++) {
+      const col = columns[i];
+      if (col.busy) continue;
+      const next = nextItem();
+      if (!next) return;
+      startCol(col, next);
     }
-    ctx.fillStyle = 'rgba(1,4,10,.18)';
+  }
+
+  function tick() {
+    ctx.fillStyle = '#01040a';
     ctx.fillRect(0, 0, W, H);
-    ctx.font = '13px "JetBrains Mono", ui-monospace, monospace';
-    ambientTimer += 16;
-    if (ambientTimer > 90) {
-      ambientTimer = 0;
-      if (drops.length < cols * 1.2) spawnDrop(null);
+    ctx.font = '300 ' + FONT + 'px "JetBrains Mono", ui-monospace, monospace';
+    ctx.textBaseline = 'top';
+    ctx.fillStyle = INK;
+
+    for (let c = 0; c < columns.length; c++) {
+      const col = columns[c];
+      if (!col.busy) continue;
+      col.y += col.speed;
+      const x = c * FONT + 2;
+      const head = col.y;
+      for (let i = 0; i < col.len; i++) {
+        const row = head + i;
+        if (row < -1 || row > rowCount + 1) continue;
+        ctx.fillText(col.chars[i], x, row * FONT);
+      }
+      if (head > rowCount + 1) {
+        col.busy = false;
+        const next = nextItem();
+        if (next) startCol(col, next);
+      }
     }
-    const next = [];
-    for (const d of drops) {
-      d.y += d.speed;
-      d.age += 1;
-      ctx.fillStyle = d.color;
-      ctx.globalAlpha = d.event ? 1 : 0.55;
-      ctx.fillText(d.glyph, d.x, d.y);
-      ctx.globalAlpha = 1;
-      if (d.y < H + 40) next.push(d);
-    }
-    drops = next;
+    feed();
     requestAnimationFrame(tick);
   }
 
   canvas.addEventListener('mousemove', (e) => {
     const rect = canvas.getBoundingClientRect();
-    const mx = e.clientX - rect.left;
-    const my = e.clientY - rect.top;
-    let hit = null;
-    for (let i = drops.length - 1; i >= 0; i--) {
-      const d = drops[i];
-      if (!d.event) continue;
-      if (Math.abs(d.x - mx) < 14 && Math.abs(d.y - my) < 16) { hit = d.event; break; }
-    }
-    if (!hit) { card.style.display = 'none'; return; }
-    showCard(hit, e.clientX, e.clientY);
+    const c = Math.floor((e.clientX - rect.left) / FONT);
+    const col = columns[c];
+    if (!col || !col.busy) { card.style.display = 'none'; return; }
+    const ev = col.event || {};
+    card.innerHTML =
+      '<div class="t">' + (ev.type || 'hash') + '</div>' +
+      col.chars.slice(0, 16) + '…' + col.chars.slice(-8);
+    card.style.display = 'block';
+    let left = e.clientX + 14;
+    let top = e.clientY + 14;
+    if (left + 280 > window.innerWidth) left = e.clientX - 280;
+    card.style.left = Math.max(8, left) + 'px';
+    card.style.top = Math.max(8, top) + 'px';
   });
   canvas.addEventListener('mouseleave', () => { card.style.display = 'none'; });
 
-  function showCard(ev, cx, cy) {
-    const data = ev.data || {};
-    card.innerHTML =
-      `<div class="t">${escapeHtml(ev.type)}</div>` +
-      `<div class="k">seq ${ev.seq || '—'} · node ${escapeHtml(String(ev.node || '—'))} · ${ev.ts ? new Date(ev.ts).toISOString() : ''}</div>` +
-      `<pre>${escapeHtml(JSON.stringify(data, null, 2))}</pre>`;
-    card.style.display = 'block';
-    const pad = 16;
-    let left = cx + pad;
-    let top = cy + pad;
-    if (left + 420 > window.innerWidth) left = cx - 420 - pad;
-    if (top + 240 > window.innerHeight) top = cy - 240;
-    card.style.left = Math.max(8, left) + 'px';
-    card.style.top = Math.max(8, top) + 'px';
-  }
+  window.addEventListener('resize', resize);
 
-  function escapeHtml(s) {
-    return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-  }
-
-  function pushEvent(ev) {
-    if (!ev || !ev.type || ev.type.startsWith('firehose.')) return;
-    recent.push(ev);
-    if (recent.length > MAX_RECENT) recent.shift();
-    listEl.classList.remove('empty');
-    const row = document.createElement('div');
-    row.className = 'row';
-    row.innerHTML =
-      `<span class="et">${escapeHtml(ev.type)}</span>` +
-      `<span class="meta">seq=${ev.seq || '—'} node=${escapeHtml(String(ev.node || '—'))}</span>`;
-    row.addEventListener('mouseenter', (e) => showCard(ev, e.clientX, e.clientY));
-    row.addEventListener('mouseleave', () => { card.style.display = 'none'; });
-    listEl.insertBefore(row, listEl.firstChild);
-    while (listEl.childElementCount > MAX_RECENT) listEl.removeChild(listEl.lastChild);
-    if (!reduceMotion && !document.body.classList.contains('force-list')) spawnDrop(ev);
-  }
-
-  // ---- SSE ----
-  let es = null;
-  let retryMs = 1000;
-
-  function connect() {
-    setStatus('connecting');
-    if (es) try { es.close(); } catch (_) {}
-    es = new EventSource(STREAM_URL);
-    es.onopen = () => { setStatus('live'); retryMs = 1000; };
-    es.onerror = () => {
-      setStatus('err');
-      es.close();
-      setTimeout(() => { setStatus('reconnect'); connect(); }, retryMs);
-      retryMs = Math.min(15000, retryMs * 1.6);
-    };
-    // Named events use the ledger type as event name; also catch default "message".
-    es.onmessage = (msg) => {
-      try { pushEvent(JSON.parse(msg.data)); } catch (_) {}
-    };
-    // Listen broadly: EventSource only fires onmessage for unnamed events; named ones need addEventListener.
-    // We can't enumerate types ahead of time, so piggy-back via a catch-all by also using a proxy:
-    // the server always sends `event: <type>`. Register a MutationObserver-free approach: override
-    // via listening to known set + periodic refresh is fragile. Instead, use fetch NDJSON as
-    // fallback only if EventSource can't attach wildcards — but browsers don't support wildcard.
-    // Solution: also open NDJSON via fetch streams when needed. For EventSource, re-dispatch:
-    const known = Object.keys(TYPE_GLYPH).concat([
-      'agent.overlay_update', 'agent.p2p_update', 'agent.revoke', 'seeds.endorsed',
-      'contribution.report', 'shared.intent', 'room.state_update', 'message.ack',
-      'firehose.hello',
-    ]);
-    for (const name of known) {
-      es.addEventListener(name, (msg) => {
-        try { pushEvent(JSON.parse(msg.data)); } catch (_) {}
-      });
+  async function seedFromLedger() {
+    const res = await fetch(API_BASE + '/api/ledger?limit=200');
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    const entries = data.entries || [];
+    for (const ev of entries) enqueue(ev);
+    for (let i = 0; i < columns.length; i++) {
+      if (columns[i].busy) columns[i].y = (Math.random() * (rowCount + columns[i].len)) - columns[i].len;
     }
-    // Catch-all for unknown types: the payload always includes "type", and SSE unnamed
-    // fallback isn't used by our server. Use a second NDJSON subscription only for discovery
-    // of new types would double traffic — instead, patch EventSource via fetch stream below
-    // if we detect we're missing events. Simpler approach: use fetch ReadableStream for NDJSON
-    // as the primary transport for this page (same data, easier to handle all types).
+    return entries.length;
   }
 
-  // Prefer NDJSON fetch stream so every event type is handled without a type registry.
-  // Fall back to EventSource if fetch streaming isn't available.
+  let retryMs = 1000;
   let abortCtrl = null;
   async function connectNdjson() {
-    setStatus('connecting');
     if (abortCtrl) abortCtrl.abort();
     abortCtrl = new AbortController();
     try {
@@ -347,7 +248,7 @@
         headers: { Accept: 'application/x-ndjson' },
       });
       if (!res.ok || !res.body) throw new Error('HTTP ' + res.status);
-      setStatus('live');
+      setStatus('Live', true);
       retryMs = 1000;
       const reader = res.body.getReader();
       const dec = new TextDecoder();
@@ -363,28 +264,17 @@
           if (!line) continue;
           try {
             const ev = JSON.parse(line);
-            if (ev.type === 'firehose.hello') continue;
-            if (ev.type === 'firehose.ping') continue;
-            pushEvent(ev);
+            enqueue(ev);
           } catch (_) {}
         }
       }
-      setStatus('reconnect');
     } catch (e) {
       if (e.name === 'AbortError') return;
-      setStatus('err');
+      if (!fresh.length && !pool.length && !columns.some((c) => c.busy)) setStatus('Disconnected');
     }
-    setTimeout(() => { setStatus('reconnect'); connectNdjson(); }, retryMs);
+    setTimeout(connectNdjson, retryMs);
     retryMs = Math.min(15000, retryMs * 1.6);
   }
-
-  document.getElementById('toggle-mode').addEventListener('click', () => {
-    document.body.classList.toggle('force-list');
-    applyLang();
-    if (!document.body.classList.contains('force-list')) {
-      resize();
-    }
-  });
 
   Moye.mountNav();
   document.getElementById('nav-toggle').onclick = () => {
@@ -392,11 +282,17 @@
     n.classList.toggle('open');
     document.getElementById('nav-toggle').setAttribute('aria-expanded', String(n.classList.contains('open')));
   };
-  applyLang();
-  if (reduceMotion) document.body.classList.add('force-list');
+
   resize();
   requestAnimationFrame(tick);
-  connectNdjson();
+  (async function boot() {
+    setStatus('Connecting…');
+    try {
+      const n = await seedFromLedger();
+      if (n) setStatus('Live', true);
+    } catch (_) {}
+    connectNdjson();
+  })();
 })();
 </script>
 </body>

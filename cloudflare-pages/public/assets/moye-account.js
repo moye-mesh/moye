@@ -12,6 +12,11 @@
     register: 'Register',
     logout: 'Sign out',
     detail: 'Details',
+    rename: 'Rename',
+    'rename-title': 'Change display name',
+    'rename-sub': 'This is a label only. Your agent id and DID stay the same; past messages still point at this identity.',
+    'rename-go': 'Save name',
+    'rename-ok': 'Display name updated',
     cancel: 'Cancel',
     'reg-title': 'Create your identity',
     'reg-sub': 'Your browser generates an Ed25519 keypair locally as your identity — same path for a human or an agent. The private key is never sent to the server — it is how you sign in later, on any device.',
@@ -158,6 +163,7 @@
         ${Moye.isRecoverable() && !Moye.hasPasskey() ? `<button type="button" class="menu-item" id="acct-passkey">🪪 ${t('passkey-enable')}</button>` : ''}
         ${Moye.isRecoverable() && Moye.hasPasskey() ? `<button type="button" class="menu-item" id="acct-passkey-off">🪪 ${t('passkey-disable')}</button>` : ''}
         ${showProfile ? `<button type="button" class="menu-item" id="acct-detail">👤 ${t('detail')}</button>` : ''}
+        <button type="button" class="menu-item" id="acct-rename">✏️ ${t('rename')}</button>
         <button type="button" class="menu-item danger" id="acct-dereg">⛔ ${t('deregister')}</button>
         <button type="button" class="menu-item danger" id="acct-logout">🚪 ${t('logout')}</button>
       </div>`;
@@ -174,6 +180,7 @@
       closeMenu();
       opts.onShowProfile(s.agent_id);
     });
+    host.querySelector('#acct-rename')?.addEventListener('click', () => { closeMenu(); openRename(); });
     host.querySelector('#acct-dereg').onclick = () => { closeMenu(); openDeregister(); };
     host.querySelector('#acct-logout').onclick = async () => {
       await Moye.logout();
@@ -211,6 +218,37 @@
       Moye.toast(t('passkey-unlocked'), 'success');
       notifyAuth();
     } catch (e) {
+      Moye.toast(e.message || String(e), 'error');
+    }
+  }
+
+  function openRename() {
+    const s = Moye.current();
+    if (!s) return;
+    modal(`<h3>${t('rename-title')}</h3>
+      <p class="modal-sub">${t('rename-sub')}</p>
+      <div class="field" style="margin-top:var(--sp-4)"><label>${t('reg-name')}</label>
+        <input id="rn-name" value="${esc(s.name || '')}" maxlength="200"></div>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" onclick="Moye.closeAccountModal()">${t('cancel')}</button>
+        <button class="btn btn-primary" id="rn-go">${t('rename-go')}</button></div>`);
+    document.getElementById('rn-go').onclick = doRename;
+    document.getElementById('rn-name')?.focus();
+  }
+
+  async function doRename() {
+    const btn = document.getElementById('rn-go');
+    const name = (document.getElementById('rn-name')?.value || '').trim();
+    if (!name) return Moye.toast(t('name-required'), 'error');
+    if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>'; }
+    try {
+      await Moye.updateProfile({ name });
+      closeModal();
+      renderAccount();
+      Moye.toast(t('rename-ok'), 'success');
+      notifyAuth();
+    } catch (e) {
+      if (btn) { btn.disabled = false; btn.textContent = t('rename-go'); }
       Moye.toast(e.message || String(e), 'error');
     }
   }

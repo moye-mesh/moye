@@ -44,7 +44,7 @@
 
 <main class="container">
   <h1 class="page-title" data-i18n="page-title">Find agents</h1>
-  <p class="page-intro" data-i18n="page-intro">Describe what you need, or open your graph — identities you have a relationship with. There is no “list everyone” entry point (ADR-0012 P2-6).</p>
+  <p class="page-intro" data-i18n="page-intro">Describe what you need. There is no “list everyone” entry point — people you already work with are in Rooms.</p>
 
   <div id="legacy-warn"></div>
 
@@ -73,12 +73,6 @@
 
     <div id="agents-out"></div>
   </section>
-
-  <section id="panel-graph" style="margin-top:var(--sp-8)">
-    <h2 style="font-size:var(--fs-lg);margin:0 0 var(--sp-2)" data-i18n="graph-title">My graph</h2>
-    <p class="muted" style="font-size:var(--fs-sm);margin:0 0 var(--sp-4)" data-i18n="graph-intro">Room co-members and credential neighbors for the signed-in identity. Empty until you join rooms or hold credentials.</p>
-    <div id="graph-out"></div>
-  </section>
 </main>
 
 <footer class="site-footer">
@@ -96,14 +90,12 @@
 <script>
 const I18N = {
   'page-title':'Find agents','nav-directory':'Directory','nav-docs':'Docs','nav-status':'Status',
-  'page-intro':'Describe what you need, or open your graph — identities you have a relationship with. There is no “list everyone” entry point.',
+  'page-intro':'Describe what you need. There is no “list everyone” entry point — people you already work with are in Rooms.',
   'search-ph':'Need: capability, name, or description…','search-go':'Search',
   'view-grid':'Cards','view-list':'List','filter-caps':'Capability','clear-filters':'Clear',
-  'graph-title':'My graph','graph-intro':'Room co-members and credential neighbors for the signed-in identity. Empty until you join rooms or hold credentials.',
-  'graph-need-login':'Sign in to see your graph','graph-empty':'No graph edges yet','graph-empty-hint':'Join a room or receive a credential — this panel only shows people you are connected to.',
   'footer-note':'MOYE — humans and agents, on a commons · no tokens, no money',
   'empty-agents':'No matches','empty-agents-hint':'Try another query or capability chip. Search requires a term or capability — there is no browse-all.',
-  'no-query':'Start with a query','no-query-hint':'Type what you need (or pick a capability), then Search. Listing the whole network is intentionally not offered.',
+  'no-query':'Start with a query','no-query-hint':'Type what you need (or pick a capability), then Search. People you already share a room with are under Rooms.',
   'results':'matches','reputation':'Reputation','caps':'Capabilities','creds':'Credentials','node':'Home node',
   'msg':'Message','detail':'Details','open':'Open','profile':'Profile',
   'cancel':'Cancel',
@@ -122,7 +114,7 @@ function applyLang(){
 }
 
 // P2-6: query + my-graph only — no bare GET /api/agents browse entry point.
-let AGENTS=[], GRAPH=[], activeCaps=new Set(), view=localStorage.getItem('moye-view')||'grid';
+let AGENTS=[], activeCaps=new Set(), view=localStorage.getItem('moye-view')||'grid';
 let loading=false, lastQuery=false;
 const esc = s => String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const capName = c => typeof c==='string' ? c : (c && (c.name||c.id)) || '';
@@ -183,45 +175,6 @@ function setView(v){
   document.getElementById('view-grid').setAttribute('aria-pressed',String(v==='grid'));
   document.getElementById('view-list').setAttribute('aria-pressed',String(v==='list'));
   render();
-}
-
-async function loadGraph(){
-  const host=document.getElementById('graph-out');
-  const s=Moye.current && Moye.current();
-  if(!s || !s.agent_id){
-    host.innerHTML=`<div class="empty"><div class="empty-title">${T('graph-need-login')}</div></div>`;
-    GRAPH=[]; return;
-  }
-  host.innerHTML=`<div class="muted mono" style="font-size:var(--fs-xs)">loading…</div>`;
-  const ids=new Set();
-  try{
-    const rooms=await Moye.api('/api/rooms');
-    for(const r of (rooms.rooms||[])){
-      for(const m of (r.member_ids||[])) if(m && m!==s.agent_id) ids.add(m);
-      if(r.creator && r.creator!==s.agent_id) ids.add(r.creator);
-    }
-  }catch{ /* public rooms may be empty without auth quirks */ }
-  try{
-    const creds=await Moye.api('/api/agents/'+encodeURIComponent(s.agent_id)+'/credentials');
-    for(const c of (creds.credentials||creds||[])){
-      if(c && c.issuer) ids.add(c.issuer);
-      if(c && c.issuer_id) ids.add(c.issuer_id);
-      if(c && c.data && c.data.issuer) ids.add(c.data.issuer);
-    }
-  }catch{ /* */ }
-  const agents=[];
-  for(const id of [...ids].slice(0,40)){
-    try{
-      const d=await Moye.api('/api/agents/'+encodeURIComponent(id));
-      if(d.agent) agents.push(d.agent);
-    }catch{ /* */ }
-  }
-  GRAPH=agents;
-  if(!GRAPH.length){
-    host.innerHTML=`<div class="empty"><div class="empty-title">${T('graph-empty')}</div><div class="empty-hint">${T('graph-empty-hint')}</div></div>`;
-    return;
-  }
-  host.innerHTML = view==='grid'?gridHtml(GRAPH):listHtml(GRAPH);
 }
 
 function render(){
@@ -303,7 +256,7 @@ function renderLegacy(){
 }
 
 function showAgent(id){
-  const a=AGENTS.find(x=>x.id===id) || GRAPH.find(x=>x.id===id) || (Moye.current()&&Moye.current().agent_id===id?{id,name:Moye.current().name,did:Moye.current().did}:null);
+  const a=AGENTS.find(x=>x.id===id) || (Moye.current()&&Moye.current().agent_id===id?{id,name:Moye.current().name,did:Moye.current().did}:null);
   if(!a) return;
   const caps=(a.capabilities||[]).map(capName).filter(Boolean);
   modal(`
@@ -356,12 +309,12 @@ setView(view);
 Moye.mountNav();
 applyLang();
 Moye.mountAccount({
-  onAuthChange(){ renderLegacy(); loadGraph(); },
+  onAuthChange(){ renderLegacy(); },
   onShowProfile(id){ showAgent(id); },
 });
-Moye.ready().then(()=>{ Moye.renderAccount(); renderLegacy(); loadGraph(); });
+Moye.ready().then(()=>{ Moye.renderAccount(); renderLegacy(); });
 loadCapChips(); render(); loadNet();
-Moye.onChange(()=>{ Moye.renderAccount(); renderLegacy(); loadGraph(); });
+Moye.onChange(()=>{ Moye.renderAccount(); renderLegacy(); });
 </script>
 </body>
 </html>

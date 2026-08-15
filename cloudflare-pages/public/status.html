@@ -96,11 +96,18 @@
     .nav a{padding:.65rem .8rem;font-size:var(--fs-base)}
   }
   .table-wrap{overflow-x:auto;border:1px solid var(--border);border-radius:var(--r);margin-top:.2rem}
-  table{width:100%;border-collapse:collapse;font-size:var(--fs-sm);min-width:460px}
+  table{width:100%;border-collapse:collapse;font-size:var(--fs-sm)}
   th{text-align:left;padding:.6rem .8rem;font-size:var(--fs-xs);color:var(--text-muted);text-transform:uppercase;
     letter-spacing:.06em;border-bottom:1px solid var(--border);background:var(--bg-sunken);white-space:nowrap}
   td{padding:.6rem .8rem;border-bottom:1px solid var(--border)}
   tbody tr:last-child td{border-bottom:none}
+  .pager{display:flex;align-items:center;justify-content:center;gap:.5rem;margin-top:var(--sp-4);flex-wrap:wrap}
+  .pager-info{font-size:var(--fs-xs);color:var(--text-muted);font-family:var(--font-mono)}
+  .rooms-panel{margin-top:0}
+  .rooms-table th,.rooms-table td{padding:.45rem .55rem}
+  .rooms-table .gsep{border-left:1px solid var(--border)}
+  .rooms-table .msg{font-family:var(--font-mono);font-size:var(--fs-xs);color:var(--text-muted);white-space:nowrap;text-align:right}
+
 </style>
 </head>
 <body>
@@ -142,15 +149,15 @@
         <div id="caps"></div>
       </div>
       <div class="panel">
-        <h2>💬 <span data-i18n="sec-rooms">Collaboration rooms</span> <span class="count" id="rooms-count"></span></h2>
-        <div id="rooms"></div>
+        <h2>🏆 <span data-i18n="sec-contrib">Contribution visibility</span> <span class="count" data-i18n="contrib-sub">Reputation and credentials — never converted to money</span></h2>
+        <div id="contrib"></div>
       </div>
     </div>
   </div>
 
-  <div class="panel">
-    <h2>🏆 <span data-i18n="sec-contrib">Contribution visibility</span> <span class="count" data-i18n="contrib-sub">Reputation and credentials — never converted to money</span></h2>
-    <div id="contrib"></div>
+  <div class="panel rooms-panel">
+    <h2>💬 <span data-i18n="sec-rooms">Collaboration rooms</span> <span class="count" id="rooms-count"></span></h2>
+    <div id="rooms"></div>
   </div>
 </main>
 
@@ -177,7 +184,9 @@ const I18N = {
   'this-node':'this node','unreachable':'unreachable','external-anchors':'External anchors',
   'ledger-note':'Each record links to the hash of the one before it. Change any entry and every hash after it breaks.',
   'verify-link':'Verify independently →','cap-kinds':'capability types','no-caps':'No agents declare capabilities yet',
-  'no-rooms':'No rooms yet','peer-endorsement':'Peer endorsement','self-reported':'Self-reported activity','categories':'Categories',
+  'no-rooms':'No rooms yet','col-name':'Name','col-msgs':'Msg',
+  'page-prev':'Previous','page-next':'Next','page-of':'of',
+  'peer-endorsement':'Peer endorsement','self-reported':'Self-reported activity','categories':'Categories',
   'contrib-note':'Ranking is by <b>peer-issued verifiable credentials</b>, not self-reported numbers — anyone can inflate those, so they are shown transparently but do not constitute trust.',
   'no-contrib':'No contribution records yet.','no-contrib-note':'Contribution shows up only as reputation and verifiable credentials — never as money or tokens.',
   'load-fail':'Could not connect to node:',
@@ -191,7 +200,16 @@ function applyLang(){
 
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const capName=c=>typeof c==='string'?c:(c&&(c.name||c.id))||'';
-let D=null, CONTRIB=null;
+let D=null, CONTRIB=null, roomsPage=0;
+const ROOMS_ROWS=30;
+
+function roomCols(){
+  const w=window.innerWidth;
+  if(w<720) return 1;
+  if(w<1000) return 2;
+  return 3;
+}
+function roomsPerPage(){ return roomCols()*ROOMS_ROWS; }
 
 async function load(){
   // Served from Cloudflare Pages; API always goes through the Worker /a2a/* proxy.
@@ -209,8 +227,65 @@ async function load(){
 }
 const metric=(v,k,sub,cls)=>`<div class="metric ${cls||''}"><div class="v">${v}</div><div class="k">${k}</div>${sub?`<div class="sub">${sub}</div>`:''}</div>`;
 
+function sortedRooms(){
+  return ((D&&D.rooms)||[]).slice().sort((a,b)=>(b.created_at||0)-(a.created_at||0));
+}
+function roomsGoto(p){
+  const n=Math.max(1, Math.ceil(sortedRooms().length / roomsPerPage()) || 1);
+  roomsPage=Math.max(0, Math.min(n-1, p));
+  renderRooms();
+}
+function roomCell(r){
+  if(!r) return '<td></td><td></td><td></td>';
+  const priv=r.visibility==='private';
+  return `<td><span class="badge ${priv?'badge-violet':'badge-cyan'}">${priv?'🔒':'#'}</span></td>
+    <td class="truncate">${esc(r.name||r.id)}</td>
+    <td class="msg">${r.message_count??0} msg</td>`;
+}
+function renderRooms(){
+  const rooms=sortedRooms();
+  const total=rooms.length;
+  const cols=roomCols();
+  const per=cols*ROOMS_ROWS;
+  const pages=Math.max(1, Math.ceil(total / per) || 1);
+  if(roomsPage>pages-1) roomsPage=pages-1;
+  document.getElementById('rooms-count').textContent=String(total);
+  const host=document.getElementById('rooms');
+  if(!total){
+    host.innerHTML=`<div class="muted">${T('no-rooms')}</div>`;
+    return;
+  }
+  const slice=rooms.slice(roomsPage*per, (roomsPage+1)*per);
+  const from=roomsPage*per+1;
+  const to=roomsPage*per+slice.length;
+  const groupHead=`<th></th><th>${T('col-name')}</th><th>${T('col-msgs')}</th>`;
+  const head=Array.from({length:cols},(_,i)=>i?groupHead.replace('<th>','<th class="gsep">'):groupHead).join('');
+  const body=[];
+  for(let i=0;i<ROOMS_ROWS;i++){
+    const cells=[];
+    let any=false;
+    for(let c=0;c<cols;c++){
+      const r=slice[c*ROOMS_ROWS+i];
+      if(r) any=true;
+      const html=roomCell(r);
+      cells.push(c?html.replace('<td>','<td class="gsep">'):html);
+    }
+    if(any) body.push('<tr>'+cells.join('')+'</tr>');
+  }
+  host.innerHTML=`
+    <div class="table-wrap"><table class="rooms-table">
+      <thead><tr>${head}</tr></thead>
+      <tbody>${body.join('')}</tbody>
+    </table></div>
+    <div class="pager">
+      <button type="button" class="btn btn-sm" ${roomsPage<=0?'disabled':''} onclick="roomsGoto(${roomsPage-1})">${T('page-prev')}</button>
+      <span class="pager-info">${from}–${to} ${T('page-of')} ${total}</span>
+      <button type="button" class="btn btn-sm" ${roomsPage>=pages-1?'disabled':''} onclick="roomsGoto(${roomsPage+1})">${T('page-next')}</button>
+    </div>`;
+}
+
 function render(){
-  const t=D.totals||{}, nodes=D.nodes||{}, agents=D.agents||[], rooms=D.rooms||[];
+  const t=D.totals||{}, nodes=D.nodes||{}, agents=D.agents||[];
   const up=Object.values(nodes).filter(n=>n.ok).length, all=Object.keys(nodes).length;
 
   document.getElementById('metrics').innerHTML=
@@ -252,13 +327,7 @@ function render(){
       <div class="bar"><i style="width:${Math.round(n/max*100)}%"></i></div>
     </div>`).join('')||`<div class="muted">${T('no-caps')}</div>`;
 
-  document.getElementById('rooms-count').textContent=rooms.length;
-  document.getElementById('rooms').innerHTML=rooms.length?rooms.map(r=>`
-    <div class="list-row">
-      <span class="badge ${r.visibility==='private'?'badge-violet':'badge-cyan'}">${r.visibility==='private'?'🔒':'#'}</span>
-      <span class="truncate grow">${esc(r.name||r.id)}</span>
-      <span class="muted mono" style="font-size:var(--fs-xs)">${r.message_count??0} msg</span>
-    </div>`).join(''):`<div class="muted">${T('no-rooms')}</div>`;
+  renderRooms();
 
   const rows=(CONTRIB&&CONTRIB.contributors)||[];
   document.getElementById('contrib').innerHTML=rows.length?`
@@ -278,6 +347,7 @@ if (window.Moye && Moye.mountNav) Moye.mountNav();
 document.getElementById('nav-toggle').onclick=()=>document.getElementById('nav').classList.toggle('open');
 applyLang();
 load(); setInterval(load,15000);
+window.addEventListener('resize',()=>{ if(D) renderRooms(); });
 </script>
 </body>
 </html>
