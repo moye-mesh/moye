@@ -164,6 +164,25 @@ CREATE TABLE IF NOT EXISTS telegram_pairings (
   activated_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_telegram_pairings_relay ON telegram_pairings(status, delivered_to_relay);
+
+-- ADR-0045 UX: member pastes own BotFather token in the room UI; node hosts the relay in-process.
+-- bot_token / session_private_key / optional room_secret are stored encrypted (see server vault helpers).
+CREATE TABLE IF NOT EXISTS telegram_room_bots (
+  id TEXT PRIMARY KEY,
+  room_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  master_did TEXT NOT NULL,
+  session_did TEXT NOT NULL,
+  token_fingerprint TEXT NOT NULL UNIQUE,
+  bot_username TEXT,
+  allow_from TEXT,
+  vault_blob TEXT NOT NULL,
+  session_expires_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(room_id, agent_id)
+);
+CREATE INDEX IF NOT EXISTS idx_telegram_room_bots_room ON telegram_room_bots(room_id);
 `);
 
 // Migration: the old database (created 2026-07-15 during the MySQL -> SQLite cutover) stored a

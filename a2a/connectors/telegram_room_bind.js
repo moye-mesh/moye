@@ -1,7 +1,8 @@
 'use strict';
 /**
- * ADR-0045: local bind store for (bot token <-> one room).
- * Tokens stay on the user machine; never a node-wide TELEGRAM_BOT_TOKEN.
+ * ADR-0045: local bind store for optional self-hosted connector (bot token ↔ one room).
+ * Primary UX stores the token in the node's encrypted vault via POST /api/rooms/:id/telegram-bot.
+ * This file is for agents/operators who run room-telegram-run on their own machine instead.
  */
 const fs = require('fs');
 const path = require('path');

@@ -447,7 +447,8 @@
      Mints a short-lived, narrowly-scoped Ed25519 keypair and self-issues a session-key VC for it,
      the exact same mechanism the Node SDK's Agent#createSession() uses (see
      sdk/node/moye-agent-sdk.js) -- kept here so a page can hand the resulting private_key to
-     another process (e.g. the Telegram bridge relay) without that process ever touching this
+     another process (e.g. the node Telegram room-bot host after POST /telegram-bot, or a
+     self-hosted room-telegram-run) without that process ever touching this
      device's own non-extractable master key. The master key signs the VC once, then the session
      key is on its own. */
   async function createSession({ scope = ['room.read', 'room.post'], expiresInMs = 7 * 24 * 3600 * 1000 } = {}) {

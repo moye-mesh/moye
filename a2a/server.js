@@ -298,6 +298,17 @@ const stmt = {
   activateTelegramPairing: db.prepare(`UPDATE telegram_pairings SET status='active', agent_id=?, master_did=?, session_did=?, session_private_key=?, session_expires_at=?, activated_at=? WHERE pairing_code=?`),
   pendingRelayPairings: db.prepare("SELECT * FROM telegram_pairings WHERE status='active' AND delivered_to_relay=0"),
   markTelegramPairingDelivered: db.prepare('UPDATE telegram_pairings SET delivered_to_relay=1 WHERE pairing_code=?'),
+  upsertTelegramRoomBot: db.prepare(`INSERT INTO telegram_room_bots
+    (id, room_id, agent_id, master_did, session_did, token_fingerprint, bot_username, allow_from, vault_blob, session_expires_at, created_at, updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+    ON CONFLICT(room_id, agent_id) DO UPDATE SET
+      master_did=excluded.master_did, session_did=excluded.session_did, token_fingerprint=excluded.token_fingerprint,
+      bot_username=excluded.bot_username, allow_from=excluded.allow_from, vault_blob=excluded.vault_blob,
+      session_expires_at=excluded.session_expires_at, updated_at=excluded.updated_at`),
+  telegramRoomBotByRoomAgent: db.prepare('SELECT * FROM telegram_room_bots WHERE room_id=? AND agent_id=?'),
+  telegramRoomBotByFingerprint: db.prepare('SELECT * FROM telegram_room_bots WHERE token_fingerprint=?'),
+  deleteTelegramRoomBot: db.prepare('DELETE FROM telegram_room_bots WHERE room_id=? AND agent_id=?'),
+  allTelegramRoomBots: db.prepare('SELECT * FROM telegram_room_bots'),
 };
 
 // ---- SSRF guard for agent-supplied webhook URLs ----
@@ -3146,14 +3157,177 @@ app.post('/api/bridge/send', async (req, res) => {
   ok(res, { message_id: id, status: 'pending', encrypted: isEnc });
 });
 
-// ================= Telegram bridge (ADR-0044 DEPRECATED → ADR-0045) =================
-// Shared node bot + invite/pairing is superseded. Members bind their own BotFather bot locally
-// (CLI room-telegram-bind / connectors/telegram_room_bridge.js). These endpoints return 410.
-const TELEGRAM_GONE = 'Telegram shared-bot API removed (ADR-0045). Bind your own BotFather token to one room with: node a2a/mcp/cli.js room-telegram-bind --room <id> --token <token> && room-telegram-run --room <id>. See docs/adr/0045-telegram-own-bot-per-room.md';
+// ================= Telegram room bots (ADR-0045 UX) =================
+// Member pastes their own BotFather token in the room UI. Browser mints a session key; node stores
+// an encrypted vault blob and runs getUpdates in-process (see lib/telegram_room_host.js).
+// 1 bot token ↔ 1 room (token_fingerprint UNIQUE). No DID registration via Telegram.
+const telegramRoomHost = require('./lib/telegram_room_host');
+const TELEGRAM_GONE = 'Legacy shared-bot Telegram API removed (ADR-0045). Use POST /api/rooms/:id/telegram-bot from the room page (paste your BotFather token).';
 app.post('/api/telegram/invite', async (_req, res) => fail(res, 410, TELEGRAM_GONE));
 app.post('/api/telegram/relay/start', async (_req, res) => fail(res, 410, TELEGRAM_GONE));
 app.post('/api/telegram/pair', async (_req, res) => fail(res, 410, TELEGRAM_GONE));
 app.get('/api/telegram/relay/poll', async (_req, res) => fail(res, 410, TELEGRAM_GONE));
+
+function telegramVaultKey() {
+  const raw = process.env.TELEGRAM_TOKEN_VAULT_KEY || process.env.FED_SECRET || process.env.NODE_ID || 'moye-dev-telegram-vault';
+  return crypto.createHash('sha256').update(String(raw)).digest();
+}
+function telegramVaultSeal(obj) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', telegramVaultKey(), iv);
+  const pt = Buffer.from(JSON.stringify(obj), 'utf8');
+  const enc = Buffer.concat([cipher.update(pt), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return Buffer.concat([iv, tag, enc]).toString('base64');
+}
+function telegramVaultOpen(blob) {
+  const buf = Buffer.from(String(blob), 'base64');
+  const iv = buf.subarray(0, 12);
+  const tag = buf.subarray(12, 28);
+  const enc = buf.subarray(28);
+  const decipher = crypto.createDecipheriv('aes-256-gcm', telegramVaultKey(), iv);
+  decipher.setAuthTag(tag);
+  const pt = Buffer.concat([decipher.update(enc), decipher.final()]).toString('utf8');
+  return JSON.parse(pt);
+}
+function telegramTokenFingerprint(token) {
+  return crypto.createHash('sha256').update(String(token).trim()).digest('hex').slice(0, 16);
+}
+
+app.get('/api/rooms/:id/telegram-bot', async (req, res) => {
+  const me = await authAgent(req);
+  if (!me) return fail(res, 401, 'auth required');
+  const room = store.getRoom(req.params.id);
+  if (!room) return fail(res, 404, 'room not found');
+  if (!isRoomMember(room, me.id)) return fail(res, 403, 'not a member');
+  const row = stmt.telegramRoomBotByRoomAgent.get(req.params.id, me.id);
+  if (!row) return ok(res, { connected: false, room_id: req.params.id });
+  ok(res, {
+    connected: true,
+    room_id: row.room_id,
+    bot_username: row.bot_username,
+    session_expires_at: row.session_expires_at,
+    updated_at: row.updated_at,
+    host: telegramHostInfo ? telegramHostInfo() : null,
+  });
+});
+
+app.post('/api/rooms/:id/telegram-bot', async (req, res) => {
+  const me = await authAgent(req);
+  if (!me) return fail(res, 401, 'auth required');
+  const room_id = req.params.id;
+  const room = store.getRoom(room_id);
+  if (!room) return fail(res, 404, 'room not found');
+  if (!isRoomMember(room, me.id)) return fail(res, 403, 'not a member of this room');
+
+  const {
+    bot_token, master_did, session_did, session_private_key,
+    allow_from, bot_username, room_secret,
+  } = req.body || {};
+  if (!bot_token || !String(bot_token).includes(':')) return fail(res, 400, 'bot_token required (BotFather token)');
+  if (!master_did || !session_did || !session_private_key) {
+    return fail(res, 400, 'master_did, session_did, session_private_key required (browser createSession)');
+  }
+  const agent = store.getAgent(me.id);
+  if (!agent || agent.did !== master_did) return fail(res, 403, 'master_did must match the authenticated agent');
+
+  const grant = findLiveSessionKey(master_did, session_did);
+  if (!grant) return fail(res, 403, 'no live session-key VC for that session_did — call createSession first');
+  if (!sessionScopeAllows(grant.claim.scope, 'room.read') || !sessionScopeAllows(grant.claim.scope, 'room.post')) {
+    return fail(res, 403, 'session must include room.read and room.post');
+  }
+  let derivedPub;
+  try { derivedPub = crypto.createPublicKey(session_private_key).export({ type: 'spki', format: 'pem' }); }
+  catch { return fail(res, 400, 'session_private_key is not a valid Ed25519 PKCS#8 PEM'); }
+  if (derivedPub !== grant.claim.pubkey) return fail(res, 403, 'session_private_key does not match session-key VC');
+
+  if (room.visibility === 'private' && !room_secret) {
+    return fail(res, 400, 'private room requires room_secret on this device (Unlock the room, then connect)');
+  }
+
+  const fp = telegramTokenFingerprint(bot_token);
+  const clash = stmt.telegramRoomBotByFingerprint.get(fp);
+  if (clash && (clash.room_id !== room_id || clash.agent_id !== me.id)) {
+    return fail(res, 409, `this bot token is already bound to room ${clash.room_id} (1 bot ↔ 1 room)`);
+  }
+
+  let username = bot_username || null;
+  try {
+    const meBot = await fetch(`https://api.telegram.org/bot${String(bot_token).trim()}/getMe`).then((r) => r.json());
+    if (meBot.ok && meBot.result && meBot.result.username) username = meBot.result.username;
+    else if (!meBot.ok) return fail(res, 400, `Telegram rejected token: ${meBot.description || 'getMe failed'}`);
+  } catch (e) {
+    return fail(res, 400, `could not reach Telegram getMe: ${e.message}`);
+  }
+
+  const allow = Array.isArray(allow_from) ? allow_from.map(String) : String(allow_from || '').split(',').map((s) => s.trim()).filter(Boolean);
+  const expires = grant.claim.expires || (Date.now() + 7 * 24 * 3600 * 1000);
+  const vault_blob = telegramVaultSeal({
+    bot_token: String(bot_token).trim(),
+    session_private_key,
+    room_secret: room_secret || null,
+  });
+  const now = Date.now();
+  const id = `tgb_${crypto.randomBytes(8).toString('hex')}`;
+  try {
+    stmt.upsertTelegramRoomBot.run(
+      id, room_id, me.id, master_did, session_did, fp, username,
+      JSON.stringify(allow), vault_blob, expires, now, now,
+    );
+  } catch (e) {
+    if (String(e.message || e).includes('UNIQUE')) {
+      return fail(res, 409, 'bot token or room bind conflict (1 bot ↔ 1 room; one bind per member per room)');
+    }
+    throw e;
+  }
+  ledger.append('telegram.room_bot', { agent: me.id, room_id, bot_username: username, ts: now }).catch(() => {});
+  kickTelegramHost();
+  ok(res, {
+    connected: true,
+    room_id,
+    bot_username: username,
+    bot_link: username ? `https://t.me/${username}` : null,
+    session_expires_at: expires,
+    note: 'Relay runs on this MOYE node in the background. Open your bot in Telegram and send a message.',
+  });
+});
+
+app.delete('/api/rooms/:id/telegram-bot', async (req, res) => {
+  const me = await authAgent(req);
+  if (!me) return fail(res, 401, 'auth required');
+  const room = store.getRoom(req.params.id);
+  if (!room) return fail(res, 404, 'room not found');
+  if (!isRoomMember(room, me.id)) return fail(res, 403, 'not a member');
+  stmt.deleteTelegramRoomBot.run(req.params.id, me.id);
+  kickTelegramHost();
+  ok(res, { connected: false, room_id: req.params.id });
+});
+
+let telegramHostInfo = null;
+let telegramHostCtl = null;
+function listDecryptedTelegramBinds() {
+  return stmt.allTelegramRoomBots.all().map((row) => {
+    const secrets = telegramVaultOpen(row.vault_blob);
+    let allow = [];
+    try { allow = JSON.parse(row.allow_from || '[]'); } catch { allow = []; }
+    return {
+      id: row.id,
+      room_id: row.room_id,
+      agent_id: row.agent_id,
+      master_did: row.master_did,
+      session_did: row.session_did,
+      bot_username: row.bot_username,
+      allow_from: allow,
+      session_expires_at: row.session_expires_at,
+      bot_token: secrets.bot_token,
+      session_private_key: secrets.session_private_key,
+      room_secret: secrets.room_secret,
+    };
+  }).filter((b) => b.bot_token && b.session_private_key);
+}
+function kickTelegramHost() {
+  try { if (telegramHostCtl && typeof telegramHostCtl.sync === 'function') telegramHostCtl.sync(); } catch { /* ignore */ }
+}
 
 // Shared intent: intents/declarations anchored to the ledger (visible network-wide)
 app.post('/api/shared-intent', async (req, res) => {
@@ -3952,6 +4126,18 @@ app.get(['/api/network', '/.well-known/moye-net'], async (req, res) => {
 });
 
 server.listen(PORT, async () => {
+  console.log(`[moye-a2a] listening on :${PORT}`);
+  try {
+    // In-process host must hit this node locally — PUBLIC_ENDPOINT goes through CF and can hairpin-fail.
+    telegramHostCtl = telegramRoomHost.startTelegramRoomHost({
+      listBinds: listDecryptedTelegramBinds,
+      baseUrl: process.env.MOYE_LOCAL_BASE_URL || `http://127.0.0.1:${PORT}`,
+    });
+    telegramHostInfo = () => telegramHostCtl.info();
+    console.log('[telegram-host] in-process room-bot relay started (paste token in room UI)');
+  } catch (e) {
+    console.error('[telegram-host] failed to start:', e.message);
+  }
   console.log(`MOYE A2A server on :${PORT} (http+ws) node=${ledger.NODE_ID}`);
   await store.init();        // Subscribe to the IPFS shared-state channel (agent/room/shared)
   await migrateLegacyRoomTasks().catch(e => console.log('[rooms] legacy task migration skipped:', e.message));

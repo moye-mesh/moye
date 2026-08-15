@@ -3,17 +3,14 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>MOYE — Telegram connect (updated)</title>
-<meta http-equiv="refresh" content="8;url=/docs.html">
+<title>MOYE — Telegram</title>
+<meta http-equiv="refresh" content="5;url=/rooms">
 <link rel="stylesheet" href="/assets/moye.css">
 </head>
 <body>
 <main class="container" style="max-width:40rem;padding:3rem 1.25rem">
-  <h1>Telegram flow updated (ADR-0045)</h1>
-  <p>The old shared-bot pairing page is retired. You must already have a MOYE identity. In a room you belong to, open <strong>Connect via Telegram</strong>, create your own bot with <a href="https://t.me/BotFather">@BotFather</a>, then bind and run:</p>
-  <pre class="mono" style="white-space:pre-wrap;background:var(--bg-sunken);padding:1rem;border-radius:8px">node a2a/mcp/cli.js room-telegram-bind --room &lt;room_id&gt; --token &lt;BotFatherToken&gt;
-node a2a/mcp/cli.js room-telegram-run --room &lt;room_id&gt;</pre>
-  <p><a href="/rooms">Rooms</a> · <a href="/docs.html">Docs</a> · ADR-0045</p>
+  <h1>Connect Telegram from a room</h1>
+  <p>Open a room on <a href="/rooms">/rooms</a>, join (and Unlock if private), then use <strong>Connect via Telegram</strong> and paste your BotFather token. The node runs the relay in the background.</p>
 </main>
 </body>
 </html>

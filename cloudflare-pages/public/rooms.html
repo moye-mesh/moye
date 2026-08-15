@@ -199,11 +199,21 @@ const I18N={
   rotate_go:'Rotate now',rotate_ok:'Room key rotated',rotate_failed_wraps:'Rotated, but some sealed invites failed',
   rotate_done_sub:'Save this key. Members you wrapped can use Accept invite; others need this key out of band (or Unlock).',
   tg_btn:'📱 Connect via Telegram',tg_title:'Connect via Telegram',
-  tg_sub:'You already have a MOYE identity. Create your own bot with @BotFather, bind its token to THIS room only (1 bot ↔ 1 room), then run the connector. Chat with your bot in the Telegram app to talk to the room. Telegram never registers a DID.',
-  tg_steps:'1) Open @BotFather → /newbot → copy the token.<br>2) On a machine that holds your MOYE identity, run the commands below.<br>3) Open your bot in Telegram and send a message.',
-  tg_copy_bind:'Copy bind command',tg_copy_run:'Copy run command',
+  tg_sub:'Paste the BotFather token for YOUR bot. This room is locked to that bot (1 bot ↔ 1 room). After you connect, this MOYE node runs the relay in the background — open your bot in Telegram and chat.',
+  tg_token_label:'BotFather token',
+  tg_token_ph:'123456:ABC-DEF…',
+  tg_allow_label:'Your Telegram user id (optional allowlist)',
+  tg_allow_ph:'leave empty to lock to the first person who DMs the bot',
+  tg_connect:'Connect',
+  tg_disconnect:'Disconnect',
+  tg_connecting:'Connecting…',
+  tg_connected:'Connected',
   tg_need_member:'Join this room first (unlock private rooms if needed), then connect Telegram.',
+  tg_need_unlock:'Unlock this private room on this device before connecting Telegram.',
   tg_open_botfather:'Open BotFather',
+  tg_open_bot:'Open my bot',
+  tg_ok:'Telegram bot connected. Relay is running on the node — message your bot in Telegram.',
+  tg_gone:'Disconnected',
   room:'Room',no_desc:'(no description)',share_key:'🔑 Share room key',members:'Members',tasks:'Tasks',
   assign_btn:'＋ Assign a task',no_tasks:'No tasks yet',done:'done',doing:'in progress',submit_result:'Submit result',
   new_room:'New room',name:'Name',desc:'Description',visibility:'Visibility',
@@ -536,24 +546,74 @@ function renderSide(){
     </div>`;
 }
 
-/* ---------- Telegram (ADR-0045: own bot ↔ one room) ---------- */
-function openTelegramConnect(){
+/* ---------- Telegram (ADR-0045: paste token; node runs relay) ---------- */
+async function openTelegramConnect(){
   if(!CUR) return;
   if(!Moye.current()) return Moye.toast(T('need_login'),'error');
   if(!isMember()) return Moye.toast(T('tg_need_member'),'error');
-  const roomId=CUR.id;
-  const bindCmd=`node a2a/mcp/cli.js room-telegram-bind --room ${roomId} --token <PASTE_BOTFATHER_TOKEN>`;
-  const runCmd=`node a2a/mcp/cli.js room-telegram-run --room ${roomId}`;
+  if(CUR.visibility==='private' && !Moye.getRoomSecret(CUR.id)) return Moye.toast(T('tg_need_unlock'),'error');
+  let status={connected:false};
+  try{ status=await Moye.api('/api/rooms/'+encodeURIComponent(CUR.id)+'/telegram-bot',{auth:true}); }catch{}
+  if(status.connected){
+    const link=status.bot_username?`https://t.me/${status.bot_username}`:'';
+    modal(`<h3>${T('tg_title')}</h3>
+      <p class="modal-sub">${T('tg_connected')}${status.bot_username?': @'+esc(status.bot_username):''}</p>
+      <p class="muted" style="font-size:var(--fs-sm)">${T('tg_sub')}</p>
+      <div class="modal-actions" style="flex-wrap:wrap;gap:.4rem">
+        ${link?`<a class="btn btn-primary" href="${esc(link)}" target="_blank" rel="noopener">${T('tg_open_bot')}</a>`:''}
+        <button class="btn btn-ghost" id="tg-dis">${T('tg_disconnect')}</button>
+        <button class="btn" onclick="closeModal()">✕</button>
+      </div>`);
+    document.getElementById('tg-dis').onclick=async()=>{
+      try{
+        await Moye.api('/api/rooms/'+encodeURIComponent(CUR.id)+'/telegram-bot',{method:'DELETE',auth:true});
+        Moye.toast(T('tg_gone'),'ok'); closeModal();
+      }catch(e){ Moye.toast(e.message||String(e),'error'); }
+    };
+    return;
+  }
   modal(`<h3>${T('tg_title')}</h3>
     <p class="modal-sub">${T('tg_sub')}</p>
-    <p class="muted" style="font-size:var(--fs-sm);line-height:1.45;margin:var(--sp-3) 0">${T('tg_steps')}</p>
-    <div class="mono" style="font-size:var(--fs-xs);background:var(--bg-sunken);padding:var(--sp-3);border-radius:var(--r);overflow-wrap:anywhere;margin-bottom:var(--sp-2)">${esc(bindCmd)}</div>
-    <div class="mono" style="font-size:var(--fs-xs);background:var(--bg-sunken);padding:var(--sp-3);border-radius:var(--r);overflow-wrap:anywhere;margin-bottom:var(--sp-3)">${esc(runCmd)}</div>
+    <div class="field" style="margin-top:var(--sp-4)"><label>${T('tg_token_label')}</label>
+      <input id="tg-token" class="mono" placeholder="${T('tg_token_ph')}" autocomplete="off"></div>
+    <div class="field"><label>${T('tg_allow_label')}</label>
+      <input id="tg-allow" placeholder="${T('tg_allow_ph')}"></div>
     <div class="modal-actions" style="flex-wrap:wrap;gap:.4rem">
       <a class="btn btn-ghost" href="https://t.me/BotFather" target="_blank" rel="noopener">${T('tg_open_botfather')}</a>
-      <button class="btn btn-ghost" onclick="Moye.copy(${JSON.stringify(bindCmd)})">${T('tg_copy_bind')}</button>
-      <button class="btn btn-primary" onclick="Moye.copy(${JSON.stringify(runCmd)})">${T('tg_copy_run')}</button>
+      <button class="btn btn-ghost" onclick="closeModal()">${T('cancel')}</button>
+      <button class="btn btn-primary" id="tg-go">${T('tg_connect')}</button>
     </div>`);
+  document.getElementById('tg-go').onclick=()=>doTelegramConnect();
+  document.getElementById('tg-token').focus();
+}
+async function doTelegramConnect(){
+  const token=(document.getElementById('tg-token')||{}).value;
+  const allow=(document.getElementById('tg-allow')||{}).value;
+  if(!token||!String(token).includes(':')) return Moye.toast(T('tg_token_ph'),'error');
+  const btn=document.getElementById('tg-go');
+  if(btn){ btn.disabled=true; btn.innerHTML='<span class="spinner"></span> '+T('tg_connecting'); }
+  try{
+    const session=await Moye.createSession({scope:['room.read','room.post']});
+    const body={
+      bot_token:String(token).trim(),
+      master_did:session.master_did,
+      session_did:session.session_did,
+      session_private_key:session.private_key,
+      allow_from:allow?String(allow).trim():'',
+    };
+    if(CUR.visibility==='private'){
+      const secret=Moye.getRoomSecret(CUR.id);
+      if(!secret) throw new Error(T('tg_need_unlock'));
+      body.room_secret=secret;
+    }
+    const r=await Moye.api('/api/rooms/'+encodeURIComponent(CUR.id)+'/telegram-bot',{method:'POST',auth:true,body});
+    Moye.toast(T('tg_ok'),'ok');
+    closeModal();
+    if(r.bot_link) setTimeout(()=>openTelegramConnect(),200);
+  }catch(e){
+    if(btn){ btn.disabled=false; btn.textContent=T('tg_connect'); }
+    Moye.toast(e.message||String(e),'error');
+  }
 }
 
 /* ---------- modals ---------- */

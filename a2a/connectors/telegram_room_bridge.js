@@ -1,7 +1,9 @@
 'use strict';
 /**
- * ADR-0045: per-member Telegram room bridge.
+ * ADR-0045: optional per-member Telegram room bridge (self-hosted).
  * One BotFather token ↔ one room. Uses an existing MOYE identity (no DID registration).
+ * Prefer the room UI paste-token flow (node hosts getUpdates). Use this when you want the
+ * connector on your own machine:
  *
  *   MOYE_IDENTITY_FILE=... node connectors/telegram_room_bridge.js --room room_xxx
  *   # or: node mcp/cli.js room-telegram-run --room room_xxx
