@@ -69,7 +69,7 @@ const RESERVED_SHARED_PREFIXES = ['revoke:', 'reputation:'];
 // soft-fork *signaling* than its activation mechanism (MOYE has no hashpower-equivalent objective
 // threshold; adoption data here is informational, not a trigger that flips anything on by itself).
 const PROTOCOL_VERSION = '1.6';
-const PROTOCOL_FEATURES = ['capability-schema', 'verifiable-credentials', 'message-signing', 'rich-crdt', 'a2a-jsonrpc-bridge', 'portable-address-attestation', 'capability-input-filter', 'seeds-multisig-governance', 'firehose', 'message-attachments', 'room-awaiting', 'node-did-federation-auth', 'room-fork', 'slip0010', 'identity-delegation', 'session-keys', 'resolve-at', 'agent-timeline', 'gravity-search', 'room-mcp', 'shard-route', 'query-directory', 'room-state-staleness', 'room-mcp-mrtr', 'room-pinning', 'room-consolidate', 'mnemonic-identity', 'domain-verify', 'room-read-cache', 'agent-catchup', 'ask-deadline', 'agent-profile-sig', 'webhook-sig', 'room-mcp-prompts', 'room-mcp-resources'];
+const PROTOCOL_FEATURES = ['capability-schema', 'verifiable-credentials', 'message-signing', 'rich-crdt', 'a2a-jsonrpc-bridge', 'portable-address-attestation', 'capability-input-filter', 'seeds-multisig-governance', 'firehose', 'message-attachments', 'room-awaiting', 'node-did-federation-auth', 'room-fork', 'slip0010', 'identity-delegation', 'session-keys', 'resolve-at', 'agent-timeline', 'gravity-search', 'room-mcp', 'shard-route', 'query-directory', 'room-state-staleness', 'room-mcp-mrtr', 'room-pinning', 'room-consolidate', 'mnemonic-identity', 'domain-verify', 'room-read-cache', 'agent-catchup', 'ask-deadline', 'agent-profile-sig', 'webhook-sig', 'room-mcp-prompts', 'room-mcp-resources', 'display-rename'];
 
 // Broadcast a newly-registered agent to peer nodes immediately (doesn't wait for the 15s reconcile cycle)
 function announceToPeers(agent) {
@@ -523,7 +523,10 @@ app.post('/api/shared-state', async (req, res) => {
 });
 
 // ---- health ----
-const newId = (p) => p + '_' + crypto.randomBytes(6).toString('hex');
+// Default ids: 6 random bytes (12 hex). New rooms use 16 bytes so room volume can grow
+// without colliding as easily as short agent ids; existing room_* ids are never rewritten.
+const newId = (p, bytes = 6) => p + '_' + crypto.randomBytes(bytes).toString('hex');
+const newRoomId = () => newId('room', 16);
 const newToken = () => 'tok_' + crypto.randomBytes(24).toString('hex');
 // Yggdrasil's address range is 200::/7 -- top 7 bits fixed means the first byte is 0x02 or 0x03,
 // which in standard IPv6 compressed notation always renders as a leading hex digit of '2' or '3'.
@@ -1032,6 +1035,51 @@ app.delete('/api/agents/:id/domain-verify', async (req, res) => {
   }).catch(() => {});
   if (PEERS.length) announceToPeers({ id: me.id, ...updated });
   ok(res, { agent_id: me.id, verified_domain: null, verified_display: null });
+});
+
+// Display-name / profile label update (never changes agent_id or DID). Self only.
+// DID agents must send a fresh profile_sig (ADR-0038 M8). Token-only agents may omit it.
+app.post('/api/agents/:id/profile', async (req, res) => {
+  const me = await authAgent(req);
+  if (!me) return fail(res, 401, 'Bearer token or DID sig required');
+  if (me.id !== req.params.id) return fail(res, 403, 'identity mismatch');
+  const agent = store.getAgent(me.id);
+  if (!agent) return fail(res, 404, 'agent not found');
+  const body = req.body || {};
+  const has = (k) => Object.prototype.hasOwnProperty.call(body, k);
+  const name = has('name') ? String(body.name).trim() : (agent.name || '');
+  if (!name || name.length > 200) return fail(res, 400, 'name required (1–200 chars)');
+  const description = has('description') ? String(body.description) : (agent.description || '');
+  if (has('capabilities') && !Array.isArray(body.capabilities)) return fail(res, 400, 'capabilities must be an array');
+  const capabilities = has('capabilities') ? body.capabilities : (agent.capabilities || []);
+  const endpoint = has('endpoint') ? String(body.endpoint) : (agent.endpoint || '');
+  const webhook_url = has('webhook_url') ? body.webhook_url : (agent.webhook_url || null);
+  if (webhook_url) {
+    const v = await webhookUrlSafe(webhook_url);
+    if (!v.ok) return fail(res, 400, 'invalid webhook_url: ' + v.reason);
+  }
+  const fields = { name, description, capabilities, endpoint, webhook_url };
+  let storedProfileSig = agent.profile_sig || null;
+  if (agent.pubkey) {
+    const profile_sig = body.profile_sig;
+    if (!profile_sig) return fail(res, 400, 'profile_sig required for DID agents');
+    if (!agentProfile.verifyProfile(agent.pubkey, fields, profile_sig)) {
+      return fail(res, 400, 'invalid profile_sig');
+    }
+    storedProfileSig = profile_sig;
+  }
+  let verified_display = agent.verified_display || null;
+  if (agent.verified_domain) {
+    verified_display = domainVerify.verifiedDisplayName(name, agent.verified_domain);
+  }
+  const updated = await store.putAgent(me.id, {
+    ...agent, ...fields, profile_sig: storedProfileSig, verified_display,
+  });
+  await ledger.append('agent.profile', {
+    agent: me.id, name, did: agent.did || null, ts: Date.now(),
+  }).catch(() => {});
+  if (PEERS.length) announceToPeers({ id: me.id, ...updated });
+  ok(res, { agent_id: me.id, name: updated.name, verified_display: updated.verified_display || null });
 });
 
 // ---- ADR-0010: portable, independently-verifiable DID->address attestations ----
@@ -2181,7 +2229,7 @@ app.post('/api/rooms', async (req, res) => {
   // generates or sees the raw secret, only whatever one-way value the client chooses to send. See
   // the trust-model comment above the room section.
   if (isPrivate && !membership_proof) return fail(res, 400, 'private rooms require membership_proof (derived client-side from a secret you generate and keep)');
-  const id = newId('room');
+  const id = newRoomId();
   await store.putRoom(id, {
     id, name, description: description || '', creator: me.id, status: 'open',
     home_node: ledger.NODE_ID, created_at: Date.now(),
@@ -2409,6 +2457,25 @@ app.get('/api/rooms/:id', async (req, res) => {
   const { membership_proof_hash, ...safeRoom } = room;
   const tasks = materializeRoomTasks(req.params.id);
   ok(res, { room: safeRoom, tasks });
+});
+
+// Rename room display label only — never rewrites room_id (links / MCP URLs stay valid).
+// Any current member may update the label; disagreement → fork (ADR-0028: no protocol voting).
+app.post('/api/rooms/:id/rename', async (req, res) => {
+  const me = await authAgent(req);
+  if (!me) return fail(res, 401, 'Bearer token or DID sig required');
+  const room = store.getRoom(req.params.id);
+  if (!room) return fail(res, 404, 'room not found');
+  if (!isRoomMember(room, me.id)) return fail(res, 403, 'membership required');
+  const name = req.body && req.body.name != null ? String(req.body.name).trim() : '';
+  if (!name || name.length > 200) return fail(res, 400, 'name required (1–200 chars)');
+  const prev = room.name || '';
+  const updated = { ...room, name };
+  await store.putRoom(room.id, updated);
+  await ledger.append('room.rename', {
+    room: room.id, from: prev, to: name, by: me.id, ts: Date.now(),
+  }).catch(() => {});
+  ok(res, { room_id: room.id, name });
 });
 
 // ---- 9c. Room chat: shared, persistent, federation-safe (RGA CRDT) memory for room members ----
@@ -2867,7 +2934,7 @@ app.post('/api/rooms/:id/fork', async (req, res) => {
   const cp = await findRoomCheckpoint(room.id, checkpoint_id);
   if (!cp) return fail(res, 404, 'checkpoint not found');
   const slice = roomSliceAt(room.id, cp.data.ts);
-  const forkId = newId('room');
+  const forkId = newRoomId();
   const now = Date.now();
   await store.putRoom(forkId, {
     id: forkId,
@@ -4093,6 +4160,8 @@ app.get(['/api/network', '/.well-known/moye-net'], async (req, res) => {
       search: '/api/search  (POST {q, capability, min_reputation, claim_type, limit}; gravity-ranked)',
       verbs: '/api/verbs',
       room_fork: '/api/rooms/:id/fork  (POST {checkpoint_id,name})',
+      room_rename: '/api/rooms/:id/rename  (POST {name} — display label only; room_id unchanged)',
+      agent_profile: '/api/agents/:id/profile  (POST patch: name/description/capabilities/endpoint/webhook_url; DID agents send profile_sig)',
       room_at: '/api/rooms/:id/at?ts=|checkpoint=',
       // ADR-0031: per-room MCP Streamable HTTP (JSON-RPC initialize|tools/list|tools/call).
       // Coexists with stdio MCP at /mcp-dist — scoped to one room_id; no create/join tools.

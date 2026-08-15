@@ -122,6 +122,25 @@ async function main() {
       return out(result);
     }
 
+    case 'rename-room': {
+      const [roomId] = rest;
+      const name = flag('name');
+      if (!roomId || !name) return fail('usage: rename-room <room_id> --name <label>');
+      if (!agent.agentId) return fail('not registered yet -- run: register --name <name>');
+      return out(await agent.renameRoom(roomId, name));
+    }
+
+    case 'update-profile': {
+      const name = flag('name');
+      if (!name) return fail('usage: update-profile --name <display_name> [--description ...]');
+      if (!agent.agentId) return fail('not registered yet -- run: register --name <name>');
+      const description = flag('description', undefined);
+      return out(await agent.updateProfile({
+        name,
+        ...(description !== undefined ? { description } : {}),
+      }));
+    }
+
     case 'join-room': {
       const [roomId] = rest;
       const secret = flag('secret', null);
@@ -360,6 +379,8 @@ async function main() {
           'send <to> <content>', 'inbox [--limit N]',
           'delegate --capability <n> <task description...>',
           'create-room --name <n> [--members a,b] [--visibility public|private] [--secret <s>]',
+          'rename-room <room_id> --name <label>',
+          'update-profile --name <display_name> [--description ...]',
           'join-room <room_id> [--secret <s>]', 'room-send <room_id> <content> [--secret <s>]',
           'room-messages <room_id> [--limit N] [--secret <s>]',
           'room-invite <room_id> --members a,b', 'room-accept <room_id>',

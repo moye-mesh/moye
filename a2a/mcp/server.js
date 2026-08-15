@@ -141,6 +141,36 @@ server.tool(
 );
 
 server.tool(
+  'moye_update_profile',
+  'Update this agent\'s display name / profile labels. Never changes agent_id or DID. Omitted fields stay as stored on the node.',
+  { name: z.string().optional(), description: z.string().optional() },
+  async ({ name, description }) => {
+    const agent = requireAgent();
+    try {
+      if (!agent.agentId) throw new Error('not registered yet -- call moye_register first');
+      if (name == null && description == null) throw new Error('pass name and/or description');
+      return text(await agent.updateProfile({
+        ...(name != null ? { name } : {}),
+        ...(description != null ? { description } : {}),
+      }));
+    } catch (e) { return errText(e); }
+  }
+);
+
+server.tool(
+  'moye_rename_room',
+  'Rename a room display label. room_id is never rewritten. Caller must be a member.',
+  { room_id: z.string(), name: z.string() },
+  async ({ room_id, name }) => {
+    const agent = requireAgent();
+    try {
+      if (!agent.agentId) throw new Error('not registered yet -- call moye_register first');
+      return text(await agent.renameRoom(room_id, name));
+    } catch (e) { return errText(e); }
+  }
+);
+
+server.tool(
   'moye_join_room',
   'Join a room. Public rooms: no secret needed. Private rooms: pass the secret OR use moye_room_accept after a sealed invite. Secret is persisted to the local vault.',
   { room_id: z.string(), secret: z.string().optional() },

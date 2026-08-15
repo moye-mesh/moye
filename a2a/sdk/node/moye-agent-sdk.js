@@ -415,6 +415,55 @@ class Agent {
     }, agent.profile_sig);
   }
 
+  /** Update display name / profile labels. Never changes agent_id or DID.
+   *  Only keys the caller passes are written; omitted fields stay as stored on the node. */
+  async updateProfile(patch = {}) {
+    if (!this.agentId) throw new MoyeError('agent not registered');
+    const provided = {};
+    if (patch.name != null) provided.name = String(patch.name).trim();
+    if (patch.description != null) provided.description = String(patch.description);
+    if (patch.capabilities != null) provided.capabilities = patch.capabilities;
+    if (patch.endpoint != null) provided.endpoint = String(patch.endpoint);
+    if (patch.webhook_url !== undefined) provided.webhook_url = patch.webhook_url;
+    if (!Object.keys(provided).length) throw new MoyeError('no profile fields to update');
+    if (provided.name !== undefined && (!provided.name || provided.name.length > 200)) {
+      throw new MoyeError('name required (1–200 chars)');
+    }
+    const live = await this.profile().catch(() => null);
+    const merged = {
+      name: provided.name != null ? provided.name : ((live && live.name) || this.name || ''),
+      description: provided.description != null ? provided.description : ((live && live.description) || this.description || ''),
+      capabilities: provided.capabilities != null ? provided.capabilities : ((live && live.capabilities) || this.capabilities || []),
+      endpoint: provided.endpoint != null ? provided.endpoint : ((live && live.endpoint) || this.endpoint || ''),
+      webhook_url: provided.webhook_url !== undefined ? provided.webhook_url : ((live && live.webhook_url) || this.webhookUrl || null),
+    };
+    const payload = { ...provided };
+    if (this._priv) {
+      if (!live) throw new MoyeError('could not load current profile to sign');
+      payload.profile_sig = signProfileLocal(this._priv, merged);
+    }
+    const r = await request(
+      this.baseUrl, 'POST', `/api/agents/${this.agentId}/profile`, payload,
+      this._headers(this._didHeaders(payload)),
+    );
+    if (provided.name != null) this.name = provided.name;
+    if (provided.description != null) this.description = provided.description;
+    if (provided.capabilities != null) this.capabilities = provided.capabilities;
+    if (provided.endpoint != null) this.endpoint = provided.endpoint;
+    if (provided.webhook_url !== undefined) this.webhookUrl = provided.webhook_url;
+    return r;
+  }
+
+  /** Rename a room's display label only (room_id unchanged). Caller must be a member. */
+  async renameRoom(roomId, name) {
+    if (!this.agentId) throw new MoyeError('agent not registered');
+    const payload = { name };
+    return request(
+      this.baseUrl, 'POST', `/api/rooms/${roomId}/rename`, payload,
+      this._headers(this._didHeaders(payload)),
+    );
+  }
+
   /** ADR-0038 M9: verify an X-Moye-Sig webhook push against the sending node's pubkey (fetch it
    *  from GET /api/node/identity). Pass the exact parsed JSON body -- content_hash/attachments_hash
    *  travel on the wire, so nothing needs recomputing here. Rejects a signed hash whose matching
