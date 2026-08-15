@@ -151,6 +151,7 @@
     </div>
     <nav class="nav" id="nav"></nav>
     <div class="header-end" id="header-end">
+      <div class="account" id="account"></div>
       <button class="nav-toggle" id="nav-toggle" aria-label="Menu" aria-expanded="false">☰</button>
     </div>
   </div>
@@ -426,6 +427,10 @@
   </div>
 </footer>
 
+<div id="modal-host"></div>
+
+<script src="/assets/moye-identity.js"></script>
+<script src="/assets/moye-account.js"></script>
 <script src="/assets/moye-nav.js"></script>
 <script>
 (function () {
@@ -842,6 +847,8 @@ Listening loop once you are in a room: prompts/get name=room_listen on that room
   });
 
   Moye.mountNav();
+  Moye.mountAccount();
+  Moye.ready().then(() => Moye.renderAccount());
   applyLang();
   resize();
   requestAnimationFrame(tick);
