@@ -20,6 +20,14 @@
 //   credentials [agent_id]
 //   verify-ledger
 import { loadAgent, saveIdentity, BASE_URL, IDENTITY_FILE, resolveIdentityFile } from './identity.js';
+import { createRequire } from 'module';
+import { spawn } from 'child_process';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const require = createRequire(import.meta.url);
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const tgBind = require('../connectors/telegram_room_bind.js');
 
 function out(obj) { process.stdout.write(JSON.stringify(obj) + '\n'); }
 function fail(msg, extra) { process.stderr.write(JSON.stringify({ error: msg, ...(extra || {}) }) + '\n'); process.exit(1); }
@@ -288,6 +296,63 @@ async function main() {
       return out({ imported: true, did: incoming.did, agent_id: incoming.agentId || null, identity_file: target });
     }
 
+    // ADR-0045: bind your own BotFather bot to exactly one room (existing DID — no TG registration).
+    case 'room-telegram-bind': {
+      if (!agent.agentId) return fail('not registered yet — run: register --name <name>');
+      const roomId = flag('room', rest[0]);
+      const token = flag('token', null);
+      if (!roomId || !token) return fail('usage: room-telegram-bind --room <room_id> --token <BotFatherToken> [--allow-from <tgUserId>] [--bot-username <name>]');
+      const r = tgBind.bindRoom({
+        roomId,
+        botToken: token,
+        allowFrom: csv(flag('allow-from', '')),
+        botUsername: flag('bot-username', null),
+      });
+      if (!r.ok) return fail(r.error);
+      return out({
+        ...r.bind,
+        agent_id: agent.agentId,
+        next: `room-telegram-run --room ${roomId}`,
+        note: '1 bot ↔ 1 room. Token stored only in the local binds file, not on the MOYE node.',
+      });
+    }
+
+    case 'room-telegram-unbind': {
+      const roomId = flag('room', rest[0]);
+      if (!roomId) return fail('usage: room-telegram-unbind --room <room_id>');
+      const r = tgBind.unbindRoom(roomId);
+      if (!r.ok) return fail(r.error);
+      return out(r);
+    }
+
+    case 'room-telegram-status': {
+      return out({ agent_id: agent.agentId || null, ...tgBind.listBinds() });
+    }
+
+    case 'room-telegram-run': {
+      if (!agent.agentId) return fail('not registered yet — run: register --name <name>');
+      const roomId = flag('room', rest[0]);
+      if (!roomId) return fail('usage: room-telegram-run --room <room_id> [--secret <s>] [--allow-from <id>]');
+      const { bind } = tgBind.getBindForRoom(roomId);
+      if (!bind) return fail(`no bot bound for ${roomId} — run room-telegram-bind first`);
+      const bridge = path.join(__dirname, '..', 'connectors', 'telegram_room_bridge.js');
+      const args = [bridge, '--room', roomId];
+      const secret = flag('secret', null);
+      if (secret) args.push('--secret', secret);
+      const allow = flag('allow-from', null);
+      if (allow) args.push('--allow-from', allow);
+      // Long-running: hand off stdio; identity via env already set for this process.
+      const child = spawn(process.execPath, args, {
+        stdio: 'inherit',
+        env: { ...process.env, MOYE_IDENTITY_FILE: process.env.MOYE_IDENTITY_FILE || IDENTITY_FILE, MOYE_BASE_URL: BASE_URL },
+      });
+      await new Promise((resolve, reject) => {
+        child.on('exit', (code) => (code === 0 || code === null ? resolve() : reject(new Error(`bridge exited ${code}`))));
+        child.on('error', reject);
+      });
+      return;
+    }
+
     default:
       fail(`unknown command: ${cmd || '(none)'}`, {
         usage: ['whoami', 'register --name <n> [--capabilities a,b]', 'discover [--q t] [--capability n]',
@@ -302,6 +367,9 @@ async function main() {
           'room-watch <room_id> [--since <ms>] [--secret <s>]',
           'room-broadcast-task <room_id> <task...>', 'room-claim-task <room_id> <broadcast_msg_id> [note...]',
           'room-accept-claim <room_id> <claim_msg_id> [note...] (room creator only)',
+          'room-telegram-bind --room <id> --token <BotFatherToken> [--allow-from <tgUserId>]',
+          'room-telegram-run --room <id> [--secret <s>]',
+          'room-telegram-unbind --room <id>', 'room-telegram-status',
           'export-identity', 'import-identity <json>',
           'issue-credential --subject <did> --claim \'<json>\' [--expires-at <ms>]', 'credentials [agent_id]',
           'assign-task --room <id> --task "<t>" --assignees a,b', 'verify-ledger'],

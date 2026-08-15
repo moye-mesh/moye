@@ -199,9 +199,11 @@ const I18N={
   rotate_go:'Rotate now',rotate_ok:'Room key rotated',rotate_failed_wraps:'Rotated, but some sealed invites failed',
   rotate_done_sub:'Save this key. Members you wrapped can use Accept invite; others need this key out of band (or Unlock).',
   tg_btn:'📱 Connect via Telegram',tg_title:'Connect via Telegram',
-  tg_sub:'Anyone who scans this or opens the link gets their own real MOYE identity and joins this room — never a shared bot account. Your own master key is never involved in generating this link.',
-  tg_open_bot:'Open in Telegram',tg_copy:'Copy link',tg_expires:'This invite works for 72 hours.',
-  tg_no_bot:'The Telegram bridge is not configured on this node yet.',
+  tg_sub:'You already have a MOYE identity. Create your own bot with @BotFather, bind its token to THIS room only (1 bot ↔ 1 room), then run the connector. Chat with your bot in the Telegram app to talk to the room. Telegram never registers a DID.',
+  tg_steps:'1) Open @BotFather → /newbot → copy the token.<br>2) On a machine that holds your MOYE identity, run the commands below.<br>3) Open your bot in Telegram and send a message.',
+  tg_copy_bind:'Copy bind command',tg_copy_run:'Copy run command',
+  tg_need_member:'Join this room first (unlock private rooms if needed), then connect Telegram.',
+  tg_open_botfather:'Open BotFather',
   room:'Room',no_desc:'(no description)',share_key:'🔑 Share room key',members:'Members',tasks:'Tasks',
   assign_btn:'＋ Assign a task',no_tasks:'No tasks yet',done:'done',doing:'in progress',submit_result:'Submit result',
   new_room:'New room',name:'Name',desc:'Description',visibility:'Visibility',
@@ -497,7 +499,7 @@ function renderSide(){
         ${CUR.visibility==='private'&&Moye.getRoomSecret(CUR.id)?`
           <button class="btn btn-sm" style="margin-top:.6rem" onclick="showSecret()">${T('share_key')}</button>
           ${isMember()?`<button class="btn btn-sm btn-ghost" style="margin-top:.4rem" onclick="openRotate()">${T('rotate_btn')}</button>`:''}`:''}
-        ${CUR.visibility!=='private'&&isMember()?`<button class="btn btn-sm btn-ghost" style="margin-top:.4rem" onclick="openTelegramConnect()">${T('tg_btn')}</button>`:''}
+        ${isMember()?`<button class="btn btn-sm btn-ghost" style="margin-top:.4rem" onclick="openTelegramConnect()">${T('tg_btn')}</button>`:''}
       </div>
     </div>
     <div class="side-section">
@@ -534,39 +536,24 @@ function renderSide(){
     </div>`;
 }
 
-/* ---------- Telegram bridge (ADR-0044) ---------- */
-function qrSvg(text, cellPx){
-  const qr=qrcode(0,'M'); qr.addData(text); qr.make();
-  const n=qr.getModuleCount(); const margin=2; const size=(n+margin*2)*cellPx;
-  let rects='';
-  for(let r=0;r<n;r++) for(let c=0;c<n;c++) if(qr.isDark(r,c))
-    rects+=`<rect x="${(c+margin)*cellPx}" y="${(r+margin)*cellPx}" width="${cellPx}" height="${cellPx}"/>`;
-  return `<svg viewBox="0 0 ${size} ${size}" width="${size}" height="${size}" xmlns="http://www.w3.org/2000/svg" style="background:#fff;border-radius:8px">
-    <g fill="#000">${rects}</g></svg>`;
-}
-async function openTelegramConnect(){
-  if(!CUR || CUR.visibility==='private') return;
+/* ---------- Telegram (ADR-0045: own bot ↔ one room) ---------- */
+function openTelegramConnect(){
+  if(!CUR) return;
   if(!Moye.current()) return Moye.toast(T('need_login'),'error');
-  modal(`<h3>${T('tg_title')}</h3><p class="modal-sub">${T('tg_sub')}</p>
-    <div style="display:flex;justify-content:center;padding:var(--sp-4)"><div class="skeleton" style="width:200px;height:200px;border-radius:8px"></div></div>`);
-  try{
-    const r=await Moye.api('/api/telegram/invite',{method:'POST',auth:true,body:{room_id:CUR.id}});
-    if(!r.bot_configured){
-      modal(`<h3>${T('tg_title')}</h3><p class="modal-sub">${T('tg_no_bot')}</p>
-        <div class="modal-actions"><button class="btn" onclick="closeModal()">✕</button></div>`);
-      return;
-    }
-    modal(`<h3>${T('tg_title')}</h3><p class="modal-sub">${T('tg_sub')}</p>
-      <div style="display:flex;justify-content:center;padding:var(--sp-4)">${qrSvg(r.deep_link,6)}</div>
-      <div class="mono muted" style="font-size:var(--fs-xs);overflow-wrap:anywhere;text-align:center;margin-bottom:var(--sp-3)">${esc(r.deep_link)}</div>
-      <p class="muted" style="font-size:var(--fs-xs);text-align:center">${T('tg_expires')}</p>
-      <div class="modal-actions">
-        <button class="btn btn-ghost" onclick="Moye.copy('${esc(r.deep_link)}')">${T('tg_copy')}</button>
-        <a class="btn btn-primary" href="${esc(r.deep_link)}" target="_blank" rel="noopener">${T('tg_open_bot')}</a></div>`);
-  }catch(e){
-    modal(`<h3>${T('tg_title')}</h3><p class="modal-sub">${esc(e.message||String(e))}</p>
-      <div class="modal-actions"><button class="btn" onclick="closeModal()">✕</button></div>`);
-  }
+  if(!isMember()) return Moye.toast(T('tg_need_member'),'error');
+  const roomId=CUR.id;
+  const bindCmd=`node a2a/mcp/cli.js room-telegram-bind --room ${roomId} --token <PASTE_BOTFATHER_TOKEN>`;
+  const runCmd=`node a2a/mcp/cli.js room-telegram-run --room ${roomId}`;
+  modal(`<h3>${T('tg_title')}</h3>
+    <p class="modal-sub">${T('tg_sub')}</p>
+    <p class="muted" style="font-size:var(--fs-sm);line-height:1.45;margin:var(--sp-3) 0">${T('tg_steps')}</p>
+    <div class="mono" style="font-size:var(--fs-xs);background:var(--bg-sunken);padding:var(--sp-3);border-radius:var(--r);overflow-wrap:anywhere;margin-bottom:var(--sp-2)">${esc(bindCmd)}</div>
+    <div class="mono" style="font-size:var(--fs-xs);background:var(--bg-sunken);padding:var(--sp-3);border-radius:var(--r);overflow-wrap:anywhere;margin-bottom:var(--sp-3)">${esc(runCmd)}</div>
+    <div class="modal-actions" style="flex-wrap:wrap;gap:.4rem">
+      <a class="btn btn-ghost" href="https://t.me/BotFather" target="_blank" rel="noopener">${T('tg_open_botfather')}</a>
+      <button class="btn btn-ghost" onclick="Moye.copy(${JSON.stringify(bindCmd)})">${T('tg_copy_bind')}</button>
+      <button class="btn btn-primary" onclick="Moye.copy(${JSON.stringify(runCmd)})">${T('tg_copy_run')}</button>
+    </div>`);
 }
 
 /* ---------- modals ---------- */

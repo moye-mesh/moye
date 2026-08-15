@@ -3146,113 +3146,14 @@ app.post('/api/bridge/send', async (req, res) => {
   ok(res, { message_id: id, status: 'pending', encrypted: isEnc });
 });
 
-// ================= Telegram bridge (ADR-0044) =================
-// Every linked Telegram chat acts as its OWN real MOYE identity -- never a shared bot account.
-// Flow: a room member mints a room-scoped invite -> anyone opening it in Telegram gets a fresh
-// pairing bound to their real Telegram chat (verified by Telegram itself relaying /start, never a
-// browser-supplied claim) -> a normal MOYE web page (reusing the existing browser identity code,
-// ADR-0014) generates a real DID (or reuses one already on that device) and mints a session key
-// (ADR-0043) -> the relay process picks up the finished pairing and bridges messages using that
-// session, same as any other session-delegated agent. The relay never sees a master private key.
-const TELEGRAM_RELAY_SECRET = process.env.TELEGRAM_RELAY_SECRET || null;
-const TELEGRAM_INVITE_TTL_MS = 72 * 3600 * 1000;   // invite: reusable, longer-lived
-const TELEGRAM_PAIRING_TTL_MS = 15 * 60 * 1000;    // pairing: single Telegram chat, short-lived
-function telegramRelayAuthorized(req) {
-  if (!TELEGRAM_RELAY_SECRET) return false; // bridge disabled until an operator sets a secret
-  const got = Buffer.from((req.headers['x-telegram-relay-secret'] || '').toString());
-  const want = Buffer.from(TELEGRAM_RELAY_SECRET);
-  return got.length === want.length && crypto.timingSafeEqual(got, want);
-}
-
-// A room member creates a reusable invite code for that room. Sharing it (posting it in the room,
-// printing a QR of the deep link) is the same trust model as sharing any other MOYE room invite --
-// this endpoint does not itself add anyone to the room; joining still happens per-person in the
-// browser step, same as any other new member.
-app.post('/api/telegram/invite', async (req, res) => {
-  const me = await authAgent(req);
-  if (!me) return fail(res, 401, 'Bearer token or DID sig required');
-  const { room_id } = req.body || {};
-  if (!room_id) return fail(res, 400, 'room_id required');
-  const room = store.getRoom(room_id);
-  if (!room) return fail(res, 404, 'room not found');
-  if (!isRoomMember(room, me.id)) return fail(res, 403, 'not a member of this room');
-  // v1 boundary (documented in ADR-0044): private E2E rooms need their secret shared out-of-band
-  // already, which the Telegram flow has no channel for -- restrict to public rooms for now rather
-  // than build a secure secret-transport special case for one bridge.
-  if (room.visibility === 'private') return fail(res, 400, 'Telegram bridge is only available for public rooms for now');
-  const invite_code = crypto.randomBytes(12).toString('hex');
-  const now = Date.now();
-  stmt.insertTelegramInvite.run(invite_code, room_id, me.id, now, now + TELEGRAM_INVITE_TTL_MS);
-  const botUsername = process.env.TELEGRAM_BOT_USERNAME || null;
-  ok(res, {
-    invite_code, room_id, expires_at: now + TELEGRAM_INVITE_TTL_MS,
-    deep_link: botUsername ? `https://t.me/${botUsername}?start=${invite_code}` : null,
-    bot_configured: !!botUsername,
-  });
-});
-
-// Internal: called only by the relay process (holds TELEGRAM_RELAY_SECRET) the moment it receives
-// /start <invite_code> from a real Telegram chat. telegram_chat_id is trustworthy here precisely
-// because Telegram itself delivered it -- the browser step later never gets to assert a chat_id.
-app.post('/api/telegram/relay/start', async (req, res) => {
-  if (!telegramRelayAuthorized(req)) return fail(res, 401, 'invalid or missing relay secret');
-  const { invite_code, telegram_chat_id } = req.body || {};
-  if (!invite_code || !telegram_chat_id) return fail(res, 400, 'invite_code and telegram_chat_id required');
-  const invite = stmt.telegramInviteByCode.get(invite_code);
-  if (!invite) return fail(res, 404, 'unknown invite_code');
-  if (invite.expires_at < Date.now()) return fail(res, 410, 'invite expired');
-  const pairing_code = crypto.randomBytes(16).toString('hex');
-  const now = Date.now();
-  stmt.insertTelegramPairing.run(pairing_code, invite.room_id, String(telegram_chat_id), 'pending_web', now, now + TELEGRAM_PAIRING_TTL_MS);
-  ok(res, { pairing_code, room_id: invite.room_id, expires_at: now + TELEGRAM_PAIRING_TTL_MS });
-});
-
-// Public: the browser step (telegram-connect.html) submits the session it just minted for itself.
-// Trust here does NOT come from this call's own signature -- it comes from independently checking
-// that a real, live session-key VC (ADR-0014 §2.4) already exists for (master_did, session_did),
-// the same check the WS/HTTP session paths use, and that the submitted private key actually matches
-// the public key on that VC. A pairing_code can only ever be completed once.
-app.post('/api/telegram/pair', async (req, res) => {
-  const { pairing_code, agent_id, master_did, session_did, session_private_key } = req.body || {};
-  if (!pairing_code || !agent_id || !master_did || !session_did || !session_private_key) {
-    return fail(res, 400, 'pairing_code, agent_id, master_did, session_did, session_private_key required');
-  }
-  const pairing = stmt.telegramPairingByCode.get(pairing_code);
-  if (!pairing) return fail(res, 404, 'unknown pairing_code');
-  if (pairing.status !== 'pending_web') return fail(res, 409, 'pairing_code already used');
-  if (pairing.expires_at < Date.now()) return fail(res, 410, 'pairing_code expired');
-  const agent = store.getAgent(agent_id);
-  if (!agent || agent.did !== master_did) return fail(res, 404, 'agent/master_did mismatch');
-  const room = store.getRoom(pairing.room_id);
-  if (!room || !isRoomMember(room, agent_id)) return fail(res, 403, 'agent is not a member of the invited room');
-  const grant = findLiveSessionKey(master_did, session_did);
-  if (!grant) return fail(res, 403, 'no live session-key VC for that (master_did, session_did)');
-  if (!sessionScopeAllows(grant.claim.scope, 'room.read') || !sessionScopeAllows(grant.claim.scope, 'room.post')) {
-    return fail(res, 403, 'session must be scoped to room.read and room.post');
-  }
-  let derivedPub;
-  try { derivedPub = crypto.createPublicKey(session_private_key).export({ type: 'spki', format: 'pem' }); }
-  catch { return fail(res, 400, 'session_private_key is not a valid Ed25519 PKCS#8 PEM key'); }
-  if (derivedPub !== grant.claim.pubkey) return fail(res, 403, 'session_private_key does not match the session-key VC pubkey');
-  const expires = grant.claim.expires || (Date.now() + 7 * 24 * 3600 * 1000);
-  stmt.activateTelegramPairing.run(agent_id, master_did, session_did, session_private_key, expires, Date.now(), pairing_code);
-  ledger.append('telegram.pair', { agent: agent_id, room_id: pairing.room_id, ts: Date.now() }).catch(() => {});
-  ok(res, { linked: true, room_id: pairing.room_id, session_expires_at: expires });
-});
-
-// Internal: relay polls this to pick up newly-activated pairings. Returns raw session private
-// keys, so it is gated exactly like /api/telegram/relay/start -- this is the same trust tier as
-// FED_SECRET (an ops-operated process, not a public client).
-app.get('/api/telegram/relay/poll', async (req, res) => {
-  if (!telegramRelayAuthorized(req)) return fail(res, 401, 'invalid or missing relay secret');
-  const rows = stmt.pendingRelayPairings.all();
-  for (const r of rows) stmt.markTelegramPairingDelivered.run(r.pairing_code);
-  ok(res, { pairings: rows.map((r) => ({
-    pairing_code: r.pairing_code, room_id: r.room_id, telegram_chat_id: r.telegram_chat_id,
-    agent_id: r.agent_id, master_did: r.master_did, session_did: r.session_did,
-    session_private_key: r.session_private_key, session_expires_at: r.session_expires_at,
-  })) });
-});
+// ================= Telegram bridge (ADR-0044 DEPRECATED → ADR-0045) =================
+// Shared node bot + invite/pairing is superseded. Members bind their own BotFather bot locally
+// (CLI room-telegram-bind / connectors/telegram_room_bridge.js). These endpoints return 410.
+const TELEGRAM_GONE = 'Telegram shared-bot API removed (ADR-0045). Bind your own BotFather token to one room with: node a2a/mcp/cli.js room-telegram-bind --room <id> --token <token> && room-telegram-run --room <id>. See docs/adr/0045-telegram-own-bot-per-room.md';
+app.post('/api/telegram/invite', async (_req, res) => fail(res, 410, TELEGRAM_GONE));
+app.post('/api/telegram/relay/start', async (_req, res) => fail(res, 410, TELEGRAM_GONE));
+app.post('/api/telegram/pair', async (_req, res) => fail(res, 410, TELEGRAM_GONE));
+app.get('/api/telegram/relay/poll', async (_req, res) => fail(res, 410, TELEGRAM_GONE));
 
 // Shared intent: intents/declarations anchored to the ledger (visible network-wide)
 app.post('/api/shared-intent', async (req, res) => {

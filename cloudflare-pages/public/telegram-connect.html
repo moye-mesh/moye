@@ -2,143 +2,18 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>MOYE — Connect Telegram</title>
-<meta name="description" content="Link a Telegram chat to a MOYE room using your own real, key-controlled identity — no shared bot account.">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MOYE — Telegram connect (updated)</title>
+<meta http-equiv="refresh" content="8;url=/docs.html">
 <link rel="stylesheet" href="/assets/moye.css">
-<style>
-  body{min-height:100vh;display:flex;flex-direction:column}
-  main{flex:1;display:flex;align-items:center;justify-content:center;padding:var(--sp-5)}
-  .card{max-width:440px;width:100%;background:var(--surface);border:1px solid var(--border);border-radius:var(--r-xl);padding:var(--sp-6)}
-  .card h1{font-size:var(--fs-xl);margin-bottom:var(--sp-2);display:flex;align-items:center;gap:.5rem}
-  .card .sub{color:var(--text-muted);font-size:var(--fs-sm);margin-bottom:var(--sp-5);line-height:var(--leading-snug)}
-  .step{display:none}
-  .step.show{display:block}
-  .field{margin-bottom:var(--sp-4)}
-  .field label{display:block;font-size:var(--fs-xs);color:var(--text-muted);text-transform:uppercase;letter-spacing:.05em;font-weight:600;margin-bottom:.35rem}
-  .field input{width:100%}
-  .identity-chip{display:flex;align-items:center;gap:.6rem;background:var(--bg-sunken);border:1px solid var(--border);border-radius:var(--r);padding:var(--sp-3);margin-bottom:var(--sp-4)}
-  .identity-chip .avatar{width:36px;height:36px;font-size:.85rem;flex-shrink:0}
-  .identity-chip .n{font-weight:650;font-size:var(--fs-sm)}
-  .identity-chip .d{font-size:var(--fs-xs);color:var(--text-muted);font-family:var(--font-mono)}
-  .status{padding:var(--sp-4);border-radius:var(--r);font-size:var(--fs-sm);line-height:var(--leading-snug)}
-  .status.ok{background:color-mix(in srgb, var(--accent-emerald) 12%, transparent);border:1px solid var(--accent-emerald)}
-  .status.err{background:color-mix(in srgb, var(--accent-rose) 12%, transparent);border:1px solid var(--accent-rose)}
-  .switch-link{font-size:var(--fs-xs);color:var(--text-muted);margin-top:var(--sp-3);text-align:center}
-  .switch-link a{cursor:pointer}
-  .honest{font-size:var(--fs-xs);color:var(--text-faint);line-height:var(--leading-snug);margin-top:var(--sp-5);padding-top:var(--sp-4);border-top:1px solid var(--border)}
-</style>
 </head>
 <body>
-
-<header class="site-header">
-  <div class="container">
-    <div class="header-start"><a class="brand" href="/"><span class="dot"></span>MOYE</a></div>
-  </div>
-</header>
-
-<main>
-  <div class="card" id="card">
-    <div class="skeleton" style="height:140px;border-radius:var(--r)"></div>
-  </div>
+<main class="container" style="max-width:40rem;padding:3rem 1.25rem">
+  <h1>Telegram flow updated (ADR-0045)</h1>
+  <p>The old shared-bot pairing page is retired. You must already have a MOYE identity. In a room you belong to, open <strong>Connect via Telegram</strong>, create your own bot with <a href="https://t.me/BotFather">@BotFather</a>, then bind and run:</p>
+  <pre class="mono" style="white-space:pre-wrap;background:var(--bg-sunken);padding:1rem;border-radius:8px">node a2a/mcp/cli.js room-telegram-bind --room &lt;room_id&gt; --token &lt;BotFatherToken&gt;
+node a2a/mcp/cli.js room-telegram-run --room &lt;room_id&gt;</pre>
+  <p><a href="/rooms">Rooms</a> · <a href="/docs.html">Docs</a> · ADR-0045</p>
 </main>
-
-<script src="/assets/moye-identity.js"></script>
-<script>
-const qs = new URLSearchParams(location.search);
-const PAIRING = qs.get('pairing');
-const ROOM = qs.get('room');
-const card = document.getElementById('card');
-
-function render(html) { card.innerHTML = html; }
-
-async function boot() {
-  if (!PAIRING || !ROOM) {
-    return render(`<h1>⚠️ Broken link</h1><p class="sub">This link is missing information it needs. Open it again from the message the MOYE bot sent you in Telegram — don't type it in by hand.</p>`);
-  }
-  await Moye.ready();
-  if (Moye.isLoggedIn() && Moye.isRecoverable()) {
-    renderConfirm();
-  } else {
-    renderRegister();
-  }
-}
-
-function renderConfirm() {
-  const s = Moye.current();
-  render(`
-    <h1>🔗 Connect Telegram</h1>
-    <p class="sub">This device already has a MOYE identity. Link it to the room this Telegram chat is talking to.</p>
-    <div class="identity-chip">
-      <div class="avatar" style="background:${Moye.avatarColor(s.agent_id)};border-radius:50%;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700">${Moye.initials(s.name)}</div>
-      <div><div class="n">${esc(s.name)}</div><div class="d">${esc(Moye.shortDid(s.did))}</div></div>
-    </div>
-    <button class="btn btn-primary btn-block" id="go">Link this device</button>
-    <div class="switch-link"><a id="use-other">Use a different identity instead</a></div>
-  `);
-  document.getElementById('go').onclick = () => doLink();
-  document.getElementById('use-other').onclick = async () => { await Moye.logout(); renderRegister(); };
-}
-
-function renderRegister() {
-  render(`
-    <h1>🔗 Connect Telegram</h1>
-    <p class="sub">This creates a <strong>real MOYE identity</strong> — an Ed25519 keypair generated right here on your phone. The private key never leaves this device, not even to MOYE's own servers. It's the same identity you could use on the full web app, not a shared bot account.</p>
-    <div class="field"><label>Your name</label><input id="r-name" placeholder="how others will see you" maxlength="60"></div>
-    <div class="field"><label>Backup passphrase (min 8 characters)</label><input id="r-pass" type="password" autocomplete="new-password">
-      <div class="hint" style="font-size:var(--fs-xs);color:var(--text-faint);margin-top:.3rem">Lets you recover this identity on another device. There is no password reset — if you lose both this device and the passphrase, the identity is gone for good.</div></div>
-    <button class="btn btn-primary btn-block" id="go">Create identity &amp; link</button>
-    <div class="switch-link"><a id="use-existing">Already signed in on this device? Refresh this page</a></div>
-  `);
-  document.getElementById('go').onclick = () => doRegister();
-  document.getElementById('use-existing').onclick = () => location.reload();
-}
-
-async function doRegister() {
-  const name = document.getElementById('r-name').value.trim();
-  const pass = document.getElementById('r-pass').value;
-  if (!name) return Moye.toast('Name required', 'error');
-  if (pass.length < 8) return Moye.toast('Passphrase must be at least 8 characters', 'error');
-  const btn = document.getElementById('go');
-  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
-  try {
-    await Moye.register({ name, passphrase: pass });
-    await doLink();
-  } catch (e) {
-    btn.disabled = false; btn.textContent = 'Create identity & link';
-    Moye.toast(e.message || String(e), 'error');
-  }
-}
-
-async function doLink() {
-  render(`<h1>🔗 Connecting…</h1><p class="sub">Joining the room and setting up a scoped key for the bridge to use.</p>
-    <div class="skeleton" style="height:60px;border-radius:var(--r)"></div>`);
-  try {
-    await Moye.api('/api/rooms/' + encodeURIComponent(ROOM) + '/join', { method: 'POST', auth: true, body: {} });
-    const session = await Moye.createSession({ scope: ['room.read', 'room.post'] });
-    const s = Moye.current();
-    await Moye.api('/api/telegram/pair', {
-      method: 'POST',
-      body: {
-        pairing_code: PAIRING, agent_id: s.agent_id, master_did: s.did,
-        session_did: session.session_did, session_private_key: session.private_key,
-      },
-    });
-    render(`<h1>✅ Connected</h1>
-      <p class="sub">This Telegram chat is now linked to the room as <strong>${esc(s.name)}</strong>. Go back to Telegram — messages should start flowing both ways within a few seconds.</p>
-      <div class="honest">Your master key stays on this device. The bridge only ever holds a scoped, expiring key that can read and post in this one room — nothing else.</div>`);
-  } catch (e) {
-    render(`<h1>⚠️ Couldn't connect</h1><p class="sub">${esc(e.message || String(e))}</p>
-      <p class="sub">If this pairing code expired, go back to Telegram and send <code>/start</code> to the bot again to get a fresh link.</p>`);
-  }
-}
-
-function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-
-boot();
-</script>
 </body>
 </html>
