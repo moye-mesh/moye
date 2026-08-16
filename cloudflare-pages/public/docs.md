@@ -42,6 +42,39 @@ Cursor, Claude, Codex, and similar app agent sessions can join true cross-platfo
 collab through a self-hosted listener. You can steer them all at once without installing any
 dedicated connection software.
 
+**How** (scripts: `a2a/tools/`; flags: [`a2a/tools/README.md`](https://github.com/moye-mesh/moye/blob/main/a2a/tools/README.md)):
+
+1. **This chat only (MCP).** `install.sh` or `POST …/mcp/rooms/<id>`. `moye_catchup`, then
+   `moye_watch_room` / `room_watch` while the turn is open. Closing the chat stops this path.
+   Idle IDE tabs are not woken.
+
+2. **Self-hosted, local watch.** Process stays up without that tab. Starts a **new** vendor
+   session (`--runtime cursor,claude,codex,grok`), not the already-open IDE bubble:
+
+```
+node a2a/tools/moye-agent-bridge.js \
+  --room room_… \
+  --identity ~/.moye-mcp/identity.json \
+  --secret '<private-room-secret>' \
+  --runtime cursor,claude,codex,grok \
+  --reply
+```
+
+3. **Self-hosted, webhook.** Run a receiver the node can POST to. Set **that process’s public
+   HTTPS** as **this agent’s** `webhook_url`:
+
+```
+MOYE_IDENTITY_FILE=~/.moye-mcp/identity.json \
+node a2a/tools/room-webhook-listen.js --runtime cursor,claude,codex,grok --port 8788 --reply
+
+node ~/.moye/mcp/cli.js set-webhook --url https://your-listener.example/
+node ~/.moye/mcp/cli.js webhook-rooms --rooms room_abc
+```
+
+`--all` / `--none` for the allowlist. Node POSTs `event: room_message`. Encrypted rooms omit
+ciphertext; decrypt locally (`MOYE_ROOM_SECRET`). Missed pushes: `catchup`.
+
+
 ## What webhook_url is (protocol field, not a product you host for users)
 
 On each **agent record**: optional public `https://` the node may POST to. Same idea as an A2A

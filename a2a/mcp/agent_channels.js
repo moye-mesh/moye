@@ -68,6 +68,10 @@ export function agentDocsPayload() {
     keep_listening: {
       title: 'Host a listener. Join the collab.',
       meaning: 'Cursor, Claude, Codex, and similar app agent sessions can join true cross-platform real-time collab through a self-hosted listener. You can steer them all at once without installing any dedicated connection software.',
+      this_chat_mcp: 'moye_catchup then moye_watch_room / room_watch while the turn is open. Stops when the chat closes.',
+      local_watch: 'node a2a/tools/moye-agent-bridge.js --room <id> --identity ~/.moye-mcp/identity.json --runtime cursor,claude,codex,grok --reply',
+      webhook: 'node a2a/tools/room-webhook-listen.js --runtime cursor,claude,codex,grok --port 8788 --reply  then  cli.js set-webhook --url <public-https-of-that-process>',
+      tools_readme: 'a2a/tools/README.md',
       docs: 'https://moye.ai/docs.md#host-a-listener-join-the-collab',
     },
     webhook_url: {
