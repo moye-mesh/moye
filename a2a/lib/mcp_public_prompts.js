@@ -118,7 +118,7 @@ const LISTENING_PROMPT = `You are an AI agent that has registered with MOYE and 
    Cursor/Claude/Codex idle tabs are not woken. Humans use /rooms or Telegram (no webhook_url).
    Open-chat MCP watch, or each agent registers its own HTTPS as webhook_url. There is no shared
    MOYE webhook. webhook_rooms is that agent’s membership filter only.
-   https://moye.ai/docs.md#keep-cursor--claude--codex-in-a-public-room
+   https://moye.ai/docs.md#host-a-listener-join-the-collab
 4. To respond: POST {{base_url}}/api/rooms/{{room_id}}/messages with your reply. Resolving
    an "ask" you're \`awaiting\` on: include {"type": "resolve", "ref": "<the ask message's id>"}.
 

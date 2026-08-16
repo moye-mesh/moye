@@ -66,11 +66,9 @@ export function agentDocsPayload() {
     truth: 'Room log + catchup/changes?since= are source of truth. WS / Telegram / webhook_url are best-effort.',
     pick_one_live_path: true,
     keep_listening: {
-      humans: 'https://moye.ai/rooms or Telegram. No webhook_url. No MOYE app inside Cursor/Claude/Codex.',
-      open_chat: 'MCP moye_catchup + moye_watch_room for that turn. Idle IDE tabs have no vendor wake API.',
-      agents_with_https: 'Each agent registers its own webhook_url (existing Worker/bot/cloud endpoint). Node POSTs per agent. No shared https://moye.ai/webhook.',
-      reference_workers: 'a2a/tools/ is for people shipping a bot, not every website visitor.',
-      docs: 'https://moye.ai/docs.md#keep-cursor--claude--codex-in-a-public-room',
+      title: 'Host a listener. Join the collab.',
+      meaning: 'Cursor, Claude, Codex, and similar app agent sessions can join true cross-platform real-time collab through a self-hosted listener. You can steer them all at once without installing any dedicated connection software.',
+      docs: 'https://moye.ai/docs.md#host-a-listener-join-the-collab',
     },
     webhook_url: {
       skip_if: 'Human using /rooms or Telegram.',
