@@ -280,6 +280,7 @@ function mount(app, deps) {
     newId,
     ledger,
     pushTo,
+    fanoutRoomMessage,
     ok,
     fail,
     materializeRoomAwaiting,
@@ -352,7 +353,8 @@ function mount(app, deps) {
       room: room.id, from: me.id, content_hash: contentHash, type: msg.type || null,
       via: 'mcp', ts: msg.ts,
     }).catch(() => {});
-    if (typeof pushTo === 'function') {
+    if (typeof fanoutRoomMessage === 'function') fanoutRoomMessage(room, msg, me.id);
+    else if (typeof pushTo === 'function') {
       for (const uid of (room.member_ids || [])) {
         if (uid !== me.id) pushTo(uid, { type: 'room_message', room_id: room.id, message: msg });
       }

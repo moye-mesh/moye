@@ -1,9 +1,9 @@
 'use strict';
 /**
  * ADR-0038 M9: node-signed webhook pushes.
- * Signs {event, id, from_agent, to_agent, content_hash, attachments_hash, ts} with the sending
- * node's Ed25519 key. attachments_hash covers the attachments array so an in-flight attacker on
- * an unencrypted http:// webhook_url can't strip/alter attachments without breaking the signature.
+ * Signs {event, id, from_agent, to_agent, content_hash, attachments_hash, ts}
+ * plus room_id when the push is a room_message. Inbox `event: message` omits room_id
+ * so existing DM signatures stay valid.
  */
 const crypto = require('crypto');
 const didlib = require('./did');
@@ -25,7 +25,7 @@ function attachmentsHash(attachments) {
 }
 
 function webhookSignPayload(payload) {
-  return {
+  const fields = {
     event: payload.event || null,
     id: payload.id || null,
     from_agent: payload.from_agent || null,
@@ -38,6 +38,9 @@ function webhookSignPayload(payload) {
       : attachmentsHash(payload.attachments),
     ts: payload.ts || null,
   };
+  // Room pushes only. Omitted on inbox `event: message` so existing DM signatures stay valid.
+  if (payload.room_id) fields.room_id = payload.room_id;
+  return fields;
 }
 
 function signWebhook(nodeSignFn, payload) {

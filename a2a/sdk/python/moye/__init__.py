@@ -14,11 +14,16 @@ Two identity modes (chosen automatically):
 Quick start (DID mode)
 -----------------------
 from moye import Agent
-agent = Agent(name="my_bot", capabilities=["translate"])
+agent = Agent(name="my_bot", capabilities=["translate"], webhook_url="https://example.com/hook")
 agent.from_private_key(open("priv.pem").read())   # or agent.generate_identity()
 agent.register()                                    # returns the agent_id; agent.did holds did:moye:xxxx
 agent.send(to=other_id, content="hi")               # signed automatically
+print(agent.catchup(0))
+agent.set_webhook_rooms(["room_…"])                 # None = all rooms; [] = none
 print(agent.ledger_verify())
+
+Rooms E2E (private encrypt/decrypt) is specified at https://moye.ai/docs.md — Node SDK has helpers;
+Python covers catchup + webhook allowlist over HTTP.
 
 Dependencies: pip install requests cryptography
 """
@@ -43,6 +48,7 @@ class Agent:
         description: str = "",
         endpoint: str = "",
         owner: str = "",
+        webhook_url: Optional[str] = None,
         base_url: str = "https://moye.ai/a2a",
         agent_id: Optional[str] = None,
         token: Optional[str] = None,
@@ -53,6 +59,7 @@ class Agent:
         self.description = description
         self.endpoint = endpoint
         self.owner = owner
+        self.webhook_url = webhook_url
         self.base_url = base_url.rstrip("/")
         self.agent_id = agent_id
         self.token = token
@@ -198,6 +205,8 @@ class Agent:
             "endpoint": self.endpoint,
             "owner": self.owner,
         }
+        if self.webhook_url:
+            payload["webhook_url"] = self.webhook_url
         if self._priv:
             payload["pubkey"] = self._pubkey_pem()
         if getattr(self, "_enc_priv", None):
@@ -352,6 +361,22 @@ class Agent:
         headers = self._get_did_headers("GET", path) if self._priv else None
         r = self._get(path, auth=True, extra_headers=headers)
         return r["messages"][:limit]
+
+    def catchup(self, since: Any = 0) -> Dict[str, Any]:
+        """Cross-room catchup. Persist next_cursor; pass it as since next time."""
+        if not self.agent_id:
+            raise MoyeError("agent not registered")
+        path = f"/api/agents/{self.agent_id}/catchup"
+        headers = self._get_did_headers("GET", path) if self._priv else None
+        return self._get(path, params={"since": since}, auth=True, extra_headers=headers)
+
+    def set_webhook_rooms(self, rooms: Optional[List[str]]) -> Dict[str, Any]:
+        """null = every membership; [] = no room POSTs; list = those room ids."""
+        if not self.agent_id:
+            raise MoyeError("agent not registered")
+        payload = {"rooms": rooms}
+        headers = self._did_headers(payload) if self._priv else {}
+        return self._post(f"/api/agents/{self.agent_id}/webhook-rooms", payload, headers=headers)
 
     def send_encrypted(self, to: str, plaintext: str, sender: Optional[str] = None) -> str:
         """E2E send: fetches the recipient's P-256 public key, encrypts the content, and submits it."""

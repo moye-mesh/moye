@@ -69,7 +69,7 @@ const RESERVED_SHARED_PREFIXES = ['revoke:', 'reputation:'];
 // soft-fork *signaling* than its activation mechanism (MOYE has no hashpower-equivalent objective
 // threshold; adoption data here is informational, not a trigger that flips anything on by itself).
 const PROTOCOL_VERSION = '1.6';
-const PROTOCOL_FEATURES = ['capability-schema', 'verifiable-credentials', 'message-signing', 'rich-crdt', 'a2a-jsonrpc-bridge', 'portable-address-attestation', 'capability-input-filter', 'seeds-multisig-governance', 'firehose', 'message-attachments', 'room-awaiting', 'node-did-federation-auth', 'room-fork', 'slip0010', 'identity-delegation', 'session-keys', 'resolve-at', 'agent-timeline', 'gravity-search', 'room-mcp', 'shard-route', 'query-directory', 'room-state-staleness', 'room-mcp-mrtr', 'room-pinning', 'room-consolidate', 'mnemonic-identity', 'domain-verify', 'room-read-cache', 'agent-catchup', 'ask-deadline', 'agent-profile-sig', 'webhook-sig', 'room-mcp-prompts', 'room-mcp-resources', 'display-rename'];
+const PROTOCOL_FEATURES = ['capability-schema', 'verifiable-credentials', 'message-signing', 'rich-crdt', 'a2a-jsonrpc-bridge', 'portable-address-attestation', 'capability-input-filter', 'seeds-multisig-governance', 'firehose', 'message-attachments', 'room-awaiting', 'node-did-federation-auth', 'room-fork', 'slip0010', 'identity-delegation', 'session-keys', 'resolve-at', 'agent-timeline', 'gravity-search', 'room-mcp', 'shard-route', 'query-directory', 'room-state-staleness', 'room-mcp-mrtr', 'room-pinning', 'room-consolidate', 'mnemonic-identity', 'domain-verify', 'room-read-cache', 'agent-catchup', 'ask-deadline', 'agent-profile-sig', 'webhook-sig', 'room-mcp-prompts', 'room-mcp-resources', 'display-rename', 'room-webhooks'];
 
 // Broadcast a newly-registered agent to peer nodes immediately (doesn't wait for the 15s reconcile cycle)
 function announceToPeers(agent) {
@@ -350,38 +350,137 @@ async function webhookUrlSafe(url) {
   return { ok: true };
 }
 
-// ---- Webhook bridge: async-POST messages to agents that registered a webhook_url (zero-SDK onboarding) ----
+// ---- Webhook bridge: async-POST inbox AND room messages to agents that registered webhook_url.
+// Small in-memory retry queue (cap 256, 5 attempts). Catchup is still the source of truth.
+const WEBHOOK_RETRY = {
+  maxQueue: 256,
+  maxAttempts: 5,
+  delaysMs: [2000, 8000, 32000, 120000, 480000],
+};
+const webhookQueue = [];
+let webhookDrainTimer = null;
+let webhookDraining = false;
+
+function parseWebhookRooms(raw) {
+  if (raw === null) return { value: null };
+  if (!Array.isArray(raw)) return { error: 'webhook_rooms must be an array or null' };
+  if (raw.length > 64) return { error: 'webhook_rooms max 64' };
+  const rooms = [];
+  const seen = new Set();
+  for (const x of raw) {
+    const id = String(x || '').trim();
+    if (!/^room_[a-z0-9]+$/i.test(id)) return { error: 'invalid room id in webhook_rooms' };
+    if (seen.has(id)) continue;
+    seen.add(id);
+    rooms.push(id);
+  }
+  return { value: rooms };
+}
+
+function agentWantsRoomWebhook(agent, roomId) {
+  const list = agent && agent.webhook_rooms;
+  if (list == null) return true;
+  if (!Array.isArray(list) || !list.length) return false;
+  return list.includes(roomId);
+}
+
+function roomWebhookPayload(roomId, msg, uid) {
+  const encrypted = !!msg.encrypted;
+  const payload = {
+    event: 'room_message',
+    id: msg.id,
+    room_id: roomId,
+    from_agent: msg.from_agent || null,
+    to_agent: uid,
+    encrypted,
+    type: msg.type || null,
+    ref: msg.ref || null,
+    ts: msg.ts,
+  };
+  if (encrypted) {
+    // Wake only: never put private-room ciphertext on a third-party URL (cloud APIs, shared hosts).
+    payload.content_omitted = true;
+  } else {
+    payload.content = msg.content;
+    payload.attachments = msg.attachments || null;
+  }
+  return payload;
+}
+
 function deliverWebhook(url, payload) {
-  let u;
-  try { u = new URL(url); } catch { return; }
-  // Re-validate at delivery time (DNS rebinding defense); skip silently if the target is unsafe.
-  webhookUrlSafe(url).then((v) => {
-    if (!v.ok) { console.warn('[webhook] blocked delivery to', url, '-', v.reason); return; }
-    // ADR-0038 M9: node-signed push — receiver optionally verifies with GET /api/node/identity.
-    // attachments_hash closes a follow-up gap: the signature originally covered content but not
-    // attachments, so an in-flight attacker on an unencrypted http:// webhook_url could strip or
-    // alter attachments without breaking X-Moye-Sig.
-    const { fields, sig } = webhookSig.signWebhook((msg) => nodeIdentity.sign(msg), payload);
-    const wire = { ...payload, content_hash: fields.content_hash, attachments_hash: fields.attachments_hash };
-    const data = JSON.stringify(wire);
-    const lib = u.protocol === 'https:' ? require('https') : http;
-    const req = lib.request({
-      hostname: u.hostname, port: u.port || (u.protocol === 'https:' ? 443 : 80),
-      path: u.pathname + u.search, method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(data),
-        'X-Moye-Event': String(payload.event || 'message'),
-        'X-Moye-Sig': sig,
-        'X-Moye-Node': nodeIdentity.nodeId,
-        'X-Moye-Node-Did': nodeIdentity.did,
-      },
-      timeout: 5000,
-    }, (r) => { r.resume(); });
-    req.on('error', () => {});
-    req.on('timeout', () => req.destroy());
-    req.write(data);
-    req.end();
+  if (webhookQueue.length >= WEBHOOK_RETRY.maxQueue) webhookQueue.shift();
+  webhookQueue.push({ url, payload, attempt: 0, nextAt: Date.now() });
+  drainWebhooks();
+}
+
+function drainWebhooks() {
+  if (webhookDraining || webhookDrainTimer) return;
+  webhookDraining = true;
+  setImmediate(() => {
+    const now = Date.now();
+    const ready = [];
+    const later = [];
+    for (const item of webhookQueue) {
+      if (item.nextAt <= now) ready.push(item);
+      else later.push(item);
+    }
+    webhookQueue.length = 0;
+    webhookQueue.push(...later);
+    Promise.all(ready.map(async (item) => {
+      const result = await postWebhookOnce(item.url, item.payload);
+      if (result === 'ok' || result === 'drop') return;
+      item.attempt += 1;
+      if (item.attempt >= WEBHOOK_RETRY.maxAttempts) return;
+      item.nextAt = Date.now() + (WEBHOOK_RETRY.delaysMs[item.attempt - 1] || 480000);
+      if (webhookQueue.length < WEBHOOK_RETRY.maxQueue) webhookQueue.push(item);
+    })).then(() => {
+      webhookDraining = false;
+      if (!webhookQueue.length) return;
+      const wait = Math.min(...webhookQueue.map((x) => x.nextAt)) - Date.now();
+      if (wait <= 0) { drainWebhooks(); return; }
+      webhookDrainTimer = setTimeout(() => {
+        webhookDrainTimer = null;
+        drainWebhooks();
+      }, wait);
+      if (webhookDrainTimer.unref) webhookDrainTimer.unref();
+    });
+  });
+}
+
+function postWebhookOnce(url, payload) {
+  return new Promise((resolve) => {
+    let u;
+    try { u = new URL(url); } catch { resolve('drop'); return; }
+    webhookUrlSafe(url).then((v) => {
+      if (!v.ok) { console.warn('[webhook] blocked delivery to', url, '-', v.reason); resolve('drop'); return; }
+      const { fields, sig } = webhookSig.signWebhook((msg) => nodeIdentity.sign(msg), payload);
+      const wire = { ...payload, content_hash: fields.content_hash, attachments_hash: fields.attachments_hash };
+      const data = JSON.stringify(wire);
+      const lib = u.protocol === 'https:' ? require('https') : http;
+      const req = lib.request({
+        hostname: u.hostname, port: u.port || (u.protocol === 'https:' ? 443 : 80),
+        path: u.pathname + u.search, method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(data),
+          'X-Moye-Event': String(payload.event || 'message'),
+          'X-Moye-Sig': sig,
+          'X-Moye-Node': nodeIdentity.nodeId,
+          'X-Moye-Node-Did': nodeIdentity.did,
+        },
+        timeout: 5000,
+      }, (r) => {
+        const code = r.statusCode || 0;
+        r.resume();
+        if (code >= 200 && code < 300) resolve('ok');
+        else if (code === 429 || code >= 500) resolve('retry');
+        else resolve('drop');
+      });
+      req.on('error', () => resolve('retry'));
+      req.on('timeout', () => { req.destroy(); resolve('retry'); });
+      req.write(data);
+      req.end();
+    }).catch(() => resolve('retry'));
   });
 }
 
@@ -422,6 +521,21 @@ function pushTo(agentId, payload) {
   if (!set) return;
   const msg = JSON.stringify(payload);
   set.forEach((ws) => { if (ws.readyState === 1) ws.send(msg); });
+}
+
+/** WS to whoever is connected, plus best-effort webhook to members who registered webhook_url.
+ *  Missed pushes are recovered via catchup. Encrypted rooms: webhook is a wake (no ciphertext). */
+function fanoutRoomMessage(room, msg, exceptId) {
+  if (!room || !msg) return;
+  const roomId = room.id;
+  for (const uid of (room.member_ids || [])) {
+    if (exceptId && uid === exceptId) continue;
+    pushTo(uid, { type: 'room_message', room_id: roomId, message: msg });
+    const agent = store.getAgent(uid);
+    if (!agent || !agent.webhook_url) continue;
+    if (!agentWantsRoomWebhook(agent, roomId)) continue;
+    deliverWebhook(agent.webhook_url, roomWebhookPayload(roomId, msg, uid));
+  }
 }
 
 wss.on('connection', (ws, req) => {
@@ -815,7 +929,7 @@ async function authAgent(req) {
 //  Classic: no pubkey -> server issues a token
 //  Decentralized: pubkey provided (Ed25519 PEM) -> derives did:moye:<fingerprint>, server only stores the public key
 app.post('/api/agents', async (req, res) => {
-  const { name, description, capabilities, endpoint, owner, pubkey, enc_pubkey, webhook_url, profile_sig } = req.body || {};
+  const { name, description, capabilities, endpoint, owner, pubkey, enc_pubkey, webhook_url, profile_sig, webhook_rooms: webhookRoomsIn } = req.body || {};
   if (!name) return fail(res, 400, 'name required');
   // SSRF guard: reject webhook targets that resolve to loopback/private/link-local addresses
   if (webhook_url) { const v = await webhookUrlSafe(webhook_url); if (!v.ok) return fail(res, 400, 'invalid webhook_url: ' + v.reason); }
@@ -870,12 +984,18 @@ app.post('/api/agents', async (req, res) => {
     }
     storedProfileSig = profile_sig;
   }
+  let webhook_rooms = null;
+  if (Object.prototype.hasOwnProperty.call(req.body || {}, 'webhook_rooms')) {
+    const parsedRooms = parseWebhookRooms(webhookRoomsIn);
+    if (parsedRooms.error) return fail(res, 400, parsedRooms.error);
+    webhook_rooms = parsedRooms.value;
+  }
   stmt.insertAgent.run(id, name, hashToken(token), ledger.NODE_ID, Date.now());
   // Directory/pubkey/capabilities are written to IPFS shared state (decentralized, visible across nodes)
   const registered = await store.putAgent(id, {
     id, name, description: description || '', capabilities: capabilities || [], endpoint: endpoint || '',
     owner: owner || '', pubkey: pubkey || null, did: did || null, enc_pubkey: enc_pubkey || null,
-    webhook_url: webhook_url || null, home_node: ledger.NODE_ID, created_at: Date.now(),
+    webhook_url: webhook_url || null, webhook_rooms, home_node: ledger.NODE_ID, created_at: Date.now(),
     profile_sig: storedProfileSig,
     p2p_addrs: req.body && req.body.p2p_addrs ? req.body.p2p_addrs : null,   // P3: libp2p direct-connect multiaddrs
     relay_tier,  // ADR-0006 workstream E: self-reported relay capability ('public'|'hole-punched'|'leech'|'unknown')
@@ -1058,6 +1178,12 @@ app.post('/api/agents/:id/profile', async (req, res) => {
     const v = await webhookUrlSafe(webhook_url);
     if (!v.ok) return fail(res, 400, 'invalid webhook_url: ' + v.reason);
   }
+  let webhook_rooms = agent.webhook_rooms == null ? null : agent.webhook_rooms;
+  if (has('webhook_rooms')) {
+    const parsedRooms = parseWebhookRooms(body.webhook_rooms);
+    if (parsedRooms.error) return fail(res, 400, parsedRooms.error);
+    webhook_rooms = parsedRooms.value;
+  }
   const fields = { name, description, capabilities, endpoint, webhook_url };
   let storedProfileSig = agent.profile_sig || null;
   if (agent.pubkey) {
@@ -1073,13 +1199,30 @@ app.post('/api/agents/:id/profile', async (req, res) => {
     verified_display = domainVerify.verifiedDisplayName(name, agent.verified_domain);
   }
   const updated = await store.putAgent(me.id, {
-    ...agent, ...fields, profile_sig: storedProfileSig, verified_display,
+    ...agent, ...fields, webhook_rooms, profile_sig: storedProfileSig, verified_display,
   });
   await ledger.append('agent.profile', {
     agent: me.id, name, did: agent.did || null, ts: Date.now(),
   }).catch(() => {});
   if (PEERS.length) announceToPeers({ id: me.id, ...updated });
   ok(res, { agent_id: me.id, name: updated.name, verified_display: updated.verified_display || null });
+});
+
+// Room webhook allowlist (not part of profile_sig). null = every membership; [] = no room POSTs.
+app.post('/api/agents/:id/webhook-rooms', async (req, res) => {
+  const me = await authAgent(req);
+  if (!me) return fail(res, 401, 'Bearer token or DID sig required');
+  if (me.id !== req.params.id) return fail(res, 403, 'identity mismatch');
+  const agent = store.getAgent(me.id);
+  if (!agent) return fail(res, 404, 'agent not found');
+  if (!Object.prototype.hasOwnProperty.call(req.body || {}, 'rooms')) {
+    return fail(res, 400, 'rooms required (array or null)');
+  }
+  const parsedRooms = parseWebhookRooms(req.body.rooms);
+  if (parsedRooms.error) return fail(res, 400, parsedRooms.error);
+  const updated = await store.putAgent(me.id, { ...agent, webhook_rooms: parsedRooms.value });
+  if (PEERS.length) announceToPeers({ id: me.id, ...updated });
+  ok(res, { agent_id: me.id, webhook_rooms: updated.webhook_rooms == null ? null : updated.webhook_rooms });
 });
 
 // ---- ADR-0010: portable, independently-verifiable DID->address attestations ----
@@ -2144,9 +2287,7 @@ app.use(siteRoutes(db, {
       ts: Date.now(),
     };
     await appendRoomMessage(roomId, msg);
-    for (const uid of (room.member_ids || [])) {
-      pushTo(uid, { type: 'room_message', room_id: roomId, message: msg });
-    }
+    fanoutRoomMessage(room, msg);
     ledger.append('guestbook.mirror', {
       room: roomId, from: '(site-guestbook)', content_hash: crypto.createHash('sha256').update(text).digest('hex'), ts: msg.ts,
     }).catch(() => {});
@@ -2584,7 +2725,7 @@ app.post('/api/rooms/:id/messages', async (req, res) => {
     room: room.id, from: me.id, content_hash: contentHash, type: msg.type || null,
     attachment_cids: atts ? atts.map((a) => a.cid) : null, ts: msg.ts,
   }).catch(() => {});
-  for (const uid of (room.member_ids || [])) if (uid !== me.id) pushTo(uid, { type: 'room_message', room_id: room.id, message: msg });
+  fanoutRoomMessage(room, msg, me.id);
   ok(res, { message_id: msg.id, ts: msg.ts });
 });
 app.get('/api/rooms/:id/messages', async (req, res) => {
@@ -2795,6 +2936,7 @@ app.post('/api/rooms/:id/consolidate', async (req, res) => {
   ledger.append('room.consolidate', {
     room: room.id, by: me.id, proposal_id: proposal.id, checkpoint_seq: checkpointSeq, ts: msg.ts,
   }).catch(() => {});
+  fanoutRoomMessage(room, msg, me.id);
   ok(res, {
     room_id: room.id, proposal, message_id: msg.id,
     staleness: await roomStateStaleness(room.id, next),
@@ -2983,7 +3125,7 @@ app.post('/api/rooms/:id/fork', async (req, res) => {
 // Mounted after room helpers (authAgent, isRoomMember, appendRoomMessage, …) exist.
 roomMcp.mount(app, {
   authAgent, store, isRoomMember, canReadRoom, roomChatKey, appendRoomMessage,
-  newId, ledger, pushTo, ok, fail, materializeRoomAwaiting, MAX_CONTENT_LEN,
+  newId, ledger, pushTo, fanoutRoomMessage, ok, fail, materializeRoomAwaiting, MAX_CONTENT_LEN,
 });
 
 // ---- 8. Distribute a task to a room (requires auth: room creator) ----
@@ -3796,7 +3938,7 @@ function agentInterfaces(a, endpoint) {
     list.push({ transport: 'yggdrasil', address: a.overlay_addr,
       note: 'public-key-derived IPv6 overlay; reachable without DNS' });
   }
-  if (a.webhook_url) list.push({ transport: 'webhook', push: true, note: 'node pushes inbound messages to a registered URL' });
+  if (a.webhook_url) list.push({ transport: 'webhook', push: true, note: 'node pushes inbox and room messages to a registered URL; catchup if a push is missed' });
   list.push({ transport: 'ipfs-pubsub', topic: `/moye/msg/${a.id}`, note: 'offline catch-up channel' });
   return list;
 }
@@ -4166,6 +4308,8 @@ app.get(['/api/network', '/.well-known/moye-net'], async (req, res) => {
       // ADR-0031: per-room MCP Streamable HTTP (JSON-RPC initialize|tools/list|tools/call).
       // Coexists with stdio MCP at /mcp-dist — scoped to one room_id; no create/join tools.
       room_mcp: '/mcp/rooms/:id  (POST JSON-RPC: tools + prompts/list|get + resources/list|read; GET discovery|SSE hello); Bearer or DID',
+      webhook_rooms: '/api/agents/:id/webhook-rooms  (POST {rooms: string[]|null})',
+      catchup: '/api/agents/:id/catchup?since=',
       resolve_at: '/api/agents/:id/resolve?at=<ts|seq:N>',
       timeline: '/api/agents/:id/timeline',
       dashboard: 'https://moye.ai/status',
@@ -4183,7 +4327,19 @@ app.get(['/api/network', '/.well-known/moye-net'], async (req, res) => {
       registration_admission: ['x-invite (if operator set OPEN_INVITE)', 'pubkey (DID self-attestation)', 'PoW (server-issued one-time challenge; solve prefix+nonce, sha256 starts with N zeros)'],
       reserved_shared_state_prefixes: ['revoke:', 'reputation:'],
     },
-    docs: { human: '/docs', llms: '/llms.txt', sdk: '/sdk-dist', mcp: '/mcp-dist', agent_card: '/.well-known/agent.json', protocol_adoption: '/api/protocol/adoption', openapi: '/api/network' },
+    docs: {
+      human: 'https://moye.ai/docs',
+      markdown: 'https://moye.ai/docs.md',
+      agents: 'https://moye.ai/AGENTS.md',
+      llms: 'https://moye.ai/llms.txt',
+      sdk: '/sdk-dist',
+      mcp: '/mcp-dist',
+      agent_card: '/.well-known/agent.json',
+      protocol_adoption: '/api/protocol/adoption',
+      openapi: '/api/network',
+      cli_docs_command: 'node ~/.moye/mcp/cli.js docs',
+      mcp_docs_tool: 'moye_docs',
+    },
     seeds,
     p2p_relay: p2pRelay.info(), // P3: libp2p circuit-relay-v2 relay info, the agent SDK uses this to connect to the relay and dial direct connections
     // ADR-0006 workstream E1 (partial): 'public'/'private'/'unknown' from resolving PUBLIC_ENDPOINT --

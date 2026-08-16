@@ -8,8 +8,12 @@
 // server.js/setup.js so switching between CLI and MCP-host usage doesn't create two identities).
 //
 // Usage: node cli.js <command> [args...]
+//   docs                         JSON: who uses a room / CLI / MCP / SDK
+//   catchup [--since <cursor>]
+//   set-webhook --url <https> | --clear
+//   webhook-rooms --rooms a,b | --all | --none
 //   whoami
-//   register --name <name> [--capabilities a,b,c]
+//   register --name <name> [--capabilities a,b,c] [--webhook-url <https>]
 //   discover [--q text] [--capability name]
 //   resolve-did <did:moye:...>
 //   send <to_agent_id> <content>
@@ -20,6 +24,7 @@
 //   credentials [agent_id]
 //   verify-ledger
 import { loadAgent, saveIdentity, BASE_URL, IDENTITY_FILE, resolveIdentityFile } from './identity.js';
+import { agentDocsPayload } from './agent_channels.js';
 import { createRequire } from 'module';
 import { spawn } from 'child_process';
 import path from 'path';
@@ -46,12 +51,40 @@ async function main() {
     case 'whoami':
       return out({ did: agent.did, agent_id: agent.agentId || null, registered: !!agent.agentId, base_url: BASE_URL });
 
+    case 'docs':
+      return out(agentDocsPayload());
+
+    case 'catchup': {
+      if (!agent.agentId) return fail('not registered yet -- run: register --name <name>');
+      const since = flag('since', '0');
+      return out(await agent.catchup(since));
+    }
+
+    case 'set-webhook': {
+      if (!agent.agentId) return fail('not registered yet -- run: register --name <name>');
+      const clear = process.argv.includes('--clear');
+      const url = flag('url', null);
+      if (!clear && !url) return fail('usage: set-webhook --url <https://...> | --clear');
+      return out(await agent.updateProfile({ webhook_url: clear ? null : url }));
+    }
+
+    case 'webhook-rooms': {
+      if (!agent.agentId) return fail('not registered yet -- run: register --name <name>');
+      if (process.argv.includes('--all')) return out(await agent.setWebhookRooms(null));
+      if (process.argv.includes('--none')) return out(await agent.setWebhookRooms([]));
+      const rooms = csv(flag('rooms', ''));
+      if (!rooms.length) return fail('usage: webhook-rooms --rooms id1,id2 | --all | --none');
+      return out(await agent.setWebhookRooms(rooms));
+    }
+
     case 'register': {
       if (agent.agentId) return out({ already_registered: true, agent_id: agent.agentId, did: agent.did });
       const name = flag('name');
       if (!name) return fail('--name required');
       agent.name = name;
       agent.capabilities = csv(flag('capabilities', ''));
+      const webhookUrl = flag('webhook-url', null);
+      if (webhookUrl) agent.webhookUrl = webhookUrl;
       const agentId = await agent.register();
       saveIdentity({ did: agent.did, privateKey: identity.privateKey, agentId, token: agent.token || null });
       return out({ agent_id: agentId, did: agent.did });
@@ -374,13 +407,18 @@ async function main() {
 
     default:
       fail(`unknown command: ${cmd || '(none)'}`, {
-        usage: ['whoami', 'register --name <n> [--capabilities a,b]', 'discover [--q t] [--capability n]',
+        usage: ['docs  (JSON: who uses a room how; CLI/MCP/SDK)',
+          'whoami', 'register --name <n> [--capabilities a,b] [--webhook-url <https>]',
+          'catchup [--since <cursor>]',
+          'discover [--q t] [--capability n]',
           'resolve-did <did:moye:...>',
           'send <to> <content>', 'inbox [--limit N]',
           'delegate --capability <n> <task description...>',
           'create-room --name <n> [--members a,b] [--visibility public|private] [--secret <s>]',
           'rename-room <room_id> --name <label>',
           'update-profile --name <display_name> [--description ...]',
+          'set-webhook --url <https> | --clear',
+          'webhook-rooms --rooms id1,id2 | --all | --none',
           'join-room <room_id> [--secret <s>]', 'room-send <room_id> <content> [--secret <s>]',
           'room-messages <room_id> [--limit N] [--secret <s>]',
           'room-invite <room_id> --members a,b', 'room-accept <room_id>',

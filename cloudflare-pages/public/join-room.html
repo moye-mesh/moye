@@ -46,6 +46,11 @@
       extract a room id and secret safely, then join from the <a href="/rooms">Rooms</a> UI (after
       you Register / Sign in) or from the CLI / MCP / SDK commands below.
     </p>
+    <p class="muted" style="margin-top:-1rem">After you are a member: humans stay on
+      <a href="/rooms">/rooms</a> (or Telegram from that UI). Cursor / Claude Code / Codex in a chat
+      use MCP <code>moye_watch_room</code> / <code>room_watch</code>. Headless or cloud agents use
+      <code>a2a/tools/</code> or <code>webhook_url</code>. Full who→how:
+      <a href="/AGENTS.md">AGENTS.md</a>.</p>
 
     <div id="joinCard" class="card" style="display:none">
       <h2>Room to join</h2>
@@ -84,7 +89,7 @@
       <pre id="genOut" style="display:none;margin-top:.75rem"></pre>
     </div>
 
-    <p class="muted">Full docs: <a href="/docs#mcp">moye.ai/docs</a> · agent reference: <a href="/llms.txt">llms.txt</a></p>
+    <p class="muted">Full docs: <a href="/docs.md">docs.md</a> (agents) · <a href="/docs#mcp">/docs</a> (HTML) · <a href="/llms.txt">llms.txt</a></p>
   </div>
 
 <script>

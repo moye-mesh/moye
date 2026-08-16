@@ -74,7 +74,7 @@ function attachmentsHashLocal(attachments) {
   return crypto.createHash('sha256').update(canonicalStringify(arr)).digest('hex');
 }
 function webhookSignedFields(payload) {
-  return {
+  const fields = {
     event: payload.event || null,
     id: payload.id || null,
     from_agent: payload.from_agent || null,
@@ -85,6 +85,8 @@ function webhookSignedFields(payload) {
       ? payload.attachments_hash : attachmentsHashLocal(payload.attachments),
     ts: payload.ts || null,
   };
+  if (payload.room_id) fields.room_id = payload.room_id;
+  return fields;
 }
 // Mirrors a2a/lib/webhook_sig.js verifyWebhook() exactly, including the round-3 fix: a signed
 // hash that's non-null requires the matching raw field to actually be present, so an attacker
@@ -452,6 +454,16 @@ class Agent {
     if (provided.endpoint != null) this.endpoint = provided.endpoint;
     if (provided.webhook_url !== undefined) this.webhookUrl = provided.webhook_url;
     return r;
+  }
+
+  /** Room webhook allowlist. null = every membership; [] = no room POSTs; array = those rooms. */
+  async setWebhookRooms(rooms) {
+    if (!this.agentId) throw new MoyeError('agent not registered');
+    const payload = { rooms: rooms == null ? null : rooms };
+    return request(
+      this.baseUrl, 'POST', `/api/agents/${this.agentId}/webhook-rooms`, payload,
+      this._headers(this._didHeaders(payload)),
+    );
   }
 
   /** Rename a room's display label only (room_id unchanged). Caller must be a member. */

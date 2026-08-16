@@ -11,6 +11,8 @@
 //!         .capabilities(vec!["translate".into(), "zh".into()])
 //!         .description("translation agent");
 //!     agent.register().await?;
+//!     agent.catchup(0).await?;
+//!     let _ = agent.set_webhook_rooms(Some(vec!["room_example".into()])).await;
 //!
 //!     let coders = Agent::discover().capability("code").call().await?;
 //!     agent.send(&coders[0].id, "help me write a crawler").await?;
@@ -115,6 +117,7 @@ pub struct Agent {
     enc_priv: Option<String>,  // P-256 private key PEM, used for E2E decryption
     id_priv: Option<String>,   // Ed25519 private key PEM, used for DID identity signing
     did: Option<String>,
+    webhook_url: Option<String>,
     client: reqwest::Client,
 }
 
@@ -132,6 +135,7 @@ impl Agent {
             enc_priv: None,
             id_priv: None,
             did: None,
+            webhook_url: None,
             client: reqwest::Client::new(),
         }
     }
@@ -185,6 +189,11 @@ impl Agent {
 
     pub fn endpoint(mut self, e: impl Into<String>) -> Self {
         self.endpoint = e.into();
+        self
+    }
+
+    pub fn webhook_url(mut self, url: impl Into<String>) -> Self {
+        self.webhook_url = Some(url.into());
         self
     }
 
@@ -392,6 +401,7 @@ impl Agent {
             owner: String,
             enc_pubkey: Option<String>,
             pubkey: Option<String>,
+            webhook_url: Option<String>,
         }
         #[derive(Deserialize)]
         struct Resp {
@@ -412,6 +422,7 @@ impl Agent {
                     owner: self.owner.clone(),
                     enc_pubkey,
                     pubkey,
+                    webhook_url: self.webhook_url.clone(),
                 },
             )
             .await?;
@@ -542,6 +553,43 @@ impl Agent {
         }
         let r: Resp = self.get_authed(&format!("/api/agents/{}/inbox", self.agent_id()?)).await?;
         Ok(r.messages)
+    }
+
+    /// Cross-room catchup. Persist `next_cursor` from the JSON and pass it as `since` next time.
+    pub async fn catchup(&self, since: u64) -> Result<serde_json::Value> {
+        let path = format!("/api/agents/{}/catchup", self.agent_id()?);
+        let mut req = self.client.get(format!("{}{}?since={}", self.base_url, path, since));
+        if self.id_priv.is_some() {
+            let did = self.did.clone().ok_or_else(|| MoyeError::Api("DID not derived".into()))?;
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let claim = serde_json::to_string(&serde_json::json!({ "method": "GET", "path": path, "ts": ts }))
+                .map_err(|e| MoyeError::Crypto(e.to_string()))?;
+            let sig = self.sign_payload(&claim)?;
+            req = req
+                .header("X-Moye-Did", did)
+                .header("X-Moye-Sig", sig)
+                .header("X-Moye-Ts", ts.to_string());
+        } else if let Some(b) = self.bearer() {
+            req = req.header("Authorization", b);
+        }
+        let resp = req.send().await?;
+        let api: Api<serde_json::Value> = resp.json().await?;
+        if !api.success {
+            return Err(MoyeError::Api(api.error.unwrap_or_default()));
+        }
+        Ok(api.data)
+    }
+
+    /// Room webhook allowlist. `None` = every membership; empty vec = no room POSTs.
+    pub async fn set_webhook_rooms(&self, rooms: Option<Vec<String>>) -> Result<serde_json::Value> {
+        self.post_authed(
+            &format!("/api/agents/{}/webhook-rooms", self.agent_id()?),
+            &serde_json::json!({ "rooms": rooms }),
+        )
+        .await
     }
 
     pub async fn ack(&self, message_id: &str) -> Result<()> {

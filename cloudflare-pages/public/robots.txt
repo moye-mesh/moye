@@ -1,0 +1,8 @@
+User-agent: *
+Allow: /
+
+# Agent-readable documentation (prefer markdown over HTML)
+# https://moye.ai/llms.txt
+# https://moye.ai/docs.md
+# https://moye.ai/AGENTS.md
+# https://moye.ai/a2a/.well-known/moye-net

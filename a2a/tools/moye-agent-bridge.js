@@ -16,18 +16,19 @@
  * to override for a one-shot (also writes through to the cursor file as it advances).
  *
  * Usage:
- *   node moye-agent-bridge.js --room <id> --match <needle> --exec <command> \
- *     [--secret <s>] [--identity <path>] [--base-url <url>] [--since <ms>] \
- *     [--cursor-file <path>] [--stdin json|text|none] [--once]
+ *   node moye-agent-bridge.js --room <id> --match <needle> --runtime cursor,claude \
+ *     [--secret <s>] [--identity <path>] [--base-url <url>] [--since <ms>] [--reply]
+ *   node moye-agent-bridge.js --room <id> --match <needle> --exec <command> ...
  *
- * Env passed to --exec: MOYE_MSG_TEXT, MOYE_MSG_JSON, MOYE_ROOM_ID, MOYE_MSG_ID,
- * MOYE_FROM, MOYE_MATCH. Stdin (default): one JSON object for the message.
+ * --runtime cursor|claude|codex|grok[,…] sets --exec to room-runtime-exec.js.
+ * --reply asks that runner to POST the result back into the room.
  */
 
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 const { Agent } = require('../sdk/node/moye-agent-sdk');
+const { execPath: runtimeExecPath } = require('./lib/room-runtime');
 
 function flag(name, fallback) {
   const i = process.argv.indexOf(`--${name}`);
@@ -42,7 +43,12 @@ function die(msg) {
 const roomId = flag('room');
 const matchNeedle = flag('match');
 const matchRegexSrc = flag('match-regex', null);
-const execCmd = flag('exec');
+const runtimeFlag = flag('runtime', process.env.MOYE_RUNTIME || null);
+const replyRuntime = hasFlag('reply') || process.env.MOYE_RUNTIME_REPLY === '1';
+let execCmd = flag('exec');
+if (!execCmd && runtimeFlag) {
+  execCmd = `node "${runtimeExecPath}" --runtime ${runtimeFlag}${replyRuntime ? ' --reply' : ''}`;
+}
 const secret = flag('secret', null);
 const identityPath = flag('identity', process.env.MOYE_IDENTITY_FILE || null);
 const baseUrl = (flag('base-url', process.env.MOYE_BASE_URL || 'https://moye.ai/a2a')).replace(/\/$/, '');
@@ -52,7 +58,7 @@ const once = hasFlag('once');
 
 if (!roomId) die('usage: --room <room_id> required');
 if (!matchNeedle && !matchRegexSrc) die('usage: --match <needle> and/or --match-regex <re> required');
-if (!execCmd) die('usage: --exec <command> required');
+if (!execCmd) die('usage: --exec <command> or --runtime cursor|claude|codex|grok required');
 if (!['json', 'text', 'none'].includes(stdinMode)) die('--stdin must be json|text|none');
 
 function defaultCursorPath() {
@@ -172,6 +178,11 @@ function runExec(m) {
       MOYE_MATCH: matchNeedle || matchRegexSrc || '',
       MOYE_MSG_BY: m.by != null ? String(m.by) : '',
       MOYE_MSG_SCHEMA: m.schema || '',
+      MOYE_RUNTIME: runtimeFlag || process.env.MOYE_RUNTIME || '',
+      MOYE_RUNTIME_REPLY: replyRuntime ? '1' : (process.env.MOYE_RUNTIME_REPLY || ''),
+      MOYE_IDENTITY_FILE: identityPath || process.env.MOYE_IDENTITY_FILE || '',
+      MOYE_BASE_URL: baseUrl,
+      MOYE_ROOM_SECRET: secret || process.env.MOYE_ROOM_SECRET || '',
     };
     const child = spawn(execCmd, {
       shell: true,
@@ -232,6 +243,10 @@ function runExec(m) {
         if (stopped) return;
         // Advance past every seen message (matched or not) so restart does not re-deliver noise.
         if (m && m.ts) advanceCursor(m.ts);
+        if (m && m.from_agent && m.from_agent === agent.agentId) {
+          process.stderr.write(JSON.stringify({ skipped: true, reason: 'own_message', message_id: m.id }) + '\n');
+          return;
+        }
         if (!matches(m)) {
           process.stderr.write(JSON.stringify({ skipped: true, message_id: m.id }) + '\n');
           return;
@@ -285,7 +300,8 @@ function runExec(m) {
     cursor_file: cursorFile,
     cursor_init: loaded.init,
     ws_impl: (process.env.MOYE_WS_IMPL || 'ws-preferred'),
-    caveat: 'notification→exec only; agent runtime wake is outside MOYE',
+    runtime: runtimeFlag || null,
+    caveat: 'starts a new runtime session; does not inject an open IDE chat tab',
   }) + '\n');
 
   const stop = () => { stopped = true; if (sub) sub.stop(); process.exit(0); };

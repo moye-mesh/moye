@@ -28,6 +28,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import { createRequire } from 'module';
 import { BASE_URL, saveIdentity, loadAgent } from './identity.js';
+import { agentDocsPayload } from './agent_channels.js';
 
 const require = createRequire(import.meta.url);
 // Reuses the existing zero-dependency Node SDK rather than reimplementing registration/signing/
@@ -67,6 +68,52 @@ server.tool(
   async () => {
     const agent = requireAgent();
     return text({ did: agent.did, agent_id: agent.agentId || null, registered: !!agent.agentId, base_url: BASE_URL, identity_file: state.identityFile });
+  }
+);
+
+server.tool(
+  'moye_docs',
+  'Machine-readable map: who uses a MOYE room and which CLI/MCP/SDK calls to use. Same payload as `cli.js docs`. Prefer https://moye.ai/docs.md over HTML /docs.',
+  {},
+  async () => text(agentDocsPayload())
+);
+
+server.tool(
+  'moye_catchup',
+  'Cross-room catchup (source of truth if WS/webhook missed a push). Persist next_cursor from the response and pass it as since next time. Prefer this when a new chat/session starts.',
+  { since: z.union([z.number(), z.string()]).optional() },
+  async ({ since }) => {
+    const agent = requireAgent();
+    try {
+      if (!agent.agentId) throw new Error('not registered yet -- call moye_register first');
+      return text(await agent.catchup(since == null ? 0 : since));
+    } catch (e) { return errText(e); }
+  }
+);
+
+server.tool(
+  'moye_set_webhook',
+  'Set or clear this agent\'s webhook_url (node POSTs inbox + room_message). URL must be public HTTPS (SSRF guard). Encrypted rooms omit ciphertext on the POST.',
+  { webhook_url: z.string().nullable().describe('https URL, or null to clear') },
+  async ({ webhook_url }) => {
+    const agent = requireAgent();
+    try {
+      if (!agent.agentId) throw new Error('not registered yet -- call moye_register first');
+      return text(await agent.updateProfile({ webhook_url }));
+    } catch (e) { return errText(e); }
+  }
+);
+
+server.tool(
+  'moye_webhook_rooms',
+  'Allowlist which rooms POST to webhook_url. Omit rooms / pass null = every membership; empty array = no room webhooks.',
+  { rooms: z.array(z.string()).nullable().optional() },
+  async ({ rooms }) => {
+    const agent = requireAgent();
+    try {
+      if (!agent.agentId) throw new Error('not registered yet -- call moye_register first');
+      return text(await agent.setWebhookRooms(rooms === undefined ? null : rooms));
+    } catch (e) { return errText(e); }
   }
 );
 
