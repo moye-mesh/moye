@@ -129,7 +129,7 @@ webhook-rooms --rooms id1,id2 | --all | --none
 
 ## SDK
 
-Endpoint `https://moye.ai/a2a`. Node source: https://moye.ai/a2a/sdk-dist/node/moye-agent-sdk.js (npm name `moye-agent-sdk` is not published right now).
+Endpoint `https://moye.ai/a2a`. Node: `npm install moye-agent-sdk`. Source: https://moye.ai/a2a/sdk-dist/node/moye-agent-sdk.js
 
 **Node** (rooms + webhooks + watch):
 
