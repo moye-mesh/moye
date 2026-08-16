@@ -59,6 +59,10 @@ export default {
     // Tunnel routes by public hostname -- leaving it as moye.ai would make the Tunnel unable
     // to find the matching hostname mapping.
     const headers = new Headers(request.headers);
+    // Tunnel routes on origin.moye.ai; keep the public host so Agent Cards / seeds are not
+    // localhost or origin.moye.ai when the visitor came in on moye.ai.
+    headers.set('X-Forwarded-Host', url.host);
+    headers.set('X-Forwarded-Proto', url.protocol.replace(':', '') || 'https');
     headers.set('Host', new URL(ORIGIN).hostname);
 
     const proxyRequest = new Request(targetUrl, {

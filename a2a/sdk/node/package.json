@@ -1,18 +1,37 @@
 {
   "name": "moye-agent-sdk",
   "version": "0.2.0",
-  "description": "Node SDK for MOYE Agent-to-Agent protocol (moye-agent-sdk.js is dependency-free; p2p.js is an optional libp2p direct-connect module)",
+  "description": "Node SDK for the MOYE agent protocol: identity, rooms, messages, catchup, webhooks.",
   "main": "moye-agent-sdk.js",
+  "exports": {
+    ".": "./moye-agent-sdk.js",
+    "./p2p": "./p2p.js"
+  },
+  "files": [
+    "moye-agent-sdk.js",
+    "p2p.js",
+    "README.md"
+  ],
   "license": "MIT",
   "type": "commonjs",
-  "dependencies": {
-    "@chainsafe/libp2p-noise": "^17.0.0",
-    "@chainsafe/libp2p-yamux": "^8.0.1",
-    "@libp2p/circuit-relay-v2": "^4.2.8",
-    "@libp2p/dcutr": "^3.0.23",
-    "@libp2p/identify": "^4.1.9",
-    "@libp2p/websockets": "^10.1.16",
-    "@multiformats/multiaddr": "^13.0.3",
-    "libp2p": "^3.3.5"
-  }
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/moye-mesh/moye.git",
+    "directory": "a2a/sdk/node"
+  },
+  "homepage": "https://moye.ai/docs",
+  "bugs": {
+    "url": "https://github.com/moye-mesh/moye/issues"
+  },
+  "keywords": [
+    "moye",
+    "a2a",
+    "agent",
+    "did",
+    "rooms"
+  ],
+  "author": "Holyrayer"
 }

@@ -3875,8 +3875,8 @@ app.get('/health', async (req, res) => ok(res, { service: 'moye-a2a', stage: 4, 
 const BOOTSTRAP_SEEDS = (process.env.BOOTSTRAP_SEEDS || '')
   .split(/\s+/).filter(Boolean)
   .map(s => { const [id, endpoint] = s.split('='); return { id, endpoint }; });
-function allSeeds() {
-  const seeds = [{ id: ledger.NODE_ID, endpoint: process.env.PUBLIC_ENDPOINT || `http://localhost:${PORT}` }];
+function allSeeds(req) {
+  const seeds = [{ id: ledger.NODE_ID, endpoint: publicBaseUrl(req) }];
   const seen = new Set([ledger.NODE_ID]);
   for (const p of [...PEERS, ...BOOTSTRAP_SEEDS]) if (!seen.has(p.id)) { seeds.push(p); seen.add(p.id); }
   return seeds;
@@ -3892,7 +3892,7 @@ app.get('/api/node/identity', async (req, res) => {
 // new node/agent isn't limited to hard-coded PUBLIC_ENDPOINT/BOOTSTRAP_SEEDS -- it can ask several
 // independent seeds for their view and cross-check the signatures, rather than trusting one domain.
 app.get('/api/bootstrap/seeds', async (req, res) => {
-  const seeds = allSeeds();
+  const seeds = allSeeds(req);
   const payload = JSON.stringify(seeds);
   ok(res, { node_id: ledger.NODE_ID, seeds, signed_at: Date.now(), sig: nodeIdentity.sign(payload) });
 });
@@ -3974,8 +3974,8 @@ function agentTrust(a) {
   };
 }
 
-function agentToCard(a, { extended = true } = {}) {
-  const endpoint = process.env.PUBLIC_ENDPOINT || `http://localhost:${PORT}`;
+function agentToCard(a, { extended = true, req } = {}) {
+  const endpoint = publicBaseUrl(req);
   const interfaces = agentInterfaces(a, endpoint);
   const card = {
     protocolVersion: '0.3.0',           // A2A card schema version this shape targets
@@ -4059,7 +4059,7 @@ function signCard(card) {
 app.get('/api/agents/:id/agent-card', async (req, res) => {
   const a = store.getAgent(req.params.id);
   if (!a) return fail(res, 404, 'agent not found');
-  const card = agentToCard(a, { extended: req.query.plain !== '1' });
+  const card = agentToCard(a, { extended: req.query.plain !== '1', req });
   // raw A2A shape at the top level, not the {success:true,...} envelope -- external A2A clients
   // expect the card itself. ?plain=1 drops the MOYE extension + signature for strict-A2A consumers.
   res.json(req.query.plain === '1' ? card : signCard(card));
@@ -4114,16 +4114,21 @@ function a2aTaskToJson(row) {
 function jsonRpcError(id, code, message) { return { jsonrpc: '2.0', id: id === undefined ? null : id, error: { code, message } }; }
 function jsonRpcResult(id, result) { return { jsonrpc: '2.0', id, result }; }
 function publicBaseUrl(req) {
-  // Prefer operator-set PUBLIC_ENDPOINT; otherwise derive from the incoming request so
-  // external-facing URLs (e.g. A2A streamUrl) aren't stuck on localhost when the env is unset
-  // (ops live check after M1 deploy — a2aStreamUrl newly exposed this existing config gap).
+  // Prefer operator-set PUBLIC_ENDPOINT. Else the visitor-facing host (X-Forwarded-Host from
+  // the Worker, which rewrites Host to the tunnel origin). Last resort localhost — that value
+  // must not appear on public Agent Cards / seeds when a request Host is available.
   if (process.env.PUBLIC_ENDPOINT) return process.env.PUBLIC_ENDPOINT.replace(/\/$/, '');
   if (req) {
-    const host = (req.get && req.get('host')) || req.headers.host;
+    const xfHost = String(req.headers['x-forwarded-host'] || '').split(',')[0].trim();
+    const host = xfHost || (req.get && req.get('host')) || req.headers.host;
     if (host) {
       const xf = (req.headers['x-forwarded-proto'] || '').toString().split(',')[0].trim();
       const proto = xf || req.protocol || 'http';
-      return `${proto}://${host}`;
+      const hostname = String(host).split(':')[0];
+      // Public site serves the API under /a2a (Worker strips it before this process).
+      const prefix = process.env.PUBLIC_PATH_PREFIX
+        || (/^(www\.)?moye\.ai$/i.test(hostname) ? '/a2a' : '');
+      return `${proto}://${host}${prefix}`.replace(/\/$/, '');
     }
   }
   return `http://localhost:${PORT}`;
@@ -4241,7 +4246,7 @@ app.post('/api/agents/:id/a2a-result', async (req, res) => {
 // Node-level index card -- explicitly labeled as a registry/gateway, not a single agent's card, so
 // an A2A client doesn't mistake "this whole MOYE node" for one agent.
 app.get('/.well-known/agent.json', async (req, res) => {
-  const endpoint = process.env.PUBLIC_ENDPOINT || `http://localhost:${PORT}`;
+  const endpoint = publicBaseUrl(req);
   res.json({
     name: `MOYE network (${ledger.NODE_ID})`,
     description: 'This is a MOYE registry/gateway node, not a single agent. It hosts many independently-identified agents (see agents[]), each with its own Agent Card.',
@@ -4255,7 +4260,7 @@ app.get('/.well-known/agent.json', async (req, res) => {
 
 // n4+: network self-description (machine-readable discovery entrypoint) -- agents read this to self-onboard
 app.get(['/api/network', '/.well-known/moye-net'], async (req, res) => {
-  const seeds = allSeeds();
+  const seeds = allSeeds(req);
   const endpointReachability = await p2pRelay.reachabilityHint();
   ok(res, {
     protocol: 'moye-net',

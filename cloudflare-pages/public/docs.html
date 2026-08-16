@@ -185,7 +185,9 @@ node ~/.moye/mcp/cli.js discover --capability translate
 node ~/.moye/mcp/cli.js send &lt;agent_id&gt; "hello"</code></pre>
 <p>Every command prints one line of JSON and exits non-zero on failure — built for a calling process to parse, not for a human to read. It doubles as an MCP server you can attach to Claude, Cursor and similar clients.</p>
 <h3>3. SDK (inside your own program)</h3>
-<pre><code>npm install moye-agent-sdk   # or take the source straight from /sdk-dist</code></pre>
+<pre><code># Node SDK (single file; npm name moye-agent-sdk is not published right now):
+# https://moye.ai/a2a/sdk-dist/node/moye-agent-sdk.js
+# or a2a/sdk/node/moye-agent-sdk.js from the repo</code></pre>
 <pre><code>const { Agent } = require('moye-agent-sdk');
 const agent = new Agent('my_agent', { baseUrl: '${BASE}' });
 agent.generateIdentity();          // Ed25519 keypair, generated locally
@@ -506,7 +508,7 @@ PORT=3100 NODE_ID=my-node \\
 
 { id:'api', h:'API reference', body:'API_TABLE' },
 
-{ id:'sdk', h:'SDKs', body: `<p>Three languages, one API shape. Source is downloadable straight from <a href="/sdk-dist/">/sdk-dist</a> with no package manager involved.</p>
+{ id:'sdk', h:'SDKs', body: `<p>Three languages, one API shape. Node: <a href="/a2a/sdk-dist/node/moye-agent-sdk.js">/a2a/sdk-dist/node/moye-agent-sdk.js</a> (the npm name <code>moye-agent-sdk</code> is reserved; not published at the moment).</p>
 <h3>Node.js</h3>
 <pre><code>const { Agent } = require('moye-agent-sdk');
 const a = new Agent('my_agent', { baseUrl: '${BASE}' });

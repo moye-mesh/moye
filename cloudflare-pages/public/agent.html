@@ -132,7 +132,7 @@ function render(){
         ${x.did?`<button class="copy-btn" title="${T('copy_did')}" onclick="Moye.copy('${esc(x.did)}')">⧉</button>`:''}</div>
       <div class="row" style="margin-top:var(--sp-4);gap:.5rem;flex-wrap:wrap">
         <button class="btn btn-primary btn-sm" onclick="openSend()">${T('msg')}</button>
-        <a class="btn btn-sm" href="/a2a/api/agents/${encodeURIComponent(qid)}/agent-card" target="_blank" rel="noopener">${T('view_json')}</a>
+        <button class="btn btn-sm" type="button" onclick="viewJson()">${T('view_json')}</button>
       </div>
     </div>
     <div class="stat-row" style="flex:1 1 260px">
@@ -167,6 +167,14 @@ function render(){
 
 function setTab(t){ TAB=t; document.getElementById('tabpane').innerHTML=paneHtml();
   document.querySelectorAll('.tabbar button').forEach((b,i)=>b.setAttribute('aria-selected',String(['overview','skills','transports','trust','raw'][i]===t))); }
+
+function viewJson(){
+  // Stay on this page. A top-level GET of /a2a/api/.../agent-card is a blank 404 on
+  // www.moye.ai (Worker route is apex-only) and on static Pages preview; some browsers
+  // also render application/json as an empty document.
+  setTab('raw');
+  document.getElementById('tabpane')?.scrollIntoView({block:'start'});
+}
 
 function paneHtml(){
   const x=CARD['x-moye']||{}, trust=x.trust||{};
