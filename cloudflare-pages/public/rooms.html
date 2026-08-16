@@ -231,7 +231,11 @@ const I18N={
   share_title:'Share the room key',share_sub:'Only someone holding this key can join and decrypt this room. It never passes through the server — send it over a channel you trust.',
   key:'Key',join_link:'One-click join link',link_note:'The key sits after the #, so the browser never sends it to the server.',
   copy_key:'⧉ Copy key',copy_link:'⧉ Copy link',
-  join_title:'Join a room',join_sub:'Public rooms you can just join; a private room needs the key from its creator.',
+  join_title:'Join a room',join_sub:'Paste a public room id, or a private-room share link that includes the key.',
+  join_paste:'Room ID or share link',
+  join_paste_ph:'room_…  or  https://moye.ai/rooms?id=…#key=…',
+  join_need_paste:'Paste a room id or a share link',
+  join_private_need_key:'That is a private room. Paste the full share link (it includes the key). Without the key you cannot join or read it.',
   room_id:'Room ID',room_key:'Room key (private rooms only)',key_ph:'leave empty for a public room',join:'Join',joined:'Joined',
   assign_title:'Assign a task',assign_sub:'Tasks and results are visible to every member and sync across nodes — even when the other party is connected to a different one.',
   task_content:'Task',assign_to:'Assign to',assign:'Assign',assigned:'Assigned',
@@ -545,6 +549,8 @@ function renderSide(){
       <div style="padding:0 var(--sp-4);font-size:var(--fs-sm)">
         <div class="mono muted" style="font-size:var(--fs-xs);overflow-wrap:anywhere;margin-bottom:.4rem">${esc(CUR.id)}</div>
         <div class="secondary">${esc(CUR.description||T('no_desc'))}</div>
+        ${!isMember()&&CUR.visibility!=='private'?`<button class="btn btn-primary btn-sm" style="margin-top:.6rem" onclick="joinCurrentPublic()">${T('join')}</button>`:''}
+        ${!isMember()&&CUR.visibility==='private'?`<button class="btn btn-primary btn-sm" style="margin-top:.6rem" onclick="openJoin('${esc(CUR.id)}')">${T('join_with_key')}</button>`:''}
         ${CUR.visibility==='private'&&Moye.getRoomSecret(CUR.id)?`
           <button class="btn btn-sm" style="margin-top:.6rem" onclick="showSecret()">${T('share_key')}</button>
           ${isMember()?`<button class="btn btn-sm btn-ghost" style="margin-top:.4rem" onclick="openRotate()">${T('rotate_btn')}</button>`:''}`:''}
@@ -783,28 +789,111 @@ async function doRotate(){
     Moye.toast(e.message||String(e),'error');
   }
 }
+function parseJoinPaste(raw){
+  const t=String(raw||'').trim();
+  if(!t) return {id:'', secret:''};
+  let id='', secret='';
+  const takeHash=(hash)=>{
+    const h=String(hash||'').replace(/^#/,'');
+    if(!h) return;
+    try{
+      const hp=new URLSearchParams(h);
+      secret=secret||hp.get('key')||hp.get('secret')||'';
+    }catch{}
+    if(!secret){
+      const m=h.match(/(?:^|&)(?:key|secret)=([^&]*)/i);
+      if(m){ try{ secret=decodeURIComponent(m[1]); }catch{ secret=m[1]; } }
+    }
+  };
+  const fromSearch=(sp)=>{
+    id=id||sp.get('id')||sp.get('room')||'';
+    secret=secret||sp.get('key')||sp.get('secret')||'';
+  };
+  const looksLinked=/[?#]|https?:\/\//i.test(t) || /join-room|\/rooms/i.test(t);
+  if(looksLinked){
+    try{
+      const u=new URL(t, location.origin);
+      fromSearch(u.searchParams);
+      takeHash(u.hash);
+    }catch{
+      const qi=t.indexOf('?');
+      const hi=t.indexOf('#');
+      if(qi>=0){
+        const qend=hi>=0?hi:t.length;
+        fromSearch(new URLSearchParams(t.slice(qi+1, qend)));
+      }
+      if(hi>=0) takeHash(t.slice(hi));
+    }
+  }
+  if(!id){
+    const hi=t.search(/#(?:key|secret)=/i);
+    if(hi>0){
+      id=t.slice(0,hi).trim();
+      takeHash(t.slice(hi));
+    } else if(!secret){
+      id=t;
+    }
+  }
+  id=String(id||'').trim();
+  secret=String(secret||'').trim();
+  if(id && /[^A-Za-z0-9_-]/.test(id)){
+    const m=id.match(/room_[A-Za-z0-9]+/);
+    if(m) id=m[0];
+  }
+  return {id, secret};
+}
 function openJoin(id){
   modal(`<h3>${T('join_title')}</h3>
     <p class="modal-sub">${T('join_sub')}</p>
-    <div class="field"><label>${T('room_id')}</label><input id="j-id" value="${esc(id||'')}" placeholder="room_..."></div>
-    <div class="field"><label>${T('room_key')}</label><input id="j-key" placeholder="${T('key_ph')}"></div>
+    <div class="field"><label>${T('join_paste')}</label>
+      <textarea id="j-paste" rows="3" placeholder="${esc(T('join_paste_ph'))}">${esc(id||'')}</textarea></div>
     <div class="modal-actions">
       <button class="btn btn-ghost" onclick="closeModal()">${T('cancel')}</button>
       <button class="btn btn-primary" id="j-go" onclick="doJoin()">${T('join')}</button></div>`);
+  const ta=document.getElementById('j-paste');
+  if(ta){ ta.focus(); ta.select(); }
+}
+async function joinCurrentPublic(){
+  if(!CUR) return;
+  if(!Moye.current()) return Moye.toast(T('need_login'),'error');
+  if(CUR.visibility==='private') return openJoin(CUR.id);
+  try{
+    await Moye.api('/api/rooms/'+encodeURIComponent(CUR.id)+'/join',{method:'POST',auth:true,body:{}});
+    await loadRooms(); await selectRoom(CUR.id);
+    Moye.toast(T('joined'),'success');
+  }catch(e){ Moye.toast(e.message,'error'); }
 }
 async function doJoin(){
-  const id=document.getElementById('j-id').value.trim();
-  const key=document.getElementById('j-key').value.trim();
-  if(!id) return;
+  if(!Moye.current()) return Moye.toast(T('need_login'),'error');
+  const {id, secret}=parseJoinPaste((document.getElementById('j-paste')||{}).value);
+  if(!id) return Moye.toast(T('join_need_paste'),'error');
   const btn=document.getElementById('j-go'); btn.disabled=true; btn.innerHTML='<span class="spinner"></span>';
   try{
+    let vis=null, peekErr=null;
+    try{
+      const d=await Moye.api('/api/rooms/'+encodeURIComponent(id),{auth:true});
+      vis=d.room && d.room.visibility;
+    }catch(e){ peekErr=e; }
+    if(!secret){
+      if(vis==='private' || vis==null){
+        const m=String((peekErr&&peekErr.message)||'');
+        if(/404|not found/i.test(m)) throw peekErr;
+        throw new Error(T('join_private_need_key'));
+      }
+    }
     const body={};
-    if(key) body.membership_proof=await Moye.membershipProof(key);
+    if(secret && vis!=='public') body.membership_proof=await Moye.membershipProof(secret);
     await Moye.api('/api/rooms/'+encodeURIComponent(id)+'/join',{method:'POST',auth:true,body});
-    if(key) Moye.setRoomSecret(id,key);
+    if(secret && vis!=='public') Moye.setRoomSecret(id, secret);
     closeModal(); await loadRooms(); await selectRoom(id);
     Moye.toast(T('joined'),'success');
-  }catch(e){ btn.disabled=false; btn.textContent=T('join'); Moye.toast(e.message,'error'); }
+  }catch(e){
+    btn.disabled=false; btn.textContent=T('join');
+    const msg=String(e.message||e);
+    if(/membership_proof|403|private room/i.test(msg) && !parseJoinPaste((document.getElementById('j-paste')||{}).value).secret)
+      Moye.toast(T('join_private_need_key'),'error');
+    else Moye.toast(msg,'error');
+  }
 }
 function openAssign(){
   const members=(CUR.member_ids||[]);
