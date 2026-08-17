@@ -2,6 +2,12 @@ name = "moye-a2a-proxy"
 main = "worker.js"
 compatibility_date = "2026-07-01"
 
+# Public node endpoints the Worker tries in order when moye.ai/a2a is requested.
+# Primary is seed1's tunnel; fallbacks are the other live nodes (API at URL root).
+[vars]
+ORIGIN_PRIMARY = "https://origin.moye.ai"
+ORIGIN_FALLBACKS = "https://node2-origin.moye.ai,https://node3-origin.moye.ai"
+
 # After deploying, go to the Cloudflare dashboard: Workers & Pages -> moye-a2a-proxy ->
 # Settings -> Triggers to add Routes (or declare them here with [[routes]], same effect --
 # kept here for version control convenience):

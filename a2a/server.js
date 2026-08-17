@@ -48,12 +48,27 @@ const PEERS = (process.env.PEERS || '')
 // inject forged directory records, spoof cross-node message delivery, or register sybil governance
 // nodes. Refuse to start rather than silently run wide open. Local dev / CI that genuinely wants
 // the old behavior can set ALLOW_DEFAULT_FED_SECRET=1 explicitly (documented in DEPLOY.md).
+// FED_SECRET gates write federation during the migration window. A read-only node
+// (FED_READ_ONLY=1) may start without it and only pull. ACCEPT_FED_SECRET=0 rejects the
+// shared secret on inbound writes; SEND_FED_SECRET=0 stops putting it on outbound calls.
 const DEFAULT_FED_SECRET = 'moye-fed-shared-secret';
+const FED_READ_ONLY = process.env.FED_READ_ONLY === '1';
+const ACCEPT_FED_SECRET = process.env.ACCEPT_FED_SECRET !== '0';
+const SEND_FED_SECRET = process.env.SEND_FED_SECRET !== '0';
 const FED_SECRET = process.env.FED_SECRET || DEFAULT_FED_SECRET;
-if ((!process.env.FED_SECRET || FED_SECRET === DEFAULT_FED_SECRET) && process.env.ALLOW_DEFAULT_FED_SECRET !== '1') {
+if (!FED_READ_ONLY && (!process.env.FED_SECRET || FED_SECRET === DEFAULT_FED_SECRET) && process.env.ALLOW_DEFAULT_FED_SECRET !== '1') {
   console.error('[fatal] FED_SECRET is unset or using the public default. Set a strong FED_SECRET ' +
-    '(shared across your federation nodes), or set ALLOW_DEFAULT_FED_SECRET=1 for local/testing only.');
+    '(shared across your federation nodes), or set ALLOW_DEFAULT_FED_SECRET=1 for local/testing only, ' +
+    'or FED_READ_ONLY=1 to pull without write federation.');
   process.exit(1);
+}
+
+const DEFAULT_READ_SEEDS = ['https://moye.ai/a2a', 'https://node2-origin.moye.ai', 'https://node3-origin.moye.ai'];
+const FED_READ_SEEDS = (process.env.FED_READ_SEEDS || '')
+  .split(/\s+/).filter(Boolean)
+  .map((s) => s.replace(/\/$/, ''));
+function readSeedUrls() {
+  return FED_READ_SEEDS.length ? FED_READ_SEEDS : DEFAULT_READ_SEEDS.slice();
 }
 
 // Reserved shared-state key prefixes: these namespaces back security-sensitive state (agent
@@ -69,45 +84,70 @@ const RESERVED_SHARED_PREFIXES = ['revoke:', 'reputation:'];
 // soft-fork *signaling* than its activation mechanism (MOYE has no hashpower-equivalent objective
 // threshold; adoption data here is informational, not a trigger that flips anything on by itself).
 const PROTOCOL_VERSION = '1.6';
-const PROTOCOL_FEATURES = ['capability-schema', 'verifiable-credentials', 'message-signing', 'rich-crdt', 'a2a-jsonrpc-bridge', 'portable-address-attestation', 'capability-input-filter', 'seeds-multisig-governance', 'firehose', 'message-attachments', 'room-awaiting', 'node-did-federation-auth', 'room-fork', 'slip0010', 'identity-delegation', 'session-keys', 'resolve-at', 'agent-timeline', 'gravity-search', 'room-mcp', 'shard-route', 'query-directory', 'room-state-staleness', 'room-mcp-mrtr', 'room-pinning', 'room-consolidate', 'mnemonic-identity', 'domain-verify', 'room-read-cache', 'agent-catchup', 'ask-deadline', 'agent-profile-sig', 'webhook-sig', 'room-mcp-prompts', 'room-mcp-resources', 'display-rename', 'room-webhooks'];
+const PROTOCOL_FEATURES = ['capability-schema', 'verifiable-credentials', 'message-signing', 'rich-crdt', 'a2a-jsonrpc-bridge', 'portable-address-attestation', 'capability-input-filter', 'seeds-multisig-governance', 'firehose', 'message-attachments', 'room-awaiting', 'node-did-federation-auth', 'room-fork', 'slip0010', 'identity-delegation', 'session-keys', 'resolve-at', 'agent-timeline', 'gravity-search', 'room-mcp', 'shard-route', 'query-directory', 'room-state-staleness', 'room-mcp-mrtr', 'room-pinning', 'room-consolidate', 'mnemonic-identity', 'domain-verify', 'room-read-cache', 'agent-catchup', 'ask-deadline', 'agent-profile-sig', 'webhook-sig', 'room-mcp-prompts', 'room-mcp-resources', 'display-rename', 'room-webhooks', 'fed-read-join', 'agent-home-move'];
+
+function request(url, method, body, headers, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const data = body == null ? null : (typeof body === 'string' ? body : JSON.stringify(body));
+    const lib = u.protocol === 'https:' ? require('https') : http;
+    const req = lib.request(u, {
+      method,
+      headers: { 'Content-Type': 'application/json', ...(headers || {}) },
+      timeout: timeoutMs || 8000,
+    }, (res) => {
+      let buf = ''; res.on('data', c => buf += c); res.on('end', () => {
+        let json;
+        try { json = JSON.parse(buf); } catch { json = { raw: buf }; }
+        json._httpStatus = res.statusCode;
+        resolve(json);
+      });
+    });
+    req.on('timeout', () => req.destroy(new Error('federation request timed out')));
+    req.on('error', reject);
+    if (data) req.write(data); req.end();
+  });
+}
+
+function fedPost(url, extra, timeoutMs) {
+  const body = { ...extra, ts: Date.now(), node: ledger.NODE_ID };
+  if (SEND_FED_SECRET && FED_SECRET && !FED_READ_ONLY) body.secret = FED_SECRET;
+  const data = JSON.stringify(body);
+  const headers = {
+    'Content-Type': 'application/json',
+    'X-Moye-Node-Did': nodeIdentity.did,
+    'X-Moye-Sig': nodeIdentity.sign(data),
+  };
+  return request(url, 'POST', data, headers, timeoutMs);
+}
 
 // Broadcast a newly-registered agent to peer nodes immediately (doesn't wait for the 15s reconcile cycle)
 function announceToPeers(agent) {
-  for (const peer of PEERS) {
-    const u = new URL(peer.endpoint + '/api/federation/sync');
-    const data = JSON.stringify({ since_ts: 0, remote_agents: [agent], secret: FED_SECRET });
-    const lib = u.protocol === 'https:' ? require('https') : http;
-    const req = lib.request({ hostname: u.hostname, port: u.port || (u.protocol === 'https:' ? 443 : 80),
-      path: u.pathname, method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) }, timeout: 5000 },
-      (r) => r.resume());
-    req.on('error', () => {}); req.write(data); req.end();
+  for (const peer of writePeers()) {
+    fedPost(peer.endpoint + '/api/federation/sync', {
+      since_ts: 0, remote_agents: [agent],
+    }).catch(() => {});
   }
 }
 
-// Forward an already-stored local message to a peer node (relay delivery)
-function relayToPeer(peer, payload) {
-  const u = new URL(peer.endpoint + '/api/federation/deliver');
-  const data = JSON.stringify({ ...payload, node: ledger.NODE_ID, secret: FED_SECRET });
-  const lib = u.protocol === 'https:' ? require('https') : http;
-  const req = lib.request({ hostname: u.hostname, port: u.port || (u.protocol === 'https:' ? 443 : 80),
-    path: u.pathname, method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) }, timeout: 5000 },
-    (r) => r.resume());
-  req.on('error', () => {}); req.write(data); req.end();
+// Forward an already-stored local message to a peer node (relay delivery). Resolves
+// { ok, error } so callers can return home_unreachable instead of a silent drop.
+async function relayToPeer(peer, payload) {
+  if (!peer || !peer.endpoint) return { ok: false, error: 'no peer endpoint' };
+  try {
+    const r = await fedPost(peer.endpoint + '/api/federation/deliver', { ...payload, node: ledger.NODE_ID });
+    if (r && (r.delivered || r.success)) return { ok: true };
+    return { ok: false, error: (r && (r.error || r.raw)) || 'deliver rejected' };
+  } catch (e) {
+    return { ok: false, error: e.message || String(e) };
+  }
 }
 
-// Forward a governance vote to all known peers (each vote is forwarded once; peers don't re-forward it further, to avoid loops)
 function relayVoteToAllPeers(target, voterNode, sig) {
-  for (const peer of PEERS) {
-    const u = new URL(peer.endpoint + '/api/agents/' + target + '/revoke-vote');
-    const data = JSON.stringify({ voter_node: voterNode, sig, relayed: true, secret: FED_SECRET });
-    const lib = u.protocol === 'https:' ? require('https') : http;
-    const req = lib.request({ hostname: u.hostname, port: u.port || (u.protocol === 'https:' ? 443 : 80),
-      path: u.pathname, method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) }, timeout: 5000 },
-      (r) => r.resume());
-    req.on('error', () => {}); req.write(data); req.end();
+  for (const peer of writePeers()) {
+    fedPost(peer.endpoint + '/api/agents/' + target + '/revoke-vote', {
+      voter_node: voterNode, sig, relayed: true,
+    }).catch(() => {});
   }
 }
 
@@ -140,81 +180,105 @@ async function mergeRemoteShared(shared) {
   }
   return n;
 }
-async function bootstrapFederation() {
-  if (!PEERS.length) return;
-  for (const peer of PEERS) {
-    try {
-      await request(peer.endpoint + '/api/federation/nodes',
-        'POST', { id: ledger.NODE_ID, name: ledger.NODE_ID, endpoint: process.env.PUBLIC_ENDPOINT || `http://localhost:${PORT}`, pubkey: nodeIdentity.publicKey, secret: FED_SECRET,
-          num_shards: shard.NUM_SHARDS, served_shards: shard.servedShardsList(),
-          protocol_version: PROTOCOL_VERSION, features: PROTOCOL_FEATURES });
-      const since = lastSyncTs[peer.id] || 0;
-      const syncStartedAt = Date.now();
-      // Push only local increments (owned by this node) created since the last successful round
-      // P3-6: filter by lamport (not created_at) so agent *updates* re-push after the first sync window.
-      const localAgents = Object.values(store._raw().agents).filter(a => a.home_node === ledger.NODE_ID && store.agentLamport(a) > since);
-      const localRooms = Object.values(store._raw().rooms).filter(r => r.home_node === ledger.NODE_ID && (r.created_at || 0) > since);
-      // Tombstones are sent in full every round (not since-filtered -- deletions are rare, the
-      // set stays small, and this is the only channel nodes with no local IPFS (node3) ever get
-      // them through at all, since they can't subscribe to the pubsub manifest sync).
-      // Shared state (room chat logs, room task event logs, reputation, VCs) used to reach peers ONLY
-      // through the IPFS pubsub manifest -- so a node with no local IPFS (node3) never received any of
-      // it, and room chat/tasks silently didn't federate to it at all. Ship the raw stored entries
-      // (value+lamport+owner, pre-materialization) so the receiver can run the same putShared merge
-      // laws; CRDT merges are idempotent, so re-shipping an unchanged entry is harmless.
-      const localShared = sharedSince(since);
-      const r = await request(peer.endpoint + '/api/federation/sync', 'POST',
-        { since_ts: since, remote_agents: localAgents, remote_rooms: localRooms, remote_shared: localShared, tombstones: store.getTombstones(), secret: FED_SECRET });
-      if (r.tombstones) store.mergeTombstones(r.tombstones);
-      await mergeRemoteShared(r.shared);
-      let got = 0;
-      // The tombstone checks here matter: without them, a peer that hasn't yet learned about a
-      // local deletion would keep handing back the deleted record forever, and this loop would
-      // dutifully re-add it every single reconcile cycle -- same resurrection bug the OR-Set
-      // tombstones in ipfs_store.js fix for the IPFS-pubsub path, needed here too since this is
-      // a separate merge path (HTTP, not pubsub).
-      // ADR-0008: only pull agents this node is responsible for (shard.isResponsibleFor is a no-op
-      // true when sharding is disabled, i.e. NUM_SHARDS=1 -- default, unchanged behavior).
-      // P3-6: LWW accept (not insert-only) so a peer's updated agent record can replace a stale local copy.
-      for (const a of r.agents || []) {
-        if (!a || !a.id || !a.home_node || a.home_node === ledger.NODE_ID) continue;
-        if (!shard.isResponsibleFor(a.id) || store.isTombstoned('agents', a.id)) continue;
-        const cur = store.getAgent(a.id);
-        if (!store.agentLwwWins(a, cur)) continue;
-        await store.putAgent(a.id, a, { preserveLamport: true }); got++;
-      }
-      // Rooms need the same pull-back as agents -- previously only agents were read from the
-      // response, so a room created on the peer only ever reached us via the peer's own push,
-      // never via us pulling it (silently asymmetric with the agent path; harmless in a 2-node
-      // full-mesh but a real gap once a 3rd node isn't peered with every other node directly).
-      for (const rm of r.rooms || []) if (rm.home_node && rm.home_node !== ledger.NODE_ID && !store.getRoom(rm.id) && !store.isTombstoned('rooms', rm.id)) {
+function mergePulledDirectory(r) {
+  return (async () => {
+    if (r.tombstones) store.mergeTombstones(r.tombstones);
+    await mergeRemoteShared(r.shared);
+    let got = 0;
+    for (const a of r.agents || []) {
+      if (!a || !a.id || !a.home_node || a.home_node === ledger.NODE_ID) continue;
+      if (!shard.isResponsibleFor(a.id) || store.isTombstoned('agents', a.id)) continue;
+      const cur = store.getAgent(a.id);
+      if (!store.agentLwwWins(a, cur)) continue;
+      await store.putAgent(a.id, a, { preserveLamport: true }); got++;
+    }
+    for (const rm of r.rooms || []) {
+      if (rm.home_node && rm.home_node !== ledger.NODE_ID && !store.getRoom(rm.id) && !store.isTombstoned('rooms', rm.id)) {
         await store.putRoom(rm.id, rm); got++;
       }
+    }
+    return got;
+  })();
+}
+
+let announcedReadJoin = false;
+async function announceReadJoin() {
+  if (announcedReadJoin) return;
+  const endpoint = process.env.PUBLIC_ENDPOINT || `http://localhost:${PORT}`;
+  for (const base of readSeedUrls()) {
+    try {
+      const r = await fedPost(base.replace(/\/$/, '') + '/api/federation/join-read', {
+        id: ledger.NODE_ID, name: ledger.NODE_ID, endpoint, pubkey: nodeIdentity.publicKey,
+      });
+      if (r && r.success !== false) {
+        announcedReadJoin = true;
+        console.log(`[federation] join-read on ${base}: role=${r.role || 'read'}`);
+        return;
+      }
+    } catch (e) {
+      console.log(`[federation] join-read ${base} failed: ${e.message}`);
+    }
+  }
+}
+
+async function pullFromSeeds() {
+  if (FED_READ_ONLY) await announceReadJoin();
+  const seeds = readSeedUrls();
+  const since = lastSyncTs['__pull'] || 0;
+  const started = Date.now();
+  for (const base of seeds) {
+    try {
+      const r = await request(base.replace(/\/$/, '') + '/api/federation/pull?since_ts=' + since, 'GET', null, {}, 8000);
+      if (!r || r.success === false) continue;
+      const got = await mergePulledDirectory(r);
+      lastSyncTs['__pull'] = started;
+      if (got) console.log(`[federation] pull from ${base}: ${got} remote`);
+      return;
+    } catch (e) {
+      console.log(`[federation] pull from ${base} failed: ${e.message}`);
+    }
+  }
+}
+
+async function bootstrapFederation() {
+  if (FED_READ_ONLY) {
+    await pullFromSeeds();
+    return;
+  }
+  const peers = writePeers();
+  if (!peers.length) {
+    await pullFromSeeds();
+    return;
+  }
+  for (const peer of peers) {
+    try {
+      await fedPost(peer.endpoint + '/api/federation/nodes', {
+        id: ledger.NODE_ID, name: ledger.NODE_ID,
+        endpoint: process.env.PUBLIC_ENDPOINT || `http://localhost:${PORT}`,
+        pubkey: nodeIdentity.publicKey, role: 'write',
+        num_shards: shard.NUM_SHARDS, served_shards: shard.servedShardsList(),
+        protocol_version: PROTOCOL_VERSION, features: PROTOCOL_FEATURES,
+      });
+      const since = lastSyncTs[peer.id] || 0;
+      const syncStartedAt = Date.now();
+      const localAgents = Object.values(store._raw().agents).filter(a => a.home_node === ledger.NODE_ID && store.agentLamport(a) > since);
+      const localRooms = Object.values(store._raw().rooms).filter(r => r.home_node === ledger.NODE_ID && (r.created_at || 0) > since);
+      const localShared = sharedSince(since);
+      const r = await fedPost(peer.endpoint + '/api/federation/sync', {
+        since_ts: since, remote_agents: localAgents, remote_rooms: localRooms,
+        remote_shared: localShared, tombstones: store.getTombstones(),
+      });
+      const got = await mergePulledDirectory(r);
       lastSyncTs[peer.id] = syncStartedAt;
       if (localAgents.length || localRooms.length || got) {
         console.log(`[federation] sync with ${peer.id}: pushed ${localAgents.length} local / pulled ${got} remote`);
       }
     } catch (e) { console.log(`[federation] sync with ${peer.id} failed: ${e.message}`); }
   }
+  await flushPendingDeliver().catch(() => {});
 }
 // Periodic reconcile (so newly-registered agents/rooms keep propagating)
 setInterval(() => bootstrapFederation().catch(() => {}), 15000);
-
-// Internal HTTP request helper used for federation calls
-function request(url, method, body, headers) {
-  return new Promise((resolve, reject) => {
-    const u = new URL(url);
-    const data = body ? JSON.stringify(body) : null;
-    const lib = u.protocol === 'https:' ? require('https') : http;
-    const req = lib.request(u, { method, headers: { 'Content-Type': 'application/json', ...(headers||{}) } }, (res) => {
-      let buf = ''; res.on('data', c => buf += c); res.on('end', () => {
-        try { resolve(JSON.parse(buf)); } catch { resolve({ raw: buf }); }
-      });
-    });
-    req.on('error', reject);
-    if (data) req.write(data); req.end();
-  });
-}
 
 const app = express();
 app.set('trust proxy', 1); // behind nginx: use X-Forwarded-For for req.ip (rate limiting correctness)
@@ -274,13 +338,21 @@ const stmt = {
   // rows written before the change (see migrateLegacyRoomTasks). Nothing writes to room_tasks now.
   allRoomTasks: db.prepare('SELECT id, room_id, task, assignee, result, status, created_at, updated_at FROM room_tasks'),
   listAnchors: db.prepare('SELECT chain, tx_hash, merkle_root, ts FROM anchors ORDER BY ts DESC LIMIT ?'),
-  upsertFederationNode: db.prepare(`INSERT INTO federation_nodes (id, name, endpoint, pubkey, created_at, num_shards, served_shards, features, protocol_version) VALUES (?,?,?,?,?,?,?,?,?)
-    ON CONFLICT(id) DO UPDATE SET name=excluded.name, endpoint=excluded.endpoint, pubkey=excluded.pubkey, num_shards=excluded.num_shards, served_shards=excluded.served_shards, features=excluded.features, protocol_version=excluded.protocol_version`),
-  allFederationNodes: db.prepare('SELECT id, endpoint, num_shards, served_shards FROM federation_nodes'),
+  upsertFederationNode: db.prepare(`INSERT INTO federation_nodes (id, name, endpoint, pubkey, created_at, num_shards, served_shards, features, protocol_version, role) VALUES (?,?,?,?,?,?,?,?,?,?)
+    ON CONFLICT(id) DO UPDATE SET name=excluded.name, endpoint=excluded.endpoint, pubkey=excluded.pubkey, num_shards=excluded.num_shards, served_shards=excluded.served_shards, features=excluded.features, protocol_version=excluded.protocol_version, role=COALESCE(excluded.role, federation_nodes.role)`),
+  allFederationNodes: db.prepare('SELECT id, endpoint, num_shards, served_shards, role, pubkey FROM federation_nodes'),
   allFederationNodeFeatures: db.prepare('SELECT id, features, protocol_version FROM federation_nodes'),
   ledgerCount: db.prepare('SELECT COUNT(*) AS n FROM ledger'),
-  federationNodeById: db.prepare('SELECT id, pubkey FROM federation_nodes WHERE id=?'),
+  federationNodeById: db.prepare('SELECT id, pubkey, endpoint, role FROM federation_nodes WHERE id=?'),
   countFederationNodes: db.prepare('SELECT COUNT(*) AS n FROM federation_nodes'),
+  countWriteFederationNodes: db.prepare("SELECT COUNT(*) AS n FROM federation_nodes WHERE role='write'"),
+  setFederationRole: db.prepare("UPDATE federation_nodes SET role=?, endpoint=COALESCE(?, endpoint), pubkey=COALESCE(?, pubkey) WHERE id=?"),
+  updateAgentHome: db.prepare('UPDATE agents SET home_node=? WHERE id=?'),
+  pendingDeliverInsert: db.prepare('INSERT OR REPLACE INTO pending_deliver (id, home_node, payload, created_at, attempts) VALUES (?,?,?,?,?)'),
+  pendingDeliverAll: db.prepare('SELECT id, home_node, payload, created_at, attempts FROM pending_deliver ORDER BY created_at ASC LIMIT 50'),
+  pendingDeliverDelete: db.prepare('DELETE FROM pending_deliver WHERE id=?'),
+  pendingDeliverBump: db.prepare('UPDATE pending_deliver SET attempts=? WHERE id=?'),
+  messagesToAgent: db.prepare('SELECT id, from_agent, to_agent, content, status, encrypted, nonce, sender_sig, attachments, created_at FROM messages WHERE to_agent=? ORDER BY created_at ASC'),
   upsertVote: db.prepare(`INSERT INTO governance_votes (target, voter_node, sig, ts) VALUES (?,?,?,?)
     ON CONFLICT(target, voter_node) DO UPDATE SET sig=excluded.sig, ts=excluded.ts`),
   countVotes: db.prepare('SELECT COUNT(DISTINCT voter_node) AS n FROM governance_votes WHERE target=?'),
@@ -310,6 +382,72 @@ const stmt = {
   deleteTelegramRoomBot: db.prepare('DELETE FROM telegram_room_bots WHERE room_id=? AND agent_id=?'),
   allTelegramRoomBots: db.prepare('SELECT * FROM telegram_room_bots'),
 };
+
+function peerByNodeId(id) {
+  if (!id) return null;
+  const fromEnv = PEERS.find((p) => p.id === id);
+  if (fromEnv) return fromEnv;
+  const row = stmt.federationNodeById.get(id);
+  if (row && row.endpoint) return { id: row.id, endpoint: row.endpoint, role: row.role || 'write' };
+  return null;
+}
+
+function writePeers() {
+  const out = [];
+  const seen = new Set([ledger.NODE_ID]);
+  for (const p of PEERS) {
+    if (!p.id || seen.has(p.id) || !p.endpoint) continue;
+    seen.add(p.id);
+    out.push({ id: p.id, endpoint: p.endpoint, role: 'write' });
+  }
+  for (const row of stmt.allFederationNodes.all()) {
+    if (!row.id || seen.has(row.id) || !row.endpoint) continue;
+    if ((row.role || 'write') !== 'write') continue;
+    seen.add(row.id);
+    out.push({ id: row.id, endpoint: row.endpoint, role: 'write' });
+  }
+  return out;
+}
+
+function queuePendingDeliver(homeNode, payload) {
+  const id = payload.id || newId('msg');
+  payload.id = id;
+  stmt.pendingDeliverInsert.run(id, homeNode, JSON.stringify(payload), Date.now(), 0);
+  return id;
+}
+
+async function flushPendingDeliver() {
+  const rows = stmt.pendingDeliverAll.all();
+  for (const row of rows) {
+    const peer = peerByNodeId(row.home_node);
+    let payload;
+    try { payload = JSON.parse(row.payload); } catch { stmt.pendingDeliverDelete.run(row.id); continue; }
+    if (!peer) {
+      stmt.pendingDeliverBump.run((row.attempts || 0) + 1, row.id);
+      continue;
+    }
+    const r = await relayToPeer(peer, payload);
+    if (r.ok) stmt.pendingDeliverDelete.run(row.id);
+    else stmt.pendingDeliverBump.run((row.attempts || 0) + 1, row.id);
+  }
+}
+
+function federationPullPayload(since) {
+  const agents = Object.entries(store._raw().agents)
+    .filter(([, v]) => store.agentLamport(v) > since)
+    .map(([id, v]) => ({ id, ...v }));
+  const rooms = Object.entries(store._raw().rooms)
+    .filter(([, v]) => (v.created_at || 0) > since)
+    .map(([id, v]) => ({ id, ...v }));
+  return {
+    node: ledger.NODE_ID,
+    since_ts: since,
+    agents, rooms,
+    shared: sharedSince(since),
+    tombstones: store.getTombstones(),
+    ts: Date.now(),
+  };
+}
 
 // ---- SSRF guard for agent-supplied webhook URLs ----
 // An agent registers an arbitrary webhook_url and the server POSTs message content to it. Without
@@ -694,25 +832,37 @@ function powValid(prefix, nonce) {
 }
 const ok = (res, data) => res.json({ success: true, ...data });
 const fail = (res, code, msg) => res.status(code).json({ success: false, error: msg });
+function homeUnreachable(res, home_node, extra) {
+  return res.status(503).json({
+    success: false, error: 'home_unreachable', code: 'home_unreachable',
+    home_node, queued: true, ...(extra || {}),
+  });
+}
 
 // P3-1: federation auth — FED_SECRET (legacy) OR node DID signature (X-Moye-Node-Did + X-Moye-Sig
 // over the JSON body, which must include ts). Both accepted so rolling migration is possible.
 function federationAuthorized(req) {
   const body = req.body || {};
-  if (body.secret === FED_SECRET) return { ok: true, mode: 'secret' };
+  if (ACCEPT_FED_SECRET && FED_SECRET && body.secret === FED_SECRET) {
+    return { ok: true, mode: 'secret', write: true };
+  }
   const did = (req.headers['x-moye-node-did'] || '').toString();
   const sig = (req.headers['x-moye-sig'] || '').toString();
   if (!did || !sig) return { ok: false, reason: 'missing secret or node-did headers' };
   let pubkey = null;
   let nodeId = null;
+  let role = null;
   if (did === nodeIdentity.did) {
     pubkey = nodeIdentity.publicKey;
     nodeId = ledger.NODE_ID;
+    role = 'write';
   } else {
-    const rows = db.prepare('SELECT id, pubkey FROM federation_nodes WHERE pubkey IS NOT NULL').all();
+    const rows = db.prepare('SELECT id, pubkey, role FROM federation_nodes WHERE pubkey IS NOT NULL').all();
     for (const r of rows) {
       try {
-        if (didlib.deriveDid(r.pubkey) === did) { pubkey = r.pubkey; nodeId = r.id; break; }
+        if (didlib.deriveDid(r.pubkey) === did) {
+          pubkey = r.pubkey; nodeId = r.id; role = r.role || 'write'; break;
+        }
       } catch { /* bad pem */ }
     }
   }
@@ -724,7 +874,7 @@ function federationAuthorized(req) {
     return { ok: false, reason: 'bad signature' };
   }
   if (!replayOk(sig, body)) return { ok: false, reason: 'stale or replayed signature' };
-  return { ok: true, mode: 'node-did', node_id: nodeId };
+  return { ok: true, mode: 'node-did', node_id: nodeId, write: role === 'write' };
 }
 
 // Auth: supports two modes
@@ -803,7 +953,7 @@ function sessionForbiddenPath(req) {
   if (path === '/api/credentials') return true;
   if (/\/revoke-vote$/.test(path)) return true;
   if (path === '/api/shared-state' || path === '/api/reputation') return true;
-  if (/\/overlay$/.test(path) || /\/p2p$/.test(path)) return true;
+  if (/\/overlay$/.test(path) || /\/p2p$/.test(path) || /\/home$/.test(path)) return true;
   return false;
 }
 
@@ -1886,15 +2036,10 @@ app.post('/api/agents/:id/revoke-vote', async (req, res) => {
 // seed votes away from agent-revoke targets in the same table.
 function seedsHash(seeds) { return crypto.createHash('sha256').update(JSON.stringify(seeds)).digest('hex').slice(0, 16); }
 function relaySeedVoteToAllPeers(hash, voterNode, sig) {
-  for (const peer of PEERS) {
-    const u = new URL(peer.endpoint + '/api/governance/seeds/vote');
-    const data = JSON.stringify({ hash, voter_node: voterNode, sig, relayed: true, secret: FED_SECRET });
-    const lib = u.protocol === 'https:' ? require('https') : http;
-    const req = lib.request({ hostname: u.hostname, port: u.port || (u.protocol === 'https:' ? 443 : 80),
-      path: u.pathname, method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) }, timeout: 5000 },
-      (r) => r.resume());
-    req.on('error', () => {}); req.write(data); req.end();
+  for (const peer of writePeers()) {
+    fedPost(peer.endpoint + '/api/governance/seeds/vote', {
+      hash, voter_node: voterNode, sig, relayed: true,
+    }).catch(() => {});
   }
 }
 // A node proposes a specific seeds list (and this call also casts that node's own first vote for it).
@@ -2188,12 +2333,51 @@ app.get('/api/agents/:id', async (req, res) => {
   ok(res, { agent: a });
 });
 
+app.post('/api/agents/:id/home', async (req, res) => {
+  const me = await authAgent(req);
+  if (!me) return fail(res, 401, 'Bearer token or DID sig required');
+  if (me.id !== req.params.id) return fail(res, 403, 'identity mismatch');
+  const home_node = req.body && req.body.home_node;
+  if (!home_node || typeof home_node !== 'string') return fail(res, 400, 'home_node required');
+  const a = store.getAgent(me.id);
+  if (!a) return fail(res, 404, 'agent not found');
+  const dest = home_node === ledger.NODE_ID ? { id: ledger.NODE_ID, endpoint: process.env.PUBLIC_ENDPOINT || ('http://localhost:' + PORT) } : peerByNodeId(home_node);
+  if (!dest) return fail(res, 400, 'unknown home_node');
+  const prev = a.home_node;
+  const next = { ...a, id: me.id, home_node };
+  await store.putAgent(me.id, next);
+  try { stmt.updateAgentHome.run(home_node, me.id); } catch { /* sqlite row may not exist on every node */ }
+  let drained = 0;
+  if (prev === ledger.NODE_ID && home_node !== ledger.NODE_ID) {
+    const rows = stmt.messagesToAgent.all(me.id);
+    for (const m of rows) {
+      let atts = null;
+      if (m.attachments) { try { atts = JSON.parse(m.attachments); } catch { atts = null; } }
+      const payload = {
+        type: 'message', id: m.id, from_agent: m.from_agent, to_agent: m.to_agent,
+        content: m.content, encrypted: m.encrypted ? 1 : 0, nonce: m.nonce || null,
+        sender_sig: m.sender_sig || null, attachments: atts,
+      };
+      const r = await relayToPeer(dest, payload);
+      if (r.ok) drained++;
+      else queuePendingDeliver(home_node, payload);
+    }
+  }
+  announceToPeers(next);
+  ledger.append('agent.home', { id: me.id, home_node, prev, ts: Date.now() }).catch(() => {});
+  ok(res, { agent_id: me.id, home_node, prev_home: prev, drained });
+});
+
 // ---- 4. Send a message (A2A routing, requires auth: from_agent must hold its own token) ----
 // ---- 5. Agent pulls its own messages (requires auth) ----
 app.get('/api/agents/:id/inbox', async (req, res) => {
   const me = await authAgent(req);
   if (!me) return fail(res, 401, 'Bearer token required');
   if (me.id !== req.params.id) return fail(res, 403, 'token owner mismatch');
+  const rec = store.getAgent(me.id);
+  if (rec && rec.home_node && rec.home_node !== ledger.NODE_ID) {
+    return res.status(409).json({ success: false, error: 'wrong_home', code: 'wrong_home', home_node: rec.home_node });
+  }
   const rows = stmt.inboxByAgent.all(req.params.id);
   rows.forEach(r => {
     r.encrypted = !!r.encrypted;
@@ -3275,16 +3459,20 @@ app.post('/api/messages', async (req, res, next) => {
   const sender = store.getAgent(from_agent);
   const senderLocal = sender && sender.home_node === ledger.NODE_ID;
   if (!senderLocal) {
-    // External sender: don't persist here. Relay straight to the recipient's home node;
-    // if the recipient is on this node, deliver locally + webhook only.
     if (rec0.home_node && rec0.home_node !== ledger.NODE_ID) {
-      const peer = PEERS.find(p => p.id === rec0.home_node);
-      if (peer) {
-        relayToPeer(peer, { type: 'message', id: newId('msg'), from_agent, to_agent, content, encrypted: isEnc, nonce: nonce || null, sender_sig: sender_sig || null });
-        return ok(res, { message_id: null, status: 'relayed', relayed_to: rec0.home_node, note: 'external sender: not stored locally' });
+      const peer = peerByNodeId(rec0.home_node);
+      const payload = { type: 'message', id: newId('msg'), from_agent, to_agent, content, encrypted: isEnc, nonce: nonce || null, sender_sig: sender_sig || null };
+      if (!peer) {
+        queuePendingDeliver(rec0.home_node, payload);
+        return homeUnreachable(res, rec0.home_node);
       }
+      const delivered = await relayToPeer(peer, payload);
+      if (!delivered.ok) {
+        queuePendingDeliver(rec0.home_node, payload);
+        return homeUnreachable(res, rec0.home_node);
+      }
+      return ok(res, { message_id: payload.id, status: 'relayed', relayed_to: rec0.home_node, note: 'external sender: not stored locally' });
     }
-    // Recipient is on this node: local push + webhook only, don't write to this node's message table
     const eid = newId('msg');
     pushTo(to_agent, { type: 'message', message: { id: eid, from_agent, to_agent, content, status: 'pending', encrypted: isEnc, attachments: atts } });
     if (!isEnc && rec0.webhook_url) deliverWebhook(rec0.webhook_url, { event: 'message', id: eid, from_agent, to_agent, content, attachments: atts, ts: Date.now() });
@@ -3292,13 +3480,19 @@ app.post('/api/messages', async (req, res, next) => {
   }
   const id = newId('msg');
   stmt.insertMessage.run(id, from_agent, to_agent, content, 'pending', isEnc, nonce || null, sender_sig || null, attJson, Date.now());
-  // Cross-node relay: recipient's home node isn't this one -> forward it there for delivery
   if (rec0.home_node && rec0.home_node !== ledger.NODE_ID) {
-    const peer = PEERS.find(p => p.id === rec0.home_node);
-    if (peer) {
-      relayToPeer(peer, { type: 'message', id, from_agent, to_agent, content, encrypted: isEnc, nonce: nonce || null, sender_sig: sender_sig || null, attachments: atts });
-      return ok(res, { message_id: id, status: 'relayed', relayed_to: rec0.home_node });
+    const peer = peerByNodeId(rec0.home_node);
+    const payload = { type: 'message', id, from_agent, to_agent, content, encrypted: isEnc, nonce: nonce || null, sender_sig: sender_sig || null, attachments: atts };
+    if (!peer) {
+      queuePendingDeliver(rec0.home_node, payload);
+      return homeUnreachable(res, rec0.home_node, { message_id: id });
     }
+    const delivered = await relayToPeer(peer, payload);
+    if (!delivered.ok) {
+      queuePendingDeliver(rec0.home_node, payload);
+      return homeUnreachable(res, rec0.home_node, { message_id: id });
+    }
+    return ok(res, { message_id: id, status: 'relayed', relayed_to: rec0.home_node });
   }
   pushTo(to_agent, { type: 'message', message: { id, from_agent, to_agent, content, status: 'pending', encrypted: isEnc, sender_sig: sender_sig || null, attachments: atts } });
   // Webhook bridge: if the recipient registered a webhook_url, push asynchronously (the key to zero-SDK onboarding)
@@ -3356,8 +3550,18 @@ app.post('/api/bridge/send', async (req, res) => {
   stmt.insertMessage.run(id, me.id, to, content, 'pending', isEnc, null, null, null, Date.now());
   // Cross-node relay
   if (rec0.home_node && rec0.home_node !== ledger.NODE_ID) {
-    const peer = PEERS.find(p => p.id === rec0.home_node);
-    if (peer) { relayToPeer(peer, { type: 'message', id, from_agent: me.id, to_agent: to, content, encrypted: isEnc }); return ok(res, { message_id: id, status: 'relayed', relayed_to: rec0.home_node }); }
+    const peer = peerByNodeId(rec0.home_node);
+    const payload = { type: 'message', id, from_agent: me.id, to_agent: to, content, encrypted: isEnc };
+    if (!peer) {
+      queuePendingDeliver(rec0.home_node, payload);
+      return homeUnreachable(res, rec0.home_node, { message_id: id });
+    }
+    const delivered = await relayToPeer(peer, payload);
+    if (!delivered.ok) {
+      queuePendingDeliver(rec0.home_node, payload);
+      return homeUnreachable(res, rec0.home_node, { message_id: id });
+    }
+    return ok(res, { message_id: id, status: 'relayed', relayed_to: rec0.home_node });
   }
   pushTo(to, { type: 'message', message: { id, from_agent: me.id, to_agent: to, content, status: 'pending', encrypted: isEnc } });
   // If the recipient also has a webhook, forward there too (bridges across runtimes)
@@ -3714,23 +3918,63 @@ app.get('/api/source/latest', async (req, res) => {
 app.post('/api/federation/nodes', async (req, res) => {
   const auth = federationAuthorized(req);
   if (!auth.ok) return fail(res, 401, 'invalid federation auth: ' + (auth.reason || 'secret or node-did required'));
-  const { id, name, endpoint, pubkey, num_shards, served_shards, protocol_version, features } = req.body || {};
+  if (!auth.write) return fail(res, 403, 'write federation role required');
+  const { id, name, endpoint, pubkey, num_shards, served_shards, protocol_version, features, role } = req.body || {};
   if (!id || !endpoint) return fail(res, 400, 'id and endpoint required');
-  // ADR-0008: a peer announces its own shard configuration here so this node can later give
-  // "try this peer" redirect hints for agents it doesn't have locally (see GET /api/agents/:id).
-  // ADR-0009: a peer also announces its protocol_version/features, feeding GET /api/protocol/adoption
-  // -- observable adoption data for protocol evolution, not an activation trigger (see that ADR).
-  // NULL/absent (older peer, or a field genuinely unused) is a valid, expected value -- "unknown".
+  const storedRole = role === 'read' ? 'read' : 'write';
   stmt.upsertFederationNode.run(id, name || '', endpoint, pubkey || null, Date.now(),
     Number.isFinite(num_shards) ? num_shards : null, served_shards ? JSON.stringify(served_shards) : null,
-    Array.isArray(features) ? JSON.stringify(features) : null, protocol_version || null);
-  ok(res, { node_id: id, auth_mode: auth.mode });
+    Array.isArray(features) ? JSON.stringify(features) : null, protocol_version || null, storedRole);
+  ok(res, { node_id: id, auth_mode: auth.mode, role: storedRole });
+});
+
+// Read-only join: a new node proves its DID (pubkey in body matches X-Moye-Node-Did) and is
+// recorded as role=read. It may pull; it cannot push until a write peer endorses it.
+app.post('/api/federation/join-read', async (req, res) => {
+  const body = req.body || {};
+  const did = (req.headers['x-moye-node-did'] || '').toString();
+  const sig = (req.headers['x-moye-sig'] || '').toString();
+  const { id, name, endpoint, pubkey } = body;
+  if (!id || !endpoint || !pubkey) return fail(res, 400, 'id, endpoint, and pubkey required');
+  if (!did || !sig) return fail(res, 401, 'X-Moye-Node-Did and X-Moye-Sig required');
+  let derived;
+  try { derived = didlib.deriveDid(pubkey); } catch { return fail(res, 400, 'invalid pubkey'); }
+  if (derived !== did) return fail(res, 401, 'did does not match pubkey');
+  if (!didlib.verify(pubkey, JSON.stringify(body), sig)) return fail(res, 401, 'bad signature');
+  if (!replayOk(sig, body)) return fail(res, 401, 'stale or replayed signature');
+  const existing = stmt.federationNodeById.get(id);
+  if (existing && existing.role === 'write') {
+    return ok(res, { node_id: id, role: 'write', note: 'already a write peer' });
+  }
+  if (existing && existing.pubkey && existing.pubkey !== pubkey) {
+    return fail(res, 403, 'node_id already claimed by a different pubkey');
+  }
+  stmt.upsertFederationNode.run(id, name || id, endpoint, pubkey, Date.now(), null, null, null, null, 'read');
+  ok(res, { node_id: id, role: 'read', pull: '/api/federation/pull?since_ts=0' });
+});
+
+app.post('/api/federation/endorse', async (req, res) => {
+  const auth = federationAuthorized(req);
+  if (!auth.ok) return fail(res, 401, 'invalid federation auth: ' + (auth.reason || 'secret or node-did required'));
+  if (!auth.write) return fail(res, 403, 'write federation role required');
+  const { node_id, endpoint, pubkey, role } = req.body || {};
+  if (!node_id) return fail(res, 400, 'node_id required');
+  const nextRole = role === 'read' ? 'read' : 'write';
+  const row = stmt.federationNodeById.get(node_id);
+  if (!row && (!endpoint || !pubkey)) return fail(res, 404, 'unknown node; pass endpoint and pubkey to insert');
+  if (!row) {
+    stmt.upsertFederationNode.run(node_id, node_id, endpoint, pubkey, Date.now(), null, null, null, null, nextRole);
+  } else {
+    stmt.setFederationRole.run(nextRole, endpoint || null, pubkey || null, node_id);
+  }
+  ok(res, { node_id, role: nextRole, endorsed_by: auth.node_id || ledger.NODE_ID, auth_mode: auth.mode });
 });
 
 // ---- Federation relay delivery: receive a message forwarded by a peer node, store and deliver it locally ----
 app.post('/api/federation/deliver', async (req, res) => {
   const auth = federationAuthorized(req);
   if (!auth.ok) return fail(res, 401, 'invalid federation auth: ' + (auth.reason || 'secret or node-did required'));
+  if (!auth.write) return fail(res, 403, 'write federation role required');
   const { node, type, id, from_agent, to_agent, content, encrypted, nonce, sender_sig, attachments: attIn } = req.body || {};
   if (type !== 'message' || !to_agent) return fail(res, 400, 'invalid deliver payload');
   // Only deliver to recipients owned by this node
@@ -3759,6 +4003,7 @@ app.post('/api/federation/deliver', async (req, res) => {
 app.post('/api/federation/sync', async (req, res) => {
   const auth = federationAuthorized(req);
   if (!auth.ok) return fail(res, 401, 'invalid federation auth: ' + (auth.reason || 'secret or node-did required'));
+  if (!auth.write) return fail(res, 403, 'write federation role required');
   const body = req.body || {};
   const since = parseInt(body.since_ts) || 0;
   if (body.tombstones) store.mergeTombstones(body.tombstones);
@@ -3808,8 +4053,20 @@ app.post('/api/federation/sync', async (req, res) => {
   });
 });
 
+// Incremental pull for read-only join (no write secret required).
+app.get('/api/federation/pull', async (req, res) => {
+  const since = parseInt(req.query.since_ts) || 0;
+  const head = await ledger.tail(1);
+  ok(res, { ...federationPullPayload(since), ledger_height: head.length ? head[0].seq : 0, role: FED_READ_ONLY ? 'read' : 'write' });
+});
+
 // Legacy pull-only compatibility (read-only)
 app.get('/api/federation/sync', async (req, res) => {
+  const since = parseInt(req.query.since_ts) || 0;
+  if (req.query.since_ts != null) {
+    const head = await ledger.tail(1);
+    return ok(res, { ...federationPullPayload(since), ledger_height: head.length ? head[0].seq : 0 });
+  }
   const agents = Object.entries(store._raw().agents).map(([id, v]) => ({ id, ...v }));
   const rooms = Object.entries(store._raw().rooms).map(([id, v]) => ({ id, ...v }));
   const head = await ledger.tail(1);
@@ -3878,7 +4135,11 @@ const BOOTSTRAP_SEEDS = (process.env.BOOTSTRAP_SEEDS || '')
 function allSeeds(req) {
   const seeds = [{ id: ledger.NODE_ID, endpoint: publicBaseUrl(req) }];
   const seen = new Set([ledger.NODE_ID]);
-  for (const p of [...PEERS, ...BOOTSTRAP_SEEDS]) if (!seen.has(p.id)) { seeds.push(p); seen.add(p.id); }
+  for (const p of [...PEERS, ...BOOTSTRAP_SEEDS, ...writePeers()]) {
+    if (!p || !p.id || seen.has(p.id) || !p.endpoint) continue;
+    seeds.push({ id: p.id, endpoint: p.endpoint });
+    seen.add(p.id);
+  }
   return seeds;
 }
 // This node's own identity, standalone (previously only embedded inline in federation-node
@@ -4268,7 +4529,8 @@ app.get(['/api/network', '/.well-known/moye-net'], async (req, res) => {
     // Capabilities an agent can probe for before relying on them (spec: a2a/docs/spec, local).
     features: PROTOCOL_FEATURES,
     this_node: ledger.NODE_ID,
-    role: 'seed',                       // this node is a seed/origin point
+    role: FED_READ_ONLY ? 'read' : 'seed',
+    fed_role: FED_READ_ONLY ? 'read' : 'write',
     // ADR-0006 workstream P2 (scaffolding, unverified): this node's own Yggdrasil overlay IPv6
     // address, if the operator ran scripts/setup-yggdrasil.sh and set OVERLAY_ADDR in its systemd
     // unit. null until then -- this is a discovery surface, not a claim that overlay routing works.
@@ -4317,6 +4579,10 @@ app.get(['/api/network', '/.well-known/moye-net'], async (req, res) => {
       catchup: '/api/agents/:id/catchup?since=',
       resolve_at: '/api/agents/:id/resolve?at=<ts|seq:N>',
       timeline: '/api/agents/:id/timeline',
+      agent_home: '/api/agents/:id/home  (POST {home_node}, DID-signed; session keys forbidden)',
+      fed_join_read: '/api/federation/join-read  (POST, node DID + pubkey → role=read)',
+      fed_pull: '/api/federation/pull?since_ts=  (GET, no write secret)',
+      fed_endorse: '/api/federation/endorse  (POST, write peer sets role=write|read)',
       dashboard: 'https://moye.ai/status',
     },
     // Machine-readable auth contract so a self-onboarding agent knows exactly how to authenticate
@@ -4337,6 +4603,7 @@ app.get(['/api/network', '/.well-known/moye-net'], async (req, res) => {
       markdown: 'https://moye.ai/docs.md',
       agents: 'https://moye.ai/AGENTS.md',
       llms: 'https://moye.ai/llms.txt',
+      run_node: 'https://moye.ai/run-node.md',
       sdk: '/sdk-dist',
       mcp: '/mcp-dist',
       agent_card: '/.well-known/agent.json',

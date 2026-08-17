@@ -12,11 +12,15 @@ const require = createRequire(import.meta.url);
 // Prefers the sibling copy in the full monorepo (../sdk/node/); falls back to the vendored copy
 // (./vendor/) that ships when only the mcp/ directory is downloaded standalone (see install.sh /
 // GET /mcp-dist) -- the repo layout that copy assumes doesn't exist in that case. See vendor/README.md.
-let Agent;
-try { ({ Agent } = require('../sdk/node/moye-agent-sdk.js')); }
-catch { ({ Agent } = require('./vendor/moye-agent-sdk.js')); }
+let Agent, DEFAULT_SEEDS, isLoopbackBase, isKnownPublicSeed;
+try {
+  ({ Agent, DEFAULT_SEEDS, isLoopbackBase, isKnownPublicSeed } = require('../sdk/node/moye-agent-sdk.js'));
+} catch {
+  ({ Agent, DEFAULT_SEEDS, isLoopbackBase, isKnownPublicSeed } = require('./vendor/moye-agent-sdk.js'));
+}
 
 export const BASE_URL = process.env.MOYE_BASE_URL || 'https://moye.ai/a2a';
+export { DEFAULT_SEEDS };
 const IDENTITY_DIR = path.join(os.homedir(), '.moye-mcp');
 // Legacy fixed default (kept for cli.js/setup.js, and as the fallback when no clientName is known).
 export const IDENTITY_FILE = process.env.MOYE_IDENTITY_FILE || path.join(IDENTITY_DIR, 'identity.json');
@@ -61,6 +65,33 @@ export function loadOrCreateIdentity(identityFile) {
 
 export function saveIdentity(identity, identityFile) {
   fs.writeFileSync(identityFile || IDENTITY_FILE, JSON.stringify(identity, null, 2), { mode: 0o600 });
+}
+
+function envWantsLoopback() {
+  const url = process.env.MOYE_BASE_URL;
+  return !!(url && isLoopbackBase(url));
+}
+
+// Pick a live node and remember it on the identity file. Explicit MOYE_BASE_URL to
+// loopback or an unknown self-hosted URL stays on that host (does not jump to public seeds).
+export async function bindReachableNode(agent, identity, identityFile) {
+  if (envWantsLoopback()) {
+    agent.baseUrl = process.env.MOYE_BASE_URL.replace(/\/$/, '');
+    return agent.baseUrl;
+  }
+  if (process.env.MOYE_BASE_URL) agent.baseUrl = process.env.MOYE_BASE_URL.replace(/\/$/, '');
+  else if (identity && identity.lastBaseUrl) agent.baseUrl = String(identity.lastBaseUrl).replace(/\/$/, '');
+  const extra = [];
+  if (identity && identity.lastBaseUrl) extra.push(identity.lastBaseUrl);
+  const url = await agent.ensureReachable({
+    seeds: extra,
+    includeDefaults: !process.env.MOYE_BASE_URL || isKnownPublicSeed(process.env.MOYE_BASE_URL),
+  });
+  if (identity && identity.lastBaseUrl !== url) {
+    identity.lastBaseUrl = url;
+    saveIdentity(identity, identityFile);
+  }
+  return url;
 }
 
 // Returns { agent, identity, identityFile } -- a ready-to-use Agent instance bound to the persisted

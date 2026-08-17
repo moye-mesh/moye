@@ -1,8 +1,5 @@
 /**
- * moye.ai Cloudflare Worker: forwards a2a-backend-related paths to the origin exposed via
- * Cloudflare Tunnel; all other paths (static pages) never go through this Worker at all --
- * only paths bound to a route reach here, so there's no need for a fallback like "everything
- * else goes to Pages static assets".
+ * moye.ai Cloudflare Worker: forwards a2a-backend-related paths to a live origin.
  *
  * When deploying, bind this Worker to the following routes (configure under Worker Routes in
  * the Cloudflare dashboard):
@@ -10,75 +7,102 @@
  *   moye.ai/api/guestbook
  *   moye.ai/api/count
  *   moye.ai/.well-known/moye-net
- *   moye.ai/.well-known/agent.json  (ADR-0005 direction 5: Agent Card interop, dynamic backend route)
- *   moye.ai/sdk-dist/*              (express.static SDK tarballs; no /a2a prefix)
- *   moye.ai/mcp-dist/*              (express.static MCP install stubs; no /a2a prefix)
+ *   moye.ai/.well-known/agent.json
+ *   moye.ai/sdk-dist/*
+ *   moye.ai/mcp-dist/*
  *
- * ORIGIN must match the public hostname configured in Cloudflare Tunnel (see the Cloudflare
- * migration section in docs/DEPLOY.md -- the Tunnel maps origin.moye.ai -> localhost:3100).
+ * ORIGIN_PRIMARY should match the Cloudflare Tunnel hostname for seed1 (origin.moye.ai).
+ * ORIGIN_FALLBACKS is a comma-separated list of other node public endpoints. If the primary
+ * fetch throws or returns 502/503/504/521–524, the Worker tries the next origin with the
+ * same stripped path. Casual users of moye.ai/a2a then survive seed1 being down.
  *
- * Verified end-to-end 2026-07-25: every bound route (Pages static pages, /a2a/*, the two
- * /.well-known/* endpoints, /api/count) returned 200 with correct live content post-deploy.
- *
- * New backend endpoints added since (protocol adoption, seeds governance, contributions,
- * DHT-based DID resolution, A2A JSON-RPC bridge, credentials, firehose /api/stream, etc.) all
- * live under the existing /a2a/* wildcard above -- none of them need a new Worker route binding
- * here. Explicit routes are only needed for bare paths that are not under /a2a/* and would
- * otherwise be answered by Pages as missing static files (/.well-known/*, /api/guestbook,
- * /api/count, /sdk-dist/*, /mcp-dist/*).
- *
- * Note on SSE/NDJSON firehose (ADR-0013): long-lived streaming responses go through this Worker
- * as ordinary proxied HTTP. Cloudflare may idle-timeout very quiet connections; clients should
- * reconnect (the /stream page and any serious subscriber already do).
+ * Tunnel still routes by Host: each attempt rewrites Host to that origin's hostname and
+ * sets X-Forwarded-Host to the public moye.ai host so Agent Cards stay visitor-facing.
  */
 
-const ORIGIN = 'https://origin.moye.ai';
+export const DEFAULT_ORIGINS = [
+  'https://origin.moye.ai',
+  'https://node2-origin.moye.ai',
+  'https://node3-origin.moye.ai',
+];
+
+export const FAILOVER_STATUSES = new Set([502, 503, 504, 521, 522, 523, 524]);
+
+export function parseOrigins(primary, fallbacks) {
+  const out = [];
+  const seen = new Set();
+  const raw = [primary, ...String(fallbacks || '').split(',')];
+  for (const u of raw) {
+    const t = String(u || '').trim().replace(/\/$/, '');
+    if (!t || seen.has(t)) continue;
+    seen.add(t);
+    out.push(t);
+  }
+  return out.length ? out : DEFAULT_ORIGINS.slice();
+}
+
+export function shouldFailoverStatus(status) {
+  return FAILOVER_STATUSES.has(Number(status));
+}
+
+/** Origin 503 can be Cloudflare dying *or* application `home_unreachable`. Only hop the former. */
+export async function shouldFailoverResponse(res) {
+  if (!res || !shouldFailoverStatus(res.status)) return false;
+  if (res.status !== 503) return true;
+  try {
+    const j = JSON.parse(await res.clone().text());
+    if (j && (j.code === 'home_unreachable' || j.error === 'home_unreachable')) return false;
+  } catch { /* non-JSON gateway 503 */ }
+  return true;
+}
+
+function rewritePath(pathname) {
+  let path = pathname;
+  if (path === '/a2a' || path.startsWith('/a2a/')) path = path.slice(4) || '/';
+  return path;
+}
+
+function proxyRequest(request, origin, url, path) {
+  const headers = new Headers(request.headers);
+  headers.set('X-Forwarded-Host', url.host);
+  headers.set('X-Forwarded-Proto', url.protocol.replace(':', '') || 'https');
+  headers.set('Host', new URL(origin).hostname);
+  return new Request(origin + path + url.search, {
+    method: request.method,
+    headers,
+    body: request.body,
+    redirect: 'manual',
+  });
+}
 
 export default {
-  async fetch(request) {
+  async fetch(request, env) {
     const url = new URL(request.url);
-    // Status UI moved to Cloudflare Pages (/status). Keep old dashboard bookmarks working
-    // even before every origin node has picked up the Express redirect.
     if (url.pathname === '/a2a/dashboard' || url.pathname.startsWith('/a2a/dashboard/')) {
       return Response.redirect(url.origin + '/status', 302);
     }
-    // The old nginx config was `location /a2a/ { proxy_pass http://127.0.0.1:3100/; }` --
-    // the trailing slash makes nginx strip the /a2a prefix when forwarding, and all the routes
-    // server.js registers on the backend have no /a2a prefix (e.g. /health, not /a2a/health).
-    // We need to replicate that same prefix-stripping behavior here, otherwise every /a2a/*
-    // request to the origin would 404 -- only /api/guestbook, /api/count, and
-    // /.well-known/moye-net already have no /a2a prefix, so those don't need stripping.
-    let path = url.pathname;
-    if (path === '/a2a' || path.startsWith('/a2a/')) {
-      path = path.slice(4) || '/';
+    const path = rewritePath(url.pathname);
+    const origins = parseOrigins(
+      (env && env.ORIGIN_PRIMARY) || DEFAULT_ORIGINS[0],
+      (env && env.ORIGIN_FALLBACKS) || DEFAULT_ORIGINS.slice(1).join(','),
+    );
+    const isWs = (request.headers.get('Upgrade') || '').toLowerCase() === 'websocket';
+    let lastErr = null;
+    for (let i = 0; i < origins.length; i++) {
+      const origin = origins[i];
+      const last = i === origins.length - 1;
+      try {
+        const inbound = (!isWs && !last) ? request.clone() : request;
+        const res = await fetch(proxyRequest(inbound, origin, url, path));
+        if (!last && await shouldFailoverResponse(res)) continue;
+        return res;
+      } catch (e) {
+        lastErr = e;
+        if (last) {
+          return new Response('moye-net origin unreachable: ' + (e.message || String(e)), { status: 502 });
+        }
+      }
     }
-    const targetUrl = ORIGIN + path + url.search;
-
-    // Builds a new request from the original method/headers/body, swapping only the URL;
-    // the Host header is explicitly rewritten to the origin's own hostname, since Cloudflare
-    // Tunnel routes by public hostname -- leaving it as moye.ai would make the Tunnel unable
-    // to find the matching hostname mapping.
-    const headers = new Headers(request.headers);
-    // Tunnel routes on origin.moye.ai; keep the public host so Agent Cards / seeds are not
-    // localhost or origin.moye.ai when the visitor came in on moye.ai.
-    headers.set('X-Forwarded-Host', url.host);
-    headers.set('X-Forwarded-Proto', url.protocol.replace(':', '') || 'https');
-    headers.set('Host', new URL(ORIGIN).hostname);
-
-    const proxyRequest = new Request(targetUrl, {
-      method: request.method,
-      headers,
-      body: request.body,
-      redirect: 'manual',
-    });
-
-    try {
-      // fetch() natively supports passing through WebSocket upgrades (Upgrade/Connection
-      // headers + 101 response), no need to handle WebSocketPair manually -- this is just a
-      // plain reverse proxy.
-      return await fetch(proxyRequest);
-    } catch (e) {
-      return new Response('moye-net origin unreachable: ' + e.message, { status: 502 });
-    }
+    return new Response('moye-net origin unreachable: ' + (lastErr && lastErr.message || 'all origins failed'), { status: 502 });
   },
 };

@@ -22,8 +22,9 @@
 //   assign-task --room <room_id> --task "<text>" --assignees id1,id2
 //   issue-credential --subject <did> --claim '<json>' [--expires-at <ms>]
 //   credentials [agent_id]
+//   move-home --node <node_id>
 //   verify-ledger
-import { loadAgent, saveIdentity, BASE_URL, IDENTITY_FILE, resolveIdentityFile } from './identity.js';
+import { loadAgent, saveIdentity, IDENTITY_FILE, resolveIdentityFile, bindReachableNode } from './identity.js';
 import { agentDocsPayload } from './agent_channels.js';
 import { createRequire } from 'module';
 import { spawn } from 'child_process';
@@ -44,12 +45,24 @@ function flag(name, fallback) {
 function csv(v) { return (v || '').split(',').map(s => s.trim()).filter(Boolean); }
 
 const [, , cmd, ...rest] = process.argv;
-const { agent, identity } = loadAgent();
+const { agent, identity, identityFile } = loadAgent();
 
 async function main() {
+  if (cmd && !['docs', 'export-identity', 'import-identity'].includes(cmd)) {
+    await bindReachableNode(agent, identity, identityFile);
+  }
   switch (cmd) {
-    case 'whoami':
-      return out({ did: agent.did, agent_id: agent.agentId || null, registered: !!agent.agentId, base_url: BASE_URL });
+    case 'whoami': {
+      const info = { did: agent.did, agent_id: agent.agentId || null, registered: !!agent.agentId, base_url: agent.baseUrl };
+      if (agent.agentId) {
+        try {
+          const p = await agent.profile();
+          info.home_node = p.home_node || null;
+          info.name = p.name || null;
+        } catch { /* directory miss is not fatal for whoami */ }
+      }
+      return out(info);
+    }
 
     case 'docs':
       return out(agentDocsPayload());
@@ -86,7 +99,7 @@ async function main() {
       const webhookUrl = flag('webhook-url', null);
       if (webhookUrl) agent.webhookUrl = webhookUrl;
       const agentId = await agent.register();
-      saveIdentity({ did: agent.did, privateKey: identity.privateKey, agentId, token: agent.token || null });
+      saveIdentity({ ...identity, did: agent.did, privateKey: identity.privateKey, agentId, token: agent.token || null }, identityFile);
       return out({ agent_id: agentId, did: agent.did });
     }
 
@@ -94,7 +107,7 @@ async function main() {
       const q = flag('q', ''); const capability = flag('capability', '');
       // Agent.discover is a static method; agent.constructor is the same Agent class this
       // identity was built from (avoids a second import of the SDK just for one static call).
-      return out({ agents: await agent.constructor.discover({ q, capability, baseUrl: BASE_URL }) });
+      return out({ agents: await agent.constructor.discover({ q, capability, baseUrl: agent.baseUrl }) });
     }
 
     // ADR-0006 workstream J: resolve a bare DID to an agent record (local fast path, then DHT
@@ -102,7 +115,7 @@ async function main() {
     case 'resolve-did': {
       const [did] = rest;
       if (!did) return fail('usage: resolve-did <did:moye:...>');
-      return out(await agent.constructor.resolveDid(did, { baseUrl: BASE_URL }));
+      return out(await agent.constructor.resolveDid(did, { baseUrl: agent.baseUrl }));
     }
 
     // Convenience: discover-by-capability + send in one step, for "I need a specialist for X"
@@ -118,7 +131,7 @@ async function main() {
       const task = taskParts.join(' ');
       if (!capability || !task) return fail('usage: delegate --capability <name> <task description...>');
       if (!agent.agentId) return fail('not registered yet -- run: register --name <name>');
-      const candidates = await agent.constructor.discover({ capability, baseUrl: BASE_URL });
+      const candidates = await agent.constructor.discover({ capability, baseUrl: agent.baseUrl });
       const alive = candidates.filter(a => !a.revoked && a.id !== agent.agentId);
       if (!alive.length) return fail(`no agent found with capability "${capability}"`);
       alive.sort((a, b) => (b.reputation || 0) - (a.reputation || 0));
@@ -317,8 +330,15 @@ async function main() {
       return out({ credentials: await agent.credentials(targetId || agent.agentId) });
     }
 
+    case 'move-home': {
+      if (!agent.agentId) return fail('not registered yet -- run: register --name <name>');
+      const home = flag('node', rest[0]);
+      if (!home) return fail('usage: move-home --node <node_id>');
+      return out(await agent.moveHome(home));
+    }
+
     case 'verify-ledger': {
-      const res = await fetch(BASE_URL.replace(/\/$/, '') + '/api/ledger/verify');
+      const res = await fetch(agent.baseUrl.replace(/\/$/, '') + '/api/ledger/verify');
       return out(await res.json());
     }
 
@@ -396,7 +416,7 @@ async function main() {
       // Long-running: hand off stdio; identity via env already set for this process.
       const child = spawn(process.execPath, args, {
         stdio: 'inherit',
-        env: { ...process.env, MOYE_IDENTITY_FILE: process.env.MOYE_IDENTITY_FILE || IDENTITY_FILE, MOYE_BASE_URL: BASE_URL },
+        env: { ...process.env, MOYE_IDENTITY_FILE: process.env.MOYE_IDENTITY_FILE || IDENTITY_FILE, MOYE_BASE_URL: agent.baseUrl },
       });
       await new Promise((resolve, reject) => {
         child.on('exit', (code) => (code === 0 || code === null ? resolve() : reject(new Error(`bridge exited ${code}`))));
@@ -431,7 +451,7 @@ async function main() {
           'room-telegram-unbind --room <id>', 'room-telegram-status',
           'export-identity', 'import-identity <json>',
           'issue-credential --subject <did> --claim \'<json>\' [--expires-at <ms>]', 'credentials [agent_id]',
-          'assign-task --room <id> --task "<t>" --assignees a,b', 'verify-ledger'],
+          'assign-task --room <id> --task "<t>" --assignees a,b', 'move-home --node <node_id>', 'verify-ledger'],
       });
   }
 }

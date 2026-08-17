@@ -79,7 +79,8 @@ CREATE TABLE IF NOT EXISTS federation_nodes (
   num_shards INTEGER,
   served_shards TEXT,
   features TEXT,
-  protocol_version TEXT
+  protocol_version TEXT,
+  role TEXT
 );
 
 -- Governance: federation node votes to revoke an agent, idempotent per (target, voter_node).
@@ -240,5 +241,19 @@ CREATE INDEX IF NOT EXISTS idx_telegram_room_bots_room ON telegram_room_bots(roo
   if (!cols.includes('features')) db.exec('ALTER TABLE federation_nodes ADD COLUMN features TEXT');
   if (!cols.includes('protocol_version')) db.exec('ALTER TABLE federation_nodes ADD COLUMN protocol_version TEXT');
 }
+
+{
+  const cols = db.prepare("PRAGMA table_info(federation_nodes)").all().map(c => c.name);
+  if (!cols.includes('role')) db.exec("ALTER TABLE federation_nodes ADD COLUMN role TEXT");
+  db.exec("UPDATE federation_nodes SET role='write' WHERE role IS NULL OR role=''");
+}
+
+db.exec(`CREATE TABLE IF NOT EXISTS pending_deliver (
+  id TEXT PRIMARY KEY,
+  home_node TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0
+)`);
 
 module.exports = db;

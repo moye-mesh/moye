@@ -119,22 +119,92 @@ function request(baseUrl, method, path, data, headers, timeoutMs) {
       let body = '';
       res.on('data', (c) => (body += c));
       res.on('end', () => {
+        const retryable = res.statusCode >= 500;
         try {
           const json = JSON.parse(body);
-          if (!json.success) return reject(new MoyeError(json.error || `HTTP ${res.statusCode}`));
+          if (!json.success) {
+            const err = new MoyeError(json.error || `HTTP ${res.statusCode}`);
+            err.statusCode = res.statusCode;
+            err.code = json.code || json.error;
+            if (json.home_node) err.home_node = json.home_node;
+            if (json.queued != null) err.queued = json.queued;
+            // Application 5xx (inbox home down) must not hop to another seed.
+            const app = err.code === 'home_unreachable' || err.code === 'wrong_home';
+            err.retryable = retryable && !app;
+            return reject(err);
+          }
           resolve(json);
         } catch (e) {
-          reject(new MoyeError('bad response: ' + body));
+          const err = new MoyeError('bad response: ' + body);
+          err.statusCode = res.statusCode;
+          err.retryable = retryable;
+          reject(err);
         }
       });
     });
-    req.on('error', reject);
-    // Only used by pickReachableBaseUrl()'s reachability probe below -- normal calls pass no
-    // timeoutMs and keep the old (no client-side timeout) behavior unchanged.
-    if (timeoutMs) req.setTimeout(timeoutMs, () => req.destroy(new MoyeError('request timed out')));
+    req.on('error', (e) => {
+      e.retryable = true;
+      reject(e);
+    });
+    // pickReachableBaseUrl / ensureReachable pass timeoutMs. Instance _req leaves this unset
+    // so long-lived JSON calls keep the previous no-client-timeout behavior.
+    if (timeoutMs) {
+      req.setTimeout(timeoutMs, () => {
+        const err = new MoyeError('request timed out');
+        err.retryable = true;
+        req.destroy(err);
+      });
+    }
     if (payload) req.write(payload);
     req.end();
   });
+}
+
+function normalizeBase(url) {
+  return String(url || '').replace(/\/$/, '');
+}
+
+function isLoopbackBase(url) {
+  try {
+    const u = new URL(normalizeBase(url));
+    return u.hostname === 'localhost' || u.hostname === '127.0.0.1'
+      || u.hostname === '::1' || u.hostname === '[::1]';
+  } catch { return false; }
+}
+
+function uniqueBases(urls) {
+  const out = [];
+  const seen = new Set();
+  for (const raw of urls || []) {
+    if (!raw) continue;
+    const c = normalizeBase(raw);
+    if (!c || seen.has(c)) continue;
+    seen.add(c);
+    out.push(c);
+  }
+  return out;
+}
+
+// Last-resort public entry points (same set as live PEERS / status). A self-hosted
+// node URL that is not in this list does not fail over onto them.
+const DEFAULT_SEEDS = [
+  'https://moye.ai/a2a',
+  'https://node2-origin.moye.ai',
+  'https://node3-origin.moye.ai',
+];
+
+function isKnownPublicSeed(url) {
+  const n = normalizeBase(url);
+  return DEFAULT_SEEDS.includes(n) || n === 'https://origin.moye.ai';
+}
+
+function isRetryableRequestError(err) {
+  if (!err) return false;
+  if (err.code === 'home_unreachable' || err.code === 'wrong_home') return false;
+  if (err.retryable) return true;
+  const code = err.code;
+  return code === 'ECONNREFUSED' || code === 'ENOTFOUND' || code === 'ECONNRESET'
+    || code === 'ETIMEDOUT' || code === 'ENETUNREACH' || code === 'EAI_AGAIN';
 }
 
 class Agent {
@@ -151,6 +221,7 @@ class Agent {
     this.token = token;
     this._priv = null;
     this.did = null;
+    this._seedList = null;
   }
 
   // ---------- DID ----------
@@ -279,7 +350,7 @@ class Agent {
     try {
       if (!this._pubCache) this._pubCache = {};
       let pub = this._pubCache[msg.from_agent];
-      if (!pub) { pub = (await request(this.baseUrl, 'GET', `/api/agents/${msg.from_agent}/pubkey`)).pubkey; this._pubCache[msg.from_agent] = pub; }
+      if (!pub) { pub = (await this._req( 'GET', `/api/agents/${msg.from_agent}/pubkey`)).pubkey; this._pubCache[msg.from_agent] = pub; }
       if (!pub) return false;
       const content_hash = crypto.createHash('sha256').update(msg.content).digest('hex');
       const canon = this._canonical({ from: msg.from_agent, to: msg.to_agent || this.agentId, content_hash });
@@ -398,7 +469,7 @@ class Agent {
     // attachP2P() is called -- doesn't affect this file's own zero-dependency nature, it's
     // purely a hook left for the p2p module.
     if (this.p2pAddrs) payload.p2p_addrs = this.p2pAddrs;
-    const r = await request(this.baseUrl, 'POST', '/api/agents', payload, this._headers());
+    const r = await this._req( 'POST', '/api/agents', payload, this._headers());
     this.agentId = r.agent_id;
     this.token = r.token;
     if (r.did) this.did = r.did;
@@ -486,7 +557,7 @@ class Agent {
 
   // Fetches the recipient's encryption public key, encrypts the content, and sends it (E2E)
   async sendEncrypted(to, plaintext, sender) {
-    const pub = await request(this.baseUrl, 'GET', `/api/agents/${to}/enc-pubkey`);
+    const pub = await this._req( 'GET', `/api/agents/${to}/enc-pubkey`);
     const cipher = this._encryptFor(pub.enc_pubkey, plaintext);
     return this.send(to, cipher, sender, /*encrypted*/ true);
   }
@@ -507,7 +578,7 @@ class Agent {
 
   async profile() {
     if (!this.agentId) throw new MoyeError('agent not registered');
-    return (await request(this.baseUrl, 'GET', `/api/agents/${this.agentId}`, null, this._headers())).agent;
+    return (await this._req( 'GET', `/api/agents/${this.agentId}`, null, this._headers())).agent;
   }
 
   // ADR-0006 workstream D3: bootstrap onboarding shouldn't hard-depend on one domain. Tries each
@@ -528,6 +599,19 @@ class Agent {
     throw new MoyeError('no reachable seed among: ' + seeds.join(', '));
   }
 
+  static seedList({ preferred, extra, includeDefaults = true } = {}) {
+    const pref = preferred == null ? [] : Array.isArray(preferred) ? preferred : [preferred];
+    const ext = extra == null ? [] : Array.isArray(extra) ? extra : [extra];
+    const defaults = includeDefaults ? DEFAULT_SEEDS : [];
+    return uniqueBases([...pref, ...ext, ...defaults]);
+  }
+
+  static endpointsFromSeedsPayload(json) {
+    const seeds = json && json.seeds;
+    if (!Array.isArray(seeds)) return [];
+    return uniqueBases(seeds.map((s) => (typeof s === 'string' ? s : s && s.endpoint)));
+  }
+
   // Convenience instance form: resolves and sets this.baseUrl in place, so it can be called before
   // register() without needing a second Agent construction step.
   async bootstrap(seeds, opts) {
@@ -535,12 +619,66 @@ class Agent {
     return this.baseUrl;
   }
 
+  // Probe current baseUrl, then other seeds. Loopback and unknown self-hosted URLs do not
+  // jump onto the public DEFAULT_SEEDS list. Last-good URL is this.baseUrl after return.
+  async ensureReachable({ seeds, skip = [], timeoutMs = 3000, refreshSeeds = true, includeDefaults } = {}) {
+    const extra = [...(this._seedList || []), ...(seeds || [])];
+    const useDefaults = includeDefaults != null
+      ? includeDefaults
+      : isKnownPublicSeed(this.baseUrl) || extra.some(isKnownPublicSeed);
+    const skipSet = new Set((skip || []).map(normalizeBase));
+    const list = Agent.seedList({
+      preferred: this.baseUrl,
+      extra,
+      includeDefaults: useDefaults,
+    }).filter((u) => !skipSet.has(u));
+    if (!list.length) throw new MoyeError('no reachable seed');
+    const chosen = await Agent.pickReachableBaseUrl(list, { timeoutMs });
+    this.baseUrl = chosen;
+    if (refreshSeeds) {
+      try {
+        const r = await request(chosen, 'GET', '/api/bootstrap/seeds', null, {}, timeoutMs);
+        const more = Agent.endpointsFromSeedsPayload(r);
+        if (more.length) {
+          this._seedList = Agent.seedList({
+            preferred: chosen,
+            extra: more,
+            includeDefaults: useDefaults,
+          });
+        }
+      } catch { /* best-effort; signed list is optional */ }
+    }
+    return this.baseUrl;
+  }
+
+  async _req(method, path, data, headers, timeoutMs) {
+    try {
+      return await request(this.baseUrl, method, path, data, headers, timeoutMs);
+    } catch (err) {
+      if (!isRetryableRequestError(err)) throw err;
+      const hasAlt = (this._seedList || []).some((u) => normalizeBase(u) !== this.baseUrl)
+        || isKnownPublicSeed(this.baseUrl);
+      if (isLoopbackBase(this.baseUrl) && !hasAlt) throw err;
+      const failed = this.baseUrl;
+      try {
+        await this.ensureReachable({ skip: [failed], includeDefaults: isKnownPublicSeed(failed) });
+      } catch (e) {
+        throw err;
+      }
+      if (this.baseUrl === failed) throw err;
+      return request(this.baseUrl, method, path, data, headers, timeoutMs);
+    }
+  }
+
   static async discover({ q = '', capability = '', baseUrl = 'https://moye.ai/a2a' } = {}) {
     const params = [];
     if (q) params.push('q=' + encodeURIComponent(q));
     if (capability) params.push('capability=' + encodeURIComponent(capability));
     const qs = params.length ? '?' + params.join('&') : '';
-    const r = await request(baseUrl.replace(/\/$/, ''), 'GET', '/api/agents' + qs);
+    const live = isLoopbackBase(baseUrl)
+      ? normalizeBase(baseUrl)
+      : await Agent.pickReachableBaseUrl(Agent.seedList({ preferred: baseUrl, includeDefaults: isKnownPublicSeed(baseUrl) || !baseUrl }), { timeoutMs: 3000 }).catch(() => normalizeBase(baseUrl));
+    const r = await request(live, 'GET', '/api/agents' + qs);
     return r.agents;
   }
 
@@ -555,7 +693,12 @@ class Agent {
   // have an agent_id (from the local fast path) or know which node to ask (from the DHT fallback),
   // use send()/discover() against that node as usual.
   static async resolveDid(did, { baseUrl = 'https://moye.ai/a2a' } = {}) {
-    const base = baseUrl.replace(/\/$/, '');
+    const base = isLoopbackBase(baseUrl)
+      ? normalizeBase(baseUrl)
+      : await Agent.pickReachableBaseUrl(
+        Agent.seedList({ preferred: baseUrl, includeDefaults: isKnownPublicSeed(baseUrl) }),
+        { timeoutMs: 3000 }
+      ).catch(() => normalizeBase(baseUrl));
     try {
       const r = await request(base, 'GET', `/api/agents/by-did/${encodeURIComponent(did)}`);
       return { found: true, via: 'local', agent_id: r.agent_id, agent: r.agent };
@@ -575,8 +718,14 @@ class Agent {
     const payload = { from_agent: from, to_agent: to, content, encrypted: !!encrypted, nonce, force_relay: !!forceRelay };
     // F3: attach sender authorship signature when we have a DID key (recipient verifies it locally)
     if (this._priv) { const s = this._senderSig(from, to, content); if (s) payload.sender_sig = s; }
-    const r = await request(this.baseUrl, 'POST', '/api/messages', payload, this._headers(this._didHeaders(payload)));
+    const r = await this._req( 'POST', '/api/messages', payload, this._headers(this._didHeaders(payload)));
     return r.message_id;
+  }
+
+  async moveHome(home_node) {
+    if (!this.agentId) throw new MoyeError('agent not registered');
+    const payload = { home_node };
+    return this._req('POST', `/api/agents/${this.agentId}/home`, payload, this._headers(this._didHeaders(payload)));
   }
 
   // Bug found via live end-to-end testing (2026-07-23, MCP server verification): this used to call
@@ -597,7 +746,7 @@ class Agent {
     if (!this.agentId) throw new MoyeError('agent not registered');
     const path = `/api/agents/${this.agentId}/inbox`;
     const headers = this._headers(this._didHeadersForGet(path));
-    const r = await request(this.baseUrl, 'GET', path, null, headers);
+    const r = await this._req( 'GET', path, null, headers);
     return r.messages.slice(0, limit);
   }
 
@@ -605,18 +754,18 @@ class Agent {
   async catchup(since = 0) {
     if (!this.agentId) throw new MoyeError('agent not registered');
     const path = `/api/agents/${this.agentId}/catchup?since=${encodeURIComponent(String(since || 0))}`;
-    return request(this.baseUrl, 'GET', path, null, this._headers(this._didHeadersForGet(`/api/agents/${this.agentId}/catchup`)));
+    return this._req( 'GET', path, null, this._headers(this._didHeadersForGet(`/api/agents/${this.agentId}/catchup`)));
   }
 
   async awaiting() {
     if (!this.agentId) throw new MoyeError('agent not registered');
     const path = `/api/agents/${this.agentId}/awaiting`;
-    return request(this.baseUrl, 'GET', path, null, this._headers(this._didHeadersForGet(path)));
+    return this._req( 'GET', path, null, this._headers(this._didHeadersForGet(path)));
   }
 
   async ack(messageId, status = 'done') {
     const payload = { status };
-    await request(this.baseUrl, 'POST', `/api/messages/${messageId}/ack`, payload, this._headers(this._didHeaders(payload)));
+    await this._req( 'POST', `/api/messages/${messageId}/ack`, payload, this._headers(this._didHeaders(payload)));
   }
 
   // Returns { room_id, visibility, secret? } -- `secret` is only present for private rooms, and only
@@ -631,7 +780,7 @@ class Agent {
     const usedSecret = isPrivate ? (secret || crypto.randomBytes(24).toString('base64url')) : null;
     const payload = { name, members };
     if (isPrivate) { payload.visibility = 'private'; payload.membership_proof = this._roomMembershipProof(usedSecret); }
-    const r = await request(this.baseUrl, 'POST', '/api/rooms', payload, this._headers(this._didHeaders(payload)));
+    const r = await this._req( 'POST', '/api/rooms', payload, this._headers(this._didHeaders(payload)));
     if (isPrivate) {
       this.rememberRoomSecret(r.room_id, usedSecret, 1);
       if (wrapMembers && members && members.length) {
@@ -651,7 +800,7 @@ class Agent {
     if (!this.agentId) throw new MoyeError('agent not registered');
     const payload = {};
     if (secret) payload.membership_proof = this._roomMembershipProof(secret);
-    const r = await request(this.baseUrl, 'POST', `/api/rooms/${roomId}/join`, payload, this._headers(this._didHeaders(payload)));
+    const r = await this._req( 'POST', `/api/rooms/${roomId}/join`, payload, this._headers(this._didHeaders(payload)));
     if (secret) this.rememberRoomSecret(roomId, secret, epoch);
     return r;
   }
@@ -677,7 +826,7 @@ class Agent {
     if (payload != null) body.payload = payload;
     if (by != null) body.by = by;
     if (this._priv) { const s = this._senderSig(this.agentId, roomId, wireContent); if (s) body.sender_sig = s; }
-    const r = await request(this.baseUrl, 'POST', `/api/rooms/${roomId}/messages`, body, this._headers(this._didHeaders(body)));
+    const r = await this._req( 'POST', `/api/rooms/${roomId}/messages`, body, this._headers(this._didHeaders(body)));
     return r.message_id;
   }
 
@@ -685,7 +834,7 @@ class Agent {
   // `decrypted` (string or null) to each message that came back encrypted.
   async roomMessages(roomId, limit = 100) {
     const path = `/api/rooms/${roomId}/messages?limit=${limit}`;
-    const r = await request(this.baseUrl, 'GET', path, null, this._headers(this._didHeadersForGet(path)));
+    const r = await this._req( 'GET', path, null, this._headers(this._didHeadersForGet(path)));
     for (const m of r.messages || []) {
       if (m.encrypted && m.content) {
         m.decrypted = this._decryptRoomContent(roomId, m.content);
@@ -764,7 +913,7 @@ class Agent {
     if (!this._encPriv) this.generateEncryptionKey();
     if (!this.agentId) return;
     try {
-      await request(this.baseUrl, 'GET', `/api/agents/${this.agentId}/enc-pubkey`);
+      await this._req( 'GET', `/api/agents/${this.agentId}/enc-pubkey`);
     } catch {
       const enc_pubkey = this._encPubkeyForRegister();
       if (!enc_pubkey) return;
@@ -786,9 +935,9 @@ class Agent {
     const failed = [];
     for (const to of agentIds || []) {
       try {
-        const agentRow = await request(this.baseUrl, 'GET', `/api/agents/${to}`);
+        const agentRow = await this._req( 'GET', `/api/agents/${to}`);
         const a = agentRow.agent || agentRow;
-        const enc = await request(this.baseUrl, 'GET', `/api/agents/${to}/enc-pubkey`);
+        const enc = await this._req( 'GET', `/api/agents/${to}/enc-pubkey`);
         const toDid = a.did || null;
         if (!toDid) { failed.push({ agent_id: to, error: 'no DID' }); continue; }
         const inner = {
@@ -836,7 +985,7 @@ class Agent {
     if (!this.agentId) throw new MoyeError('agent not registered');
     const basePath = `/api/rooms/${roomId}/wraps`;
     const path = epoch != null ? `${basePath}?epoch=${encodeURIComponent(String(epoch))}` : basePath;
-    const r = await request(this.baseUrl, 'GET', path, null, this._headers(this._didHeadersForGet(basePath)));
+    const r = await this._req( 'GET', path, null, this._headers(this._didHeadersForGet(basePath)));
     return r.wraps || [];
   }
 
@@ -967,17 +1116,17 @@ class Agent {
 
   async assignTask(roomId, task, assignees) {
     const payload = { task, assignees };
-    const r = await request(this.baseUrl, 'POST', `/api/rooms/${roomId}/tasks`, payload, this._headers(this._didHeaders(payload)));
+    const r = await this._req( 'POST', `/api/rooms/${roomId}/tasks`, payload, this._headers(this._didHeaders(payload)));
     return r.task_ids;
   }
 
   async report(roomId, taskId, result) {
     const payload = { result };
-    await request(this.baseUrl, 'POST', `/api/rooms/${roomId}/tasks/${taskId}/report`, payload, this._headers(this._didHeaders(payload)));
+    await this._req( 'POST', `/api/rooms/${roomId}/tasks/${taskId}/report`, payload, this._headers(this._didHeaders(payload)));
   }
 
   async room(roomId) {
-    return request(this.baseUrl, 'GET', `/api/rooms/${roomId}`);
+    return this._req( 'GET', `/api/rooms/${roomId}`);
   }
 
   // ---------- ADR-0005 direction 2: Verifiable Credentials ----------
@@ -1004,7 +1153,7 @@ class Agent {
     const body = { credential: vc, ts: Date.now() };
     const outerSig = await this._masterSign(Buffer.from(JSON.stringify(body)));
     const headers = this._headers({ 'X-Moye-Did': this.did, 'X-Moye-Sig': outerSig });
-    return request(this.baseUrl, 'POST', '/api/credentials', body, headers);
+    return this._req( 'POST', '/api/credentials', body, headers);
   }
 
   // ADR-0014 §2.4: mint a scoped/expiring session key. Returns the hot private key once —
@@ -1067,13 +1216,13 @@ class Agent {
   async credentials(agentId = null) {
     const id = agentId || this.agentId;
     if (!id) throw new MoyeError('agent id required');
-    return (await request(this.baseUrl, 'GET', `/api/agents/${id}/credentials`)).credentials;
+    return (await this._req( 'GET', `/api/agents/${id}/credentials`)).credentials;
   }
 
   // Reads messages newer than `since` (ms epoch, exclusive) + current awaiting set (ADR-0018 R3).
   async roomChanges(roomId, since = 0) {
     const path = `/api/rooms/${roomId}/changes?since=${encodeURIComponent(String(since || 0))}`;
-    return request(this.baseUrl, 'GET', path, null, this._headers(this._didHeadersForGet(path)));
+    return this._req( 'GET', path, null, this._headers(this._didHeadersForGet(path)));
   }
 
   // ADR-0025: reliable + transient-local room subscribe.
@@ -1189,6 +1338,7 @@ class Agent {
       backoffMs = Math.min(backoffMs * 2, 30000);
       reconnectTimer = setTimeout(() => {
         reconnectTimer = null;
+        self.ensureReachable().catch(() => {});
         if (typeof onReconnect === 'function') {
           try { onReconnect({ cursor, backoff_ms: delay }); } catch { /* */ }
         }
@@ -1310,53 +1460,58 @@ class Agent {
   }
 
   // ---------- Decentralization: ledger / federation / shared intent ----------
-  async ledger(limit = 50) { return request(this.baseUrl, 'GET', '/api/ledger?limit=' + limit); }
-  async ledgerVerify() { return request(this.baseUrl, 'GET', '/api/ledger/verify'); }
+  async ledger(limit = 50) { return this._req( 'GET', '/api/ledger?limit=' + limit); }
+  async ledgerVerify() { return this._req( 'GET', '/api/ledger/verify'); }
   async sharedIntent(intent, scope = 'global') {
     const payload = { intent, scope };
-    return request(this.baseUrl, 'POST', '/api/shared-intent', payload, this._headers(this._didHeaders(payload)));
+    return this._req( 'POST', '/api/shared-intent', payload, this._headers(this._didHeaders(payload)));
   }
   async joinFederation(nodeId, endpoint, name = '') {
-    return request(this.baseUrl, 'POST', '/api/federation/nodes', { id: nodeId, endpoint, name }, this._headers());
+    return this._req( 'POST', '/api/federation/nodes', { id: nodeId, endpoint, name }, this._headers());
   }
 
   // P4-3: ledger-anchored recovery ceremony (veto delay). Client still reconstructs mnemonic offline.
   async initiateRecovery(reason = '') {
     if (!this.agentId) throw new MoyeError('agent not registered');
     const payload = { reason: String(reason || '').slice(0, 500) };
-    return request(this.baseUrl, 'POST', `/api/agents/${this.agentId}/recovery/initiate`, payload, this._headers(this._didHeaders(payload)));
+    return this._req( 'POST', `/api/agents/${this.agentId}/recovery/initiate`, payload, this._headers(this._didHeaders(payload)));
   }
 
   async vetoRecovery() {
     if (!this.agentId) throw new MoyeError('agent not registered');
     const payload = {};
-    return request(this.baseUrl, 'POST', `/api/agents/${this.agentId}/recovery/veto`, payload, this._headers(this._didHeaders(payload)));
+    return this._req( 'POST', `/api/agents/${this.agentId}/recovery/veto`, payload, this._headers(this._didHeaders(payload)));
   }
 
   async completeRecovery() {
     if (!this.agentId) throw new MoyeError('agent not registered');
     const payload = {};
-    return request(this.baseUrl, 'POST', `/api/agents/${this.agentId}/recovery/complete`, payload, this._headers(this._didHeaders(payload)));
+    return this._req( 'POST', `/api/agents/${this.agentId}/recovery/complete`, payload, this._headers(this._didHeaders(payload)));
   }
 
   // P4-4: DNS `_moye.<domain>` TXT must contain this agent's DID.
   async verifyDomain(domain) {
     if (!this.agentId) throw new MoyeError('agent not registered');
     const payload = { domain };
-    return request(this.baseUrl, 'POST', `/api/agents/${this.agentId}/domain-verify`, payload, this._headers(this._didHeaders(payload)));
+    return this._req( 'POST', `/api/agents/${this.agentId}/domain-verify`, payload, this._headers(this._didHeaders(payload)));
   }
 
   async revokeDomain() {
     if (!this.agentId) throw new MoyeError('agent not registered');
     const payload = { revoke: true };
-    return request(this.baseUrl, 'POST', `/api/agents/${this.agentId}/domain-verify`, payload, this._headers(this._didHeaders(payload)));
+    return this._req( 'POST', `/api/agents/${this.agentId}/domain-verify`, payload, this._headers(this._didHeaders(payload)));
   }
 
   // R16: volunteer consolidation (any member).
   async consolidateRoom(roomId, { summary, checkpoint_seq, schema, payload } = {}) {
     const body = { summary, checkpoint_seq, schema, payload };
-    return request(this.baseUrl, 'POST', `/api/rooms/${roomId}/consolidate`, body, this._headers(this._didHeaders(body)));
+    return this._req( 'POST', `/api/rooms/${roomId}/consolidate`, body, this._headers(this._didHeaders(body)));
   }
 }
 
-module.exports = { Agent, MoyeError, mnemonicLib, shamirLib };
+Agent.DEFAULT_SEEDS = DEFAULT_SEEDS;
+
+module.exports = {
+  Agent, MoyeError, mnemonicLib, shamirLib,
+  DEFAULT_SEEDS, isLoopbackBase, isKnownPublicSeed,
+};

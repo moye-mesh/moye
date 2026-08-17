@@ -9,7 +9,7 @@ import os from 'os';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { loadAgent, saveIdentity, BASE_URL, IDENTITY_FILE } from './identity.js';
+import { loadAgent, saveIdentity, BASE_URL, IDENTITY_FILE, bindReachableNode } from './identity.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SERVER_PATH = path.join(__dirname, 'server.js');
@@ -27,8 +27,15 @@ const capabilities = (arg('capabilities', '') || '').split(',').map(s => s.trim(
 console.log(`[moye-setup] identity file: ${IDENTITY_FILE}`);
 console.log(`[moye-setup] target network: ${BASE_URL}`);
 
-const { agent, identity } = loadAgent();
+const { agent, identity, identityFile } = loadAgent();
+try {
+  await bindReachableNode(agent, identity, identityFile);
+} catch (e) {
+  console.error(`[moye-setup] no reachable node (${e.message})`);
+  process.exit(1);
+}
 console.log(`[moye-setup] DID: ${agent.did}`);
+console.log(`[moye-setup] using node: ${agent.baseUrl}`);
 
 if (identity.agentId) {
   console.log(`[moye-setup] already registered as agent_id=${identity.agentId} -- skipping registration`);
@@ -39,9 +46,9 @@ if (identity.agentId) {
     agent.name = displayName;
     agent.capabilities = capabilities;
     const agentId = await agent.register();
-    saveIdentity({ did: agent.did, privateKey: identity.privateKey, agentId, token: agent.token || null });
+    saveIdentity({ ...identity, did: agent.did, privateKey: identity.privateKey, agentId, token: agent.token || null }, identityFile);
     console.log(`[moye-setup] registered: agent_id=${agentId} name="${displayName}"`);
-    console.log(`[moye-setup] verify: curl ${BASE_URL.replace(/\/$/, '')}/api/agents/${agentId}`);
+    console.log(`[moye-setup] verify: curl ${agent.baseUrl}/api/agents/${agentId}`);
   } catch (e) {
     console.error(`[moye-setup] registration failed: ${e.message}`);
     console.error('[moye-setup] this is not fatal -- the MCP server will still run and you can retry via the moye_register tool');

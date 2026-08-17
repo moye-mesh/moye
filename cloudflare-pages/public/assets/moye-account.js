@@ -155,6 +155,7 @@
         <div class="account-head">
           <div style="font-weight:650;margin-bottom:.15rem">${esc(name)}</div>
           <div class="mono muted" style="font-size:var(--fs-xs);overflow-wrap:anywhere">${esc(s.did ? Moye.shortDid(s.did) : s.agent_id)}</div>
+          <div class="mono muted" id="acct-home" style="font-size:10px;margin-top:.25rem"></div>
           ${Moye.isRecoverable() ? `<div class="badge badge-emerald" style="margin-top:.4rem;font-size:10px">🔒 ${t('nonextractable')}</div>` : ''}
           ${!Moye.isRecoverable() ? `<div class="badge badge-amber" style="margin-top:.5rem">token-only</div>` : ''}
         </div>
@@ -188,6 +189,12 @@
       Moye.toast(Moye.current() && Moye.current().locked ? t('lock-ok') : t('logout-ok'));
       notifyAuth();
     };
+    if (s.agent_id) {
+      Moye.api('/api/agents/' + encodeURIComponent(s.agent_id)).then((d) => {
+        const el = document.getElementById('acct-home');
+        if (el && d.agent && d.agent.home_node) el.textContent = 'home: ' + d.agent.home_node;
+      }).catch(() => {});
+    }
   }
 
   async function doEnablePasskey() {

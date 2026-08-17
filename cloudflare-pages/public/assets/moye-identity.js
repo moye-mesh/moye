@@ -28,14 +28,108 @@
 (function (global) {
   'use strict';
 
-  const API = '/a2a';
   const DB_NAME = 'moye-identity';
   const DB_STORE = 'session';
   const DB_KEY = 'current';
   const LS_LEGACY_SESSION = 'moye.identity.v1'; // plaintext-PEM sessions, migrated on boot
   const LS_LEGACY_TOKEN = 'moye-token';
   const LS_LEGACY_ID = 'moye-id';
+  const LS_API_BASE = 'moye.apiBase';
   const PBKDF2_ITERATIONS = 600000; // OWASP guidance for PBKDF2-HMAC-SHA256
+
+  const PUBLIC_SEEDS = [
+    'https://moye.ai/a2a',
+    'https://node2-origin.moye.ai',
+    'https://node3-origin.moye.ai',
+  ];
+
+  function isLocalHost() {
+    const h = location.hostname;
+    return h === 'localhost' || h === '127.0.0.1' || h === '::1' || location.protocol === 'file:';
+  }
+
+  function queryBaseOverride() {
+    try {
+      const b = new URLSearchParams(location.search).get('base');
+      return b ? String(b).replace(/\/$/, '') : null;
+    } catch { return null; }
+  }
+
+  function uniqueBases(urls) {
+    const out = [];
+    const seen = new Set();
+    for (const raw of urls || []) {
+      if (!raw) continue;
+      const c = String(raw).replace(/\/$/, '');
+      if (!c || seen.has(c)) continue;
+      seen.add(c);
+      out.push(c);
+    }
+    return out;
+  }
+
+  function seedCandidates(skip) {
+    const skipSet = new Set((skip || []).map((s) => String(s).replace(/\/$/, '')));
+    const override = queryBaseOverride();
+    const last = (() => { try { return localStorage.getItem(LS_API_BASE); } catch { return null; } })();
+    const sameOrigin = isLocalHost() ? null : '/a2a';
+    const list = uniqueBases([override, last, sameOrigin, ...PUBLIC_SEEDS]);
+    return list.filter((u) => !skipSet.has(u));
+  }
+
+  let API = queryBaseOverride()
+    || (typeof localStorage !== 'undefined' && localStorage.getItem(LS_API_BASE))
+    || (isLocalHost() ? 'https://moye.ai/a2a' : '/a2a');
+
+  function persistApiBase(base) {
+    API = base;
+    try { localStorage.setItem(LS_API_BASE, base); } catch { /* */ }
+  }
+
+  async function probeHealth(base, timeoutMs) {
+    const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+    const t = setTimeout(() => { if (ctrl) ctrl.abort(); }, timeoutMs || 3000);
+    try {
+      const res = await fetch(String(base).replace(/\/$/, '') + '/health', ctrl ? { signal: ctrl.signal } : {});
+      const json = await res.json();
+      return !!(res.ok && json && json.success !== false);
+    } catch { return false; }
+    finally { clearTimeout(t); }
+  }
+
+  async function mergePublishedSeeds(base) {
+    try {
+      const res = await fetch(String(base).replace(/\/$/, '') + '/api/bootstrap/seeds');
+      const json = await res.json();
+      const extra = (json.seeds || []).map((s) => (typeof s === 'string' ? s : s && s.endpoint)).filter(Boolean);
+      if (extra.length) {
+        const merged = uniqueBases([base, ...extra, ...PUBLIC_SEEDS]);
+        PUBLIC_SEEDS.splice(0, PUBLIC_SEEDS.length, ...merged.filter((u) => u !== '/a2a' && /^https?:/i.test(u)));
+      }
+    } catch { /* optional */ }
+  }
+
+  let _ensureApi = null;
+  async function ensureApiBase({ skip = [], force = false } = {}) {
+    if (!force && skip.length === 0 && _ensureApi) return _ensureApi;
+    const run = (async () => {
+      if (!force && skip.length === 0 && await probeHealth(API)) {
+        await mergePublishedSeeds(API);
+        return API;
+      }
+      const list = seedCandidates(skip.concat(force ? [API] : []));
+      for (const b of list) {
+        if (await probeHealth(b)) {
+          persistApiBase(b);
+          await mergePublishedSeeds(b);
+          return API;
+        }
+      }
+      throw new Error('No reachable MOYE node');
+    })();
+    if (!skip.length && !force) _ensureApi = run.catch((e) => { _ensureApi = null; throw e; });
+    return run;
+  }
 
   const subtle = global.crypto && global.crypto.subtle;
   const enc = new TextEncoder();
@@ -193,6 +287,7 @@
       try { rec = await dbGet(DB_KEY); } catch { rec = null; }
       if (!rec) rec = await migrateLegacy();
       if (rec) { signingKey = rec.privKey || null; cached = publicView(rec); }
+      ensureApiBase().catch(() => {});
       return cached;
     })();
     return readyPromise;
@@ -433,14 +528,37 @@
         headers['Authorization'] = 'Bearer ' + s.token;
       } else throw new Error('session has no usable credential');
     }
-    const res = await fetch(API + path, {
-      method, headers,
-      body: method === 'GET' || method === 'DELETE' ? undefined : JSON.stringify(payload || {}),
-    });
-    let data;
-    try { data = await res.json(); } catch { throw new Error(`${res.status} ${res.statusText}`); }
-    if (!res.ok || data.success === false) throw new Error(data.error || `request failed (${res.status})`);
-    return data;
+    const send = async (base) => {
+      const res = await fetch(String(base).replace(/\/$/, '') + path, {
+        method, headers,
+        body: method === 'GET' || method === 'DELETE' ? undefined : JSON.stringify(payload || {}),
+      });
+      let data;
+      try { data = await res.json(); }
+      catch {
+        const e = new Error(`${res.status} ${res.statusText}`);
+        e.retryable = res.status >= 500;
+        throw e;
+      }
+      if (!res.ok || data.success === false) {
+        const e = new Error(data.error || `request failed (${res.status})`);
+        e.retryable = res.status >= 500;
+        throw e;
+      }
+      return data;
+    };
+    await ensureApiBase().catch(() => {});
+    try {
+      return await send(API);
+    } catch (err) {
+      if (!err || err.retryable === false) throw err;
+      const failed = API;
+      _ensureApi = null;
+      try { await ensureApiBase({ skip: [failed], force: true }); }
+      catch { throw err; }
+      if (API === failed) throw err;
+      return send(API);
+    }
   }
 
   /* ---------- session keys (ADR-0014 §2.4 / ADR-0043) ----------
@@ -831,7 +949,7 @@
   async function openSocket(onEvent) {
     const s = current();
     if (!s) throw new Error('not signed in');
-    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    await ensureApiBase().catch(() => {});
     let qs;
     if (signingKey && s.did) {
       const ts = Date.now();
@@ -840,7 +958,16 @@
     } else if (s.token) {
       qs = `agent=${encodeURIComponent(s.agent_id)}&token=${encodeURIComponent(s.token)}`;
     } else throw new Error('no usable credential for realtime');
-    const ws = new WebSocket(`${proto}//${location.host}${API}/ws?${qs}`);
+    let wsHref;
+    if (/^https?:/i.test(API)) {
+      const u = new URL(String(API).replace(/\/$/, '') + '/ws');
+      u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:';
+      wsHref = u.toString() + (u.search ? '&' : '?') + qs;
+    } else {
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      wsHref = `${proto}//${location.host}${API}/ws?${qs}`;
+    }
+    const ws = new WebSocket(wsHref);
     ws.addEventListener('message', (e) => {
       let d; try { d = JSON.parse(e.data); } catch { return; }
       onEvent(d);
@@ -886,7 +1013,8 @@
   }
 
   global.Moye = {
-    API, api, isSupported, ready,
+    get API() { return API; },
+    api, isSupported, ready,
     register, loginWithKey, loginWithBackupFile, inspectBackupFile, logout, forgetDevice, lockSession,
     setBackupPassphrase, downloadBackup, hasBackup, hasPasskey, isLocked,
     passkeyAvailable, enablePasskey, unlockWithPasskey, disablePasskey,

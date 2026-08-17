@@ -27,7 +27,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { createRequire } from 'module';
-import { BASE_URL, saveIdentity, loadAgent } from './identity.js';
+import { saveIdentity, loadAgent, bindReachableNode } from './identity.js';
 import { agentDocsPayload } from './agent_channels.js';
 
 const require = createRequire(import.meta.url);
@@ -56,8 +56,16 @@ const errText = (e) => ({ content: [{ type: 'text', text: `Error: ${e.message}` 
 // Defensive only: per the MCP spec, no request (including tool calls) can reach a handler before
 // the initialize handshake completes, so state.agent should always be set by the time any of these
 // run. Guards anyway rather than throwing a raw null-deref if some client ever violates that.
-function requireAgent() {
+let bindPromise = null;
+async function requireAgent() {
   if (!state.agent) throw new Error('not initialized yet (no MCP handshake received) -- this should not happen; report it as a bug');
+  if (!bindPromise) {
+    bindPromise = bindReachableNode(state.agent, state.identity, state.identityFile).catch((e) => {
+      bindPromise = null;
+      throw e;
+    });
+  }
+  await bindPromise;
   return state.agent;
 }
 
@@ -66,8 +74,8 @@ server.tool(
   'Show this MCP server\'s persistent MOYE identity for the connected client (DID, registration status, which identity file this client maps to). Call this first to see if registration is needed.',
   {},
   async () => {
-    const agent = requireAgent();
-    return text({ did: agent.did, agent_id: agent.agentId || null, registered: !!agent.agentId, base_url: BASE_URL, identity_file: state.identityFile });
+    const agent = await requireAgent();
+    return text({ did: agent.did, agent_id: agent.agentId || null, registered: !!agent.agentId, base_url: agent.baseUrl, identity_file: state.identityFile });
   }
 );
 
@@ -83,7 +91,7 @@ server.tool(
   'Cross-room catchup (source of truth if WS/webhook missed a push). Persist next_cursor from the response and pass it as since next time. Prefer this when a new chat/session starts.',
   { since: z.union([z.number(), z.string()]).optional() },
   async ({ since }) => {
-    const agent = requireAgent();
+    const agent = await requireAgent();
     try {
       if (!agent.agentId) throw new Error('not registered yet -- call moye_register first');
       return text(await agent.catchup(since == null ? 0 : since));
@@ -96,7 +104,7 @@ server.tool(
   'Set or clear this agent\'s webhook_url (node POSTs inbox + room_message). URL must be public HTTPS (SSRF guard). Encrypted rooms omit ciphertext on the POST.',
   { webhook_url: z.string().nullable().describe('https URL, or null to clear') },
   async ({ webhook_url }) => {
-    const agent = requireAgent();
+    const agent = await requireAgent();
     try {
       if (!agent.agentId) throw new Error('not registered yet -- call moye_register first');
       return text(await agent.updateProfile({ webhook_url }));
@@ -109,7 +117,7 @@ server.tool(
   'Allowlist which rooms POST to webhook_url. Omit rooms / pass null = every membership; empty array = no room webhooks.',
   { rooms: z.array(z.string()).nullable().optional() },
   async ({ rooms }) => {
-    const agent = requireAgent();
+    const agent = await requireAgent();
     try {
       if (!agent.agentId) throw new Error('not registered yet -- call moye_register first');
       return text(await agent.setWebhookRooms(rooms === undefined ? null : rooms));
@@ -122,13 +130,14 @@ server.tool(
   'Register this identity as a MOYE agent on the network (idempotent -- if already registered, returns the existing registration). No proof-of-work is needed since this identity brings its own DID pubkey.',
   { name: z.string().describe('Display name for this agent'), description: z.string().optional(), capabilities: z.array(z.string()).optional().describe('Capability names, e.g. ["translate","summarize"]') },
   async ({ name, description, capabilities }) => {
-    const agent = requireAgent();
+    const agent = await requireAgent();
     try {
       if (agent.agentId) return text({ already_registered: true, agent_id: agent.agentId, did: agent.did });
       agent.name = name; agent.description = description || ''; agent.capabilities = capabilities || [];
       if (!agent._encPriv) agent.generateEncryptionKey();
       const agentId = await agent.register();
       saveIdentity({
+        ...state.identity,
         did: agent.did, privateKey: state.identity.privateKey, agentId, token: agent.token || null,
         encPrivateKey: agent._encPriv || state.identity.encPrivateKey || null,
         encPublicKey: agent._encPubkeyForRegister ? agent._encPubkeyForRegister() : (state.identity.encPublicKey || null),
@@ -145,7 +154,10 @@ server.tool(
   'Search the MOYE agent directory by name/keyword and/or capability.',
   { q: z.string().optional(), capability: z.string().optional() },
   async ({ q, capability }) => {
-    try { return text(await Agent.discover({ q: q || '', capability: capability || '', baseUrl: BASE_URL })); }
+    try {
+      const agent = await requireAgent();
+      return text(await Agent.discover({ q: q || '', capability: capability || '', baseUrl: agent.baseUrl }));
+    }
     catch (e) { return errText(e); }
   }
 );
@@ -155,7 +167,7 @@ server.tool(
   'Send a message to another MOYE agent by its agent_id. Requires this identity to be registered first (moye_register).',
   { to: z.string().describe('Recipient agent_id'), content: z.string() },
   async ({ to, content }) => {
-    const agent = requireAgent();
+    const agent = await requireAgent();
     try { if (!agent.agentId) throw new Error('not registered yet -- call moye_register first'); return text({ message_id: await agent.send(to, content) }); }
     catch (e) { return errText(e); }
   }
@@ -166,7 +178,7 @@ server.tool(
   'Read this agent\'s inbox. Verifies each message\'s sender signature locally when present (sender_verified: true/false/null).',
   { limit: z.number().int().positive().max(50).optional() },
   async ({ limit }) => {
-    const agent = requireAgent();
+    const agent = await requireAgent();
     try { if (!agent.agentId) throw new Error('not registered yet -- call moye_register first'); return text(await agent.inboxDecrypted(limit || 50)); }
     catch (e) { return errText(e); }
   }
@@ -178,7 +190,7 @@ server.tool(
   { name: z.string(), members: z.array(z.string()).optional().describe('agent_ids to invite (sealed wrap + DM)'),
     visibility: z.enum(['public', 'private']).optional().describe('default public'), secret: z.string().optional().describe('bring your own secret instead of a random one (private rooms only)') },
   async ({ name, members, visibility, secret }) => {
-    const agent = requireAgent();
+    const agent = await requireAgent();
     try {
       const result = await agent.createRoom(name, { members: members || [], visibility: visibility || 'public', secret: secret || null });
       if (result.secret) result.warning = 'secret saved to local room vault; sealed wraps published for members when their enc_pubkey is available';
@@ -192,7 +204,7 @@ server.tool(
   'Update this agent\'s display name / profile labels. Never changes agent_id or DID. Omitted fields stay as stored on the node.',
   { name: z.string().optional(), description: z.string().optional() },
   async ({ name, description }) => {
-    const agent = requireAgent();
+    const agent = await requireAgent();
     try {
       if (!agent.agentId) throw new Error('not registered yet -- call moye_register first');
       if (name == null && description == null) throw new Error('pass name and/or description');
@@ -209,7 +221,7 @@ server.tool(
   'Rename a room display label. room_id is never rewritten. Caller must be a member.',
   { room_id: z.string(), name: z.string() },
   async ({ room_id, name }) => {
-    const agent = requireAgent();
+    const agent = await requireAgent();
     try {
       if (!agent.agentId) throw new Error('not registered yet -- call moye_register first');
       return text(await agent.renameRoom(room_id, name));
@@ -222,7 +234,7 @@ server.tool(
   'Join a room. Public rooms: no secret needed. Private rooms: pass the secret OR use moye_room_accept after a sealed invite. Secret is persisted to the local vault.',
   { room_id: z.string(), secret: z.string().optional() },
   async ({ room_id, secret }) => {
-    const agent = requireAgent();
+    const agent = await requireAgent();
     try { return text(await agent.joinRoom(room_id, secret || null)); }
     catch (e) { return errText(e); }
   }
@@ -233,7 +245,7 @@ server.tool(
   'Post a message to a room\'s shared chat log. Automatically E2E-encrypted if this agent holds the room secret (vault, create/join, or optional secret arg).',
   { room_id: z.string(), content: z.string(), secret: z.string().optional() },
   async ({ room_id, content, secret }) => {
-    const agent = requireAgent();
+    const agent = await requireAgent();
     try {
       if (secret) agent.rememberRoomSecret(room_id, secret);
       return text({ message_id: await agent.sendRoomMessage(room_id, content) });
@@ -246,7 +258,7 @@ server.tool(
   'Read a room\'s chat history. Decrypts when the vault/memory holds the room secret (or pass secret).',
   { room_id: z.string(), limit: z.number().int().positive().max(500).optional(), secret: z.string().optional() },
   async ({ room_id, limit, secret }) => {
-    const agent = requireAgent();
+    const agent = await requireAgent();
     try {
       if (secret) agent.rememberRoomSecret(room_id, secret);
       return text({ messages: await agent.roomMessages(room_id, limit || 100) });
@@ -259,7 +271,7 @@ server.tool(
   'Publish sealed room-key wraps for other agents (ciphertext only; server cannot read). Recipients call moye_room_accept. Requires recipients to have published enc_pubkey.',
   { room_id: z.string(), members: z.array(z.string()).describe('agent_ids to wrap for'), secret: z.string().optional() },
   async ({ room_id, members, secret }) => {
-    const agent = requireAgent();
+    const agent = await requireAgent();
     try {
       if (secret) agent.rememberRoomSecret(room_id, secret);
       return text(await agent.inviteToRoom(room_id, members || []));
@@ -272,7 +284,7 @@ server.tool(
   'Unwrap a sealed room-key invite for this agent, join the room, and save the secret to the local vault.',
   { room_id: z.string() },
   async ({ room_id }) => {
-    const agent = requireAgent();
+    const agent = await requireAgent();
     try {
       try { await agent._ensureEncReady(); } catch (_) { /* */ }
       return text(await agent.acceptRoomInvite(room_id));
@@ -290,7 +302,7 @@ server.tool(
     include_secret: z.boolean().optional(),
   },
   async ({ room_id, wrap_agent_ids, secret, include_secret }) => {
-    const agent = requireAgent();
+    const agent = await requireAgent();
     try {
       if (secret) agent.rememberRoomSecret(room_id, secret);
       const r = await agent.rotateRoomKey(room_id, { wrapAgentIds: wrap_agent_ids || [] });
@@ -310,7 +322,7 @@ server.tool(
     secret: z.string().optional(),
   },
   async ({ room_id, since, timeout_ms, secret }) => {
-    const agent = requireAgent();
+    const agent = await requireAgent();
     try {
       if (secret) agent.rememberRoomSecret(room_id, secret);
       const msg = await agent.watchRoomNext(room_id, {
@@ -337,7 +349,7 @@ server.tool(
   'Post a task to a room looking for volunteers (non-monetary -- visibility/reputation only, never payment). Any member can broadcast; other members respond with moye_room_claim_task, and the room creator picks one with moye_room_accept_claim.',
   { room_id: z.string(), task: z.string() },
   async ({ room_id, task }) => {
-    const agent = requireAgent();
+    const agent = await requireAgent();
     try { return text({ message_id: await agent.sendRoomMessage(room_id, task, { type: 'task-broadcast' }) }); }
     catch (e) { return errText(e); }
   }
@@ -348,7 +360,7 @@ server.tool(
   'Volunteer for a task someone broadcast in a room (moye_room_broadcast_task). ref_message_id is the id of the broadcast message being claimed.',
   { room_id: z.string(), ref_message_id: z.string(), note: z.string().optional() },
   async ({ room_id, ref_message_id, note }) => {
-    const agent = requireAgent();
+    const agent = await requireAgent();
     try { return text({ message_id: await agent.sendRoomMessage(room_id, note || 'I can take this', { type: 'task-claim', ref: ref_message_id }) }); }
     catch (e) { return errText(e); }
   }
@@ -359,7 +371,7 @@ server.tool(
   'Accept a volunteer\'s claim (moye_room_claim_task) -- ONLY the room creator can do this (server-enforced, prevents a non-creator from spoofing "who got picked" in the shared log). ref_message_id is the id of the claim message being accepted.',
   { room_id: z.string(), ref_message_id: z.string(), note: z.string().optional() },
   async ({ room_id, ref_message_id, note }) => {
-    const agent = requireAgent();
+    const agent = await requireAgent();
     try { return text({ message_id: await agent.sendRoomMessage(room_id, note || 'accepted', { type: 'task-accept', ref: ref_message_id }) }); }
     catch (e) { return errText(e); }
   }
@@ -370,7 +382,7 @@ server.tool(
   'Assign a task to one or more agents in a room (must be the room creator).',
   { room_id: z.string(), task: z.string(), assignees: z.array(z.string()) },
   async ({ room_id, task, assignees }) => {
-    const agent = requireAgent();
+    const agent = await requireAgent();
     try { return text({ task_ids: await agent.assignTask(room_id, task, assignees) }); }
     catch (e) { return errText(e); }
   }
@@ -382,7 +394,8 @@ server.tool(
   {},
   async () => {
     try {
-      const res = await fetch(BASE_URL.replace(/\/$/, '') + '/api/ledger/verify');
+      const agent = await requireAgent();
+      const res = await fetch(agent.baseUrl.replace(/\/$/, '') + '/api/ledger/verify');
       return text(await res.json());
     } catch (e) { return errText(e); }
   }

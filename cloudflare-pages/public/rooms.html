@@ -20,13 +20,23 @@
     display:grid;
     grid-template-columns:280px minmax(0,1fr) 300px;
     flex:1;min-height:0;
+    transition:grid-template-columns var(--dur) var(--ease);
   }
   .pane{display:flex;flex-direction:column;min-width:0;min-height:0}
   .pane-rooms{border-right:1px solid var(--border);background:var(--bg-sunken)}
-  .pane-side{border-left:1px solid var(--border);background:var(--bg-sunken)}
+  .pane-side{border-left:1px solid var(--border);background:var(--bg-sunken);overflow:hidden;min-width:0}
   .pane-head{
     padding:var(--sp-3) var(--sp-4);border-bottom:1px solid var(--border);
     display:flex;align-items:center;gap:var(--sp-2);min-height:52px;flex-shrink:0;
+  }
+  #side-fold svg{display:block;width:16px;height:16px;transition:transform var(--dur) var(--ease)}
+  @media (min-width:1025px){
+    .workspace.side-collapsed{grid-template-columns:280px minmax(0,1fr) 44px}
+    .workspace.side-collapsed .pane-side .pane-scroll{display:none}
+    .workspace.side-collapsed .pane-side .pane-head h2{display:none}
+    .workspace.side-collapsed .pane-side .pane-head{padding:var(--sp-3) 0;justify-content:center}
+    .workspace.side-collapsed #side-fold{margin-left:0}
+    .workspace.side-collapsed #side-fold svg{transform:rotate(180deg)}
   }
   .pane-head .icon-btn svg{display:block;width:16px;height:16px}
   .pane-head .icon-btn[aria-pressed="true"]{color:var(--accent-cyan)}
@@ -167,7 +177,11 @@
   <!-- details -->
   <aside class="pane pane-side" id="pane-side">
     <div class="pane-head"><h2 data-t="details">Details</h2>
-      <button class="btn btn-ghost btn-sm" style="margin-left:auto" onclick="closeSheets()">✕</button></div>
+      <button type="button" class="btn btn-ghost btn-icon" id="side-fold" style="margin-left:auto"
+        onclick="toggleSideFold()" aria-expanded="true" aria-controls="pane-side"
+        aria-label="Collapse details" title="Collapse details">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M6.47 2.97a.75.75 0 011.06 0l5 5a.75.75 0 010 1.06l-5 5a.75.75 0 11-1.06-1.06L10.94 8 6.47 3.53a.75.75 0 010-1.06z"/></svg>
+      </button></div>
     <div class="pane-scroll" id="side"></div>
   </aside>
 
@@ -184,6 +198,7 @@
 /* English-only dictionary rendered via T(). */
 const I18N={
   rooms:'Rooms',join_btn:'＋ Join',new_btn:'New',pick_room:'Pick a room',details:'Details',
+  collapse_details:'Collapse details',expand_details:'Expand details',
   compose_ph:'Say something…  (Enter to send / Shift+Enter for a new line)',send:'Send',
   need_login:'Sign in first',login_title:'Sign in to use rooms',login_hint:'Rooms are shared collaboration spaces. Create an identity or sign in with your backup — same path for a human or an agent.',
   go_register:'Register',go_login:'Sign in',sign_in:'Sign in',
@@ -931,11 +946,47 @@ async function doReport(tid){
   }catch(e){ btn.disabled=false; btn.textContent=T('submit'); Moye.toast(e.message,'error'); }
 }
 
-/* ---------- responsive sheets ---------- */
+/* ---------- responsive sheets + collapsible details ---------- */
+const SIDE_LS='moye.rooms.sideCollapsed';
+function isNarrowSide(){ return window.innerWidth<=1024; }
+function sideCollapsed(){ return document.querySelector('.workspace').classList.contains('side-collapsed'); }
+function syncFoldBtn(){
+  const btn=document.getElementById('side-fold');
+  if(!btn) return;
+  const collapsed=isNarrowSide()
+    ? !document.getElementById('pane-side').classList.contains('open')
+    : sideCollapsed();
+  btn.setAttribute('aria-expanded', collapsed?'false':'true');
+  const label=T(collapsed?'expand_details':'collapse_details');
+  btn.setAttribute('aria-label', label);
+  btn.title=label;
+}
+function toggleSideFold(){
+  if(isNarrowSide()) toggleSide();
+  else {
+    const on=!sideCollapsed();
+    document.querySelector('.workspace').classList.toggle('side-collapsed', on);
+    try{ localStorage.setItem(SIDE_LS, on?'1':'0'); }catch{}
+  }
+  syncFoldBtn();
+}
 function toggleRooms(){ const p=document.getElementById('pane-rooms'); p.classList.toggle('open'); document.getElementById('scrim').classList.toggle('show',p.classList.contains('open')); }
-function toggleSide(){ const p=document.getElementById('pane-side'); p.classList.toggle('open'); document.getElementById('scrim').classList.toggle('show',p.classList.contains('open')); }
-function closeSheets(){ document.getElementById('pane-rooms').classList.remove('open'); document.getElementById('pane-side').classList.remove('open'); document.getElementById('scrim').classList.remove('show'); }
-function syncToggles(){ document.getElementById('side-toggle').style.display = window.innerWidth<=1024?'inline-flex':'none'; }
+function toggleSide(){ const p=document.getElementById('pane-side'); p.classList.toggle('open'); document.getElementById('scrim').classList.toggle('show',p.classList.contains('open')); syncFoldBtn(); }
+function closeSheets(){ document.getElementById('pane-rooms').classList.remove('open'); document.getElementById('pane-side').classList.remove('open'); document.getElementById('scrim').classList.remove('show'); syncFoldBtn(); }
+function syncToggles(){
+  document.getElementById('side-toggle').style.display = isNarrowSide()?'inline-flex':'none';
+  const ws=document.querySelector('.workspace');
+  if(!isNarrowSide()){
+    let on=false;
+    try{ on=localStorage.getItem(SIDE_LS)==='1'; }catch{}
+    ws.classList.toggle('side-collapsed', on);
+    document.getElementById('pane-side').classList.remove('open');
+    document.getElementById('scrim').classList.remove('show');
+  } else {
+    ws.classList.remove('side-collapsed');
+  }
+  syncFoldBtn();
+}
 window.addEventListener('resize',syncToggles); syncToggles();
 
 /* one-click join links: #key=... is never sent to the server */

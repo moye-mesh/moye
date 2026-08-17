@@ -337,6 +337,13 @@ class Agent:
         r = self._post("/api/messages", payload, headers=headers)
         return r["message_id"]
 
+    def move_home(self, home_node: str) -> Dict[str, Any]:
+        if not self.agent_id:
+            raise MoyeError("agent not registered")
+        payload = {"home_node": home_node}
+        headers = self._did_headers(payload) if self._priv else {}
+        return self._post(f"/api/agents/{self.agent_id}/home", payload, headers=headers)
+
     def _get_did_headers(self, method: str, path: str) -> Dict[str, str]:
         """Header-only DID signing scheme for GET requests (bodyless).
 
@@ -480,7 +487,11 @@ class Agent:
         r = self._session.post(self.base_url + path, json=data, headers=h, timeout=15)
         body = r.json()
         if not body.get("success"):
-            raise MoyeError(body.get("error", f"HTTP {r.status_code}"))
+            err = MoyeError(body.get("error", f"HTTP {r.status_code}"))
+            err.code = body.get("code") or body.get("error")
+            if body.get("home_node"):
+                err.home_node = body.get("home_node")
+            raise err
         return body
 
     def _get(self, path: str, params: Optional[Dict[str, Any]] = None, auth: bool = False,
@@ -491,7 +502,11 @@ class Agent:
         r = self._session.get(self.base_url + path, params=params, headers=h, timeout=15)
         body = r.json()
         if not body.get("success"):
-            raise MoyeError(body.get("error", f"HTTP {r.status_code}"))
+            err = MoyeError(body.get("error", f"HTTP {r.status_code}"))
+            err.code = body.get("code") or body.get("error")
+            if body.get("home_node"):
+                err.home_node = body.get("home_node")
+            raise err
         return body
 
 

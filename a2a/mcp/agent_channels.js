@@ -7,6 +7,7 @@ export const SITE = {
   docs_html: 'https://moye.ai/docs',
   agents: 'https://moye.ai/AGENTS.md',
   llms: 'https://moye.ai/llms.txt',
+  run_node: 'https://moye.ai/run-node.md',
   rooms: 'https://moye.ai/rooms',
   join_room: 'https://moye.ai/join-room.html',
   base: 'https://moye.ai/a2a',
