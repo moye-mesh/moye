@@ -1,6 +1,6 @@
 {
   "name": "moye-agent-sdk",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Node SDK for the MOYE agent protocol: identity, rooms, messages, catchup, webhooks.",
   "main": "moye-agent-sdk.js",
   "exports": {
