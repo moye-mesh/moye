@@ -26,6 +26,7 @@
 //   verify-ledger
 import { loadAgent, saveIdentity, IDENTITY_FILE, resolveIdentityFile, bindReachableNode } from './identity.js';
 import { agentDocsPayload } from './agent_channels.js';
+import { stripFlags } from './cli_argv.js';
 import { createRequire } from 'module';
 import { spawn } from 'child_process';
 import path from 'path';
@@ -124,11 +125,9 @@ async function main() {
     // review candidates first, use `discover` + `send` separately instead.
     case 'delegate': {
       const capability = flag('capability');
-      // rest still contains the --capability <value> pair (flag() reads process.argv directly,
-      // it doesn't consume from rest) -- strip that pair out so it doesn't leak into the task text.
-      const capFlagIdx = rest.indexOf('--capability');
-      const taskParts = capFlagIdx === -1 ? rest : [...rest.slice(0, capFlagIdx), ...rest.slice(capFlagIdx + 2)];
-      const task = taskParts.join(' ');
+      // flag() reads process.argv in place; strip flags so --capability (and --secret) cannot
+      // leak into the delegated task text.
+      const task = stripFlags(rest).join(' ');
       if (!capability || !task) return fail('usage: delegate --capability <name> <task description...>');
       if (!agent.agentId) return fail('not registered yet -- run: register --name <name>');
       const candidates = await agent.constructor.discover({ capability, baseUrl: agent.baseUrl });
@@ -141,7 +140,7 @@ async function main() {
     }
 
     case 'send': {
-      const [to, ...contentParts] = rest;
+      const [to, ...contentParts] = stripFlags(rest);
       const content = contentParts.join(' ');
       if (!to || !content) return fail('usage: send <to_agent_id> <content>');
       if (!agent.agentId) return fail('not registered yet -- run: register --name <name>');
@@ -169,7 +168,7 @@ async function main() {
     }
 
     case 'rename-room': {
-      const [roomId] = rest;
+      const [roomId] = stripFlags(rest);
       const name = flag('name');
       if (!roomId || !name) return fail('usage: rename-room <room_id> --name <label>');
       if (!agent.agentId) return fail('not registered yet -- run: register --name <name>');
@@ -188,7 +187,7 @@ async function main() {
     }
 
     case 'join-room': {
-      const [roomId] = rest;
+      const [roomId] = stripFlags(rest);
       const secret = flag('secret', null);
       if (!roomId) return fail('usage: join-room <room_id> [--secret <secret>]');
       if (!agent.agentId) return fail('not registered yet -- run: register --name <name>');
@@ -197,17 +196,19 @@ async function main() {
     }
 
     case 'room-send': {
-      const [roomId, ...contentParts] = rest;
+      // Strip --secret (and any other flags) BEFORE joining content. flag() does not consume
+      // tokens from `rest`; leaving them in would encrypt the room secret into the chat log.
+      const secret = flag('secret', null);
+      const [roomId, ...contentParts] = stripFlags(rest);
       const content = contentParts.join(' ');
       if (!roomId || !content) return fail('usage: room-send <room_id> <content> [--secret <s>]');
       if (!agent.agentId) return fail('not registered yet -- run: register --name <name>');
-      const secret = flag('secret', null);
       if (secret) agent.rememberRoomSecret(roomId, secret);
       return out({ message_id: await agent.sendRoomMessage(roomId, content) });
     }
 
     case 'room-messages': {
-      const [roomId] = rest;
+      const [roomId] = stripFlags(rest);
       if (!roomId) return fail('usage: room-messages <room_id> [--limit N] [--secret <s>]');
       const limit = parseInt(flag('limit', '100'), 10);
       const secret = flag('secret', null);
@@ -216,7 +217,7 @@ async function main() {
     }
 
     case 'room-invite': {
-      const [roomId] = rest;
+      const [roomId] = stripFlags(rest);
       const members = csv(flag('members', ''));
       if (!roomId || !members.length) return fail('usage: room-invite <room_id> --members id1,id2 [--secret <s>]');
       if (!agent.agentId) return fail('not registered yet -- run: register --name <name>');
@@ -226,7 +227,7 @@ async function main() {
     }
 
     case 'room-accept': {
-      const [roomId] = rest;
+      const [roomId] = stripFlags(rest);
       if (!roomId) return fail('usage: room-accept <room_id>');
       if (!agent.agentId) return fail('not registered yet -- run: register --name <name>');
       try { await agent._ensureEncReady(); } catch (_) { /* best effort */ }
@@ -234,7 +235,7 @@ async function main() {
     }
 
     case 'room-rotate': {
-      const [roomId] = rest;
+      const [roomId] = stripFlags(rest);
       if (!roomId) return fail('usage: room-rotate <room_id> --wrap id1,id2 [--show-secret 1]');
       if (!agent.agentId) return fail('not registered yet -- run: register --name <name>');
       const wrap = csv(flag('wrap', ''));
@@ -248,7 +249,7 @@ async function main() {
     // ADR-0025: live room subscribe (backfill + WS + reconnect). Prints one JSON object per
     // message to stdout; Ctrl-C to stop. --since is a ms epoch cursor (exclusive).
     case 'room-watch': {
-      const [roomId] = rest;
+      const [roomId] = stripFlags(rest);
       if (!roomId) return fail('usage: room-watch <room_id> [--since <ms>] [--secret <s>]');
       if (!agent.agentId) return fail('not registered yet -- run: register --name <name>');
       const since = parseInt(flag('since', '0'), 10) || 0;
@@ -280,7 +281,7 @@ async function main() {
     // member broadcasts a task, other members claim it, the room CREATOR (server-enforced) accepts
     // one. Consistent with §0.5: visibility/reputation only, no bidding, no payment.
     case 'room-broadcast-task': {
-      const [roomId, ...taskParts] = rest;
+      const [roomId, ...taskParts] = stripFlags(rest);
       const task = taskParts.join(' ');
       if (!roomId || !task) return fail('usage: room-broadcast-task <room_id> <task description...>');
       if (!agent.agentId) return fail('not registered yet -- run: register --name <name>');
@@ -288,7 +289,7 @@ async function main() {
     }
 
     case 'room-claim-task': {
-      const [roomId, refId, ...noteParts] = rest;
+      const [roomId, refId, ...noteParts] = stripFlags(rest);
       const note = noteParts.join(' ') || 'I can take this';
       if (!roomId || !refId) return fail('usage: room-claim-task <room_id> <broadcast_message_id> [note...]');
       if (!agent.agentId) return fail('not registered yet -- run: register --name <name>');
@@ -296,7 +297,7 @@ async function main() {
     }
 
     case 'room-accept-claim': {
-      const [roomId, refId, ...noteParts] = rest;
+      const [roomId, refId, ...noteParts] = stripFlags(rest);
       const note = noteParts.join(' ') || 'accepted';
       if (!roomId || !refId) return fail('usage: room-accept-claim <room_id> <claim_message_id> [note...] (room creator only)');
       if (!agent.agentId) return fail('not registered yet -- run: register --name <name>');
