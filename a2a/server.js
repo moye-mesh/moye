@@ -1959,9 +1959,18 @@ app.get('/api/agents/:id/contributions', async (req, res) => {
   const reports = rows.filter(r => r.data && r.data.agent === req.params.id).slice(-limit);
   ok(res, { agent_id: req.params.id, node: ledger.NODE_ID, reports, note: 'self-reported; not federated across nodes; visibility only, never monetary (see ADR-0006 §0.5)' });
 });
-// ADR-0006 workstream G3: the honor board this network-wide view was missing -- contributions were
-// recorded (G1) and queryable per-agent, but nowhere visible in aggregate. Deliberately does NOT rank
-// by self-reported `metric` alone (trivially gameable, see the anti-Sybil reasoning above
+// ADR-0006 workstream G3: the network-wide contribution view that was missing -- contributions were
+// recorded (G1) and queryable per-agent, but nowhere visible in aggregate.
+//
+// ADR-0048 §4.1: this is a RECORD, not a leaderboard. Contribution visibility is the only incentive
+// layer the project permits (0006 §0.5, never money), and it exists because participation here is
+// contributive -- people help because they want the thing to exist. A scoreboard would re-frame that
+// as competition for a reward, which is the same transactional framing money would have introduced.
+// So: order deterministically, but never present this as a rank, a score, or a top-N. Callers
+// rendering this must not add rank framing either (see status.html).
+//
+// Ordering deliberately does NOT use self-reported `metric` (trivially gameable, see the anti-Sybil
+// reasoning above
 // POST /api/contributions) -- `endorsed_count` (peer-issued `contribution-endorsement` VCs, the only
 // verifiable trust signal here) is the primary sort key; self-reported activity is shown for
 // transparency, never as the thing that establishes trust.
@@ -2757,8 +2766,22 @@ app.post('/api/agents/:id/enc-pubkey', async (req, res) => {
 // ---- 8. List rooms (private rooms only shown to members; auth optional, best-effort) ----
 app.get('/api/rooms', async (req, res) => {
   const me = await authAgent(req).catch(() => null);
+  // ADR-0048 A3/A4: don't feature never-used rooms belonging to other people in the public index.
+  // Motivation is a measured problem, not tidiness: on 2026-08-19 production had 45 public rooms of
+  // which 42 were verification artifacts (14 of them literally named `r10check`), so the FIRST thing
+  // a newly-registered person saw on /rooms was a wall of someone else's test debris.
+  //
+  // This is index curation, NOT deletion and NOT expiry -- ADR-0036's permanent-retention decision
+  // is untouched. Nothing is removed, every room is still readable by direct id, and `?include_empty=1`
+  // returns the unfiltered list to anyone who asks. Rooms you are a member of are ALWAYS listed even
+  // when empty, so a room never vanishes on the person who just created it.
+  // Cost: getShared() is read-cached per materialized row (R20), so this is O(1) per room after the
+  // first read, on the same data `catchup` already touches.
+  const includeEmpty = req.query.include_empty === '1' || req.query.include_empty === 'true';
+  const hasActivity = (r) => ((store.getShared(roomChatKey(r.id)) || []).length > 0);
   const rooms = store.listRooms()
     .filter(r => r.visibility !== 'private' || (me && isRoomMember(r, me.id)))
+    .filter(r => includeEmpty || (me && isRoomMember(r, me.id)) || hasActivity(r))
     .map(({ membership_proof_hash, ...r }) => r); // never leak the hash, even to members
   // Same keyset pagination as /api/agents -- this used to be a hard .slice(0, 30), which made the
   // 31st room unreachable over the API entirely.

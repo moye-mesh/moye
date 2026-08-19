@@ -2,7 +2,7 @@
 /**
  * Minimal Shamir secret sharing over GF(256). Used for BIP-39 mnemonic social recovery
  * (ADR-0014 §6b / P4-3): default 3 shares, threshold = floor(n/2)+1 → 2-of-3.
- * English-only; no external deps.
+ * Uses the standard BIP-39 English wordlist; no external deps.
  */
 
 const crypto = require('crypto');
