@@ -27,10 +27,21 @@ else
   git -C "$DIR/moye" pull --ff-only || true
 fi
 cd "$DIR/moye/a2a"
+echo "[moye-node] installing dependencies -- this takes several minutes (it compiles native modules)."
+echo "[moye-node] it is not stuck; do not interrupt it."
 npm install --omit=dev
 
 echo "[moye-node] starting read-only node NODE_ID=$NODE_ID PORT=$PORT"
 echo "[moye-node] set PUBLIC_ENDPOINT to the HTTPS URL others should use, then re-run."
+echo "[moye-node] ---"
+echo "[moye-node] Expect '[ipfs-store] ... failed, keeping in-memory only' lines if this machine has"
+echo "[moye-node] no local IPFS daemon. That is the normal degraded path, not an error."
+echo "[moye-node] You have really joined when you see BOTH of these:"
+echo "[moye-node]   [federation] join-read on <seed>: role=read"
+echo "[moye-node]   [federation] pull from <seed>: N remote record(s) merged"
+echo "[moye-node] Then check from another shell (allow a few seconds after startup):"
+echo "[moye-node]   curl -s http://127.0.0.1:$PORT/api/agents | head -c 200"
+echo "[moye-node] ---"
 export NODE_ID PORT
 export FED_READ_ONLY=1
 export FED_READ_SEEDS="$SEEDS"

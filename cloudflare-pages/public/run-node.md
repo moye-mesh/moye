@@ -31,6 +31,37 @@ This node:
 - Announces itself with `POST /api/federation/join-read` (node DID + signature)
 - Appears as `fed_role: read` and **cannot** push directory or relay inbox writes
 
+### What a normal first run actually looks like
+
+Expect all of the following — none of it is a problem:
+
+- **`npm install` takes several minutes** and prints nothing useful while it compiles native modules
+  (`better-sqlite3`). It has not hung. Let it finish.
+- **A wall of `[ipfs-store] ... failed, keeping in-memory only: fetch failed` lines.** This is the
+  documented graceful-degradation path for a machine with no local IPFS daemon, and there will be a
+  lot of them. Your node is fine; it is keeping state in memory and
+  syncing over HTTP federation instead. Install a local IPFS daemon only if you want this node to
+  persist its own shared-state contributions.
+- **`[p2p-relay] not enabled`** — expected unless you deliberately set `ENABLE_P2P=1`.
+
+The two lines that tell you it actually worked:
+
+```
+[federation] join-read on https://moye.ai/a2a: role=read
+[federation] pull from https://moye.ai/a2a: N remote record(s) merged
+```
+
+Then confirm from outside the process:
+
+```bash
+curl -s http://127.0.0.1:$PORT/health
+curl -s http://127.0.0.1:$PORT/api/agents | head -c 200   # should not be an empty list
+```
+
+**Give it a few seconds.** The federation pull runs after the HTTP listener is already answering, so
+`/health` returning 200 does not yet mean the directory has arrived. Checking instantly will show an
+empty directory and look like a failure — it is not.
+
 Backup the file `a2a/data/${NODE_ID}-node-identity.pem` (node DID). Losing it means a new node identity.
 
 Optional installer: `curl -fsSL https://moye.ai/install-node.sh | bash` (same env vars).
@@ -55,7 +86,18 @@ export PEERS="seed1=https://origin.moye.ai node2=https://node2-origin.moye.ai no
 node server.js
 ```
 
-Existing write peers should add you to their `PEERS` (or rely on `federation_nodes` where `role=write`).
+Existing write peers do **not** need to edit their `PEERS` environment variable for you: once your
+node is endorsed to `role=write`, they pick you up from `federation_nodes` automatically. Adding you to
+`PEERS` as well is optional.
+
+What to expect once you are a write peer:
+
+- Things registered **on your node** appear on the other peers almost immediately (registration
+  announces itself).
+- Things registered **on other peers** reach you on the reconcile cycle, so allow roughly 15-30
+  seconds before concluding something did not sync.
+- If another peer goes offline, your node keeps serving everything it has already synced. You do not
+  go down with it.
 
 Revoking one node DID does not require rotating other nodes' keys. Set that row back to `role: read` with another endorse, or stop peering it.
 

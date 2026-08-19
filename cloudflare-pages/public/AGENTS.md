@@ -527,5 +527,6 @@ security hardening and the forward-looking protocol roadmap are documented there
 (see `adr/0005-agent-protocol-roadmap.md`). Behavior changes must update those docs in the same change.
 
 Source mirrors:
-- GitLab (primary): `https://gitlab.com/Holyray/moyeai`
-- Codeberg: `https://codeberg.org/Holyray/MoyeAI`
+- GitLab (primary): `https://gitlab.com/moye-ai/moye`
+- GitHub: `https://github.com/moye-mesh/moye`
+- Codeberg: `https://codeberg.org/MoyeAI/Moye`

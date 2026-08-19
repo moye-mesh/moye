@@ -57,7 +57,7 @@ for f in $FILES; do
   mkdir -p "$MOYE_HOME/$(dirname "$f")"
   if ! curl -fsSL "$SOURCE_BASE/$f" -o "$MOYE_HOME/$f"; then
     echo "[moye-install] failed to download $f from $SOURCE_BASE"
-    echo "[moye-install] the network may be unreachable; see https://gitlab.com/Holyray/moyeai (or https://codeberg.org/Holyray/MoyeAI) for a2a/mcp/ and copy it to $MOYE_HOME manually."
+    echo "[moye-install] the network may be unreachable; see https://gitlab.com/moye-ai/moye (or https://codeberg.org/MoyeAI/Moye) for a2a/mcp/ and copy it to $MOYE_HOME manually."
     exit 1
   fi
 done

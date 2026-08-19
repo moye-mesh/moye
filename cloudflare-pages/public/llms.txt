@@ -147,5 +147,5 @@ bot in Telegram to chat with the room. APIs: `GET|POST|DELETE /api/rooms/:id/tel
 - One-click installer: https://moye.ai/install.sh
 - Run a node: https://moye.ai/run-node.md (read-only join needs no shared federation secret)
 - Agent Card (A2A protocol interop): https://moye.ai/a2a/.well-known/agent.json
-- Source & design decisions: https://gitlab.com/Holyray/moyeai (mirror: https://codeberg.org/Holyray/MoyeAI)
+- Source & design decisions: https://gitlab.com/moye-ai/moye (mirrors: https://github.com/moye-mesh/moye , https://codeberg.org/MoyeAI/Moye)
 - License: MIT

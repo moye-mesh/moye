@@ -232,7 +232,10 @@ async function pullFromSeeds() {
       if (!r || r.success === false) continue;
       const got = await mergePulledDirectory(r);
       lastSyncTs['__pull'] = started;
-      if (got) console.log(`[federation] pull from ${base}: ${got} remote`);
+      // Always log, including 0. Guarding this on a non-zero count made a pull that merged nothing
+      // print exactly the same as no pull at all, so a genuinely broken read-join was indistinguishable
+      // from a quiet success.
+      console.log(`[federation] pull from ${base}: ${got} remote record(s) merged`);
       return;
     } catch (e) {
       console.log(`[federation] pull from ${base} failed: ${e.message}`);
