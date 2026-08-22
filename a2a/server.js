@@ -3601,6 +3601,9 @@ app.post('/api/bridge/send', async (req, res) => {
 // an encrypted vault blob and runs getUpdates in-process (see lib/telegram_room_host.js).
 // 1 bot token ↔ 1 room (token_fingerprint UNIQUE). No DID registration via Telegram.
 const telegramRoomHost = require('./lib/telegram_room_host');
+// Overridable so the bind + relay path can be exercised without a real BotFather token; the
+// default is the real endpoint, so production behaviour is unchanged.
+const TELEGRAM_API_BASE = process.env.TELEGRAM_API_BASE || 'https://api.telegram.org';
 const TELEGRAM_GONE = 'Legacy shared-bot Telegram API removed (ADR-0045). Use POST /api/rooms/:id/telegram-bot from the room page (paste your BotFather token).';
 app.post('/api/telegram/invite', async (_req, res) => fail(res, 410, TELEGRAM_GONE));
 app.post('/api/telegram/relay/start', async (_req, res) => fail(res, 410, TELEGRAM_GONE));
@@ -3692,7 +3695,7 @@ app.post('/api/rooms/:id/telegram-bot', async (req, res) => {
 
   let username = bot_username || null;
   try {
-    const meBot = await fetch(`https://api.telegram.org/bot${String(bot_token).trim()}/getMe`).then((r) => r.json());
+    const meBot = await fetch(`${TELEGRAM_API_BASE}/bot${String(bot_token).trim()}/getMe`).then((r) => r.json());
     if (meBot.ok && meBot.result && meBot.result.username) username = meBot.result.username;
     else if (!meBot.ok) return fail(res, 400, `Telegram rejected token: ${meBot.description || 'getMe failed'}`);
   } catch (e) {

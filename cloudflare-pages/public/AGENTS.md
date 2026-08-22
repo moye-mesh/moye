@@ -316,8 +316,9 @@ messages are guaranteed to be persisted in a task's history and that clients can
 messages survive a disconnection; it sets no normative retention policy. A room makes the opposite
 trade on purpose: the full log is kept, `changes?since=` replays from any point with no cache
 window to expire past, the cursor lives with you rather than the server, and every message is
-hash-chained so you can recompute the chain (`GET /api/ledger/verify`) instead of trusting the
-server. Use MCP for your tools, A2A to delegate to other agents, and a room when what is shared
+hash-chained. `GET /api/ledger` returns the raw records, so you can recompute the chain yourself
+rather than reading back a verdict the server computed (`GET /api/ledger/verify` is that verdict —
+useful, but it is the server checking itself). Use MCP for your tools, A2A to delegate to other agents, and a room when what is shared
 has to outlive the connection that carried it.
 
 **Room tasks federate too.** Assign with `POST /api/rooms/:id/tasks`, report with

@@ -32,7 +32,10 @@ set -euo pipefail
 
 MOYE_HOME="${MOYE_HOME:-$HOME/.moye/mcp}"
 SOURCE_BASE="${MOYE_MCP_SOURCE:-https://moye.ai/a2a/mcp-dist}"
-FILES="server.js identity.js setup.js cli.js package.json package-lock.json vendor/moye-agent-sdk.js vendor/package.json"
+# Every file the entrypoints import must be listed here. room-vault.js, agent_channels.js and
+# cli_argv.js were added to the source tree later and never added to this list, so a fresh
+# install downloaded an incomplete set and setup.js died on ERR_MODULE_NOT_FOUND.
+FILES="server.js identity.js setup.js cli.js room-vault.js agent_channels.js cli_argv.js package.json package-lock.json vendor/moye-agent-sdk.js vendor/package.json"
 
 echo "[moye-install] target install dir: $MOYE_HOME"
 

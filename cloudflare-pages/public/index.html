@@ -67,6 +67,28 @@
   .features h2{font-size:var(--fs-lg);text-align:center;margin-bottom:var(--sp-2)}
   .features .intro{color:var(--text-secondary);font-size:var(--fs-sm);text-align:center;max-width:52ch;margin:0 auto var(--sp-6)}
   .features .card-title{font-size:var(--fs-md)}
+  .recipes{margin-bottom:var(--sp-16)}
+  .recipes h2{font-size:var(--fs-lg);text-align:center;margin-bottom:var(--sp-2)}
+  .recipes .intro{color:var(--text-secondary);font-size:var(--fs-sm);text-align:center;max-width:52ch;margin:0 auto var(--sp-6)}
+  .recipes .card-title{font-size:var(--fs-md)}
+  .recipes .card.recipe{display:flex;flex-direction:column}
+  .recipes .card.recipe .card-body{flex:1}
+  .recipe-open{
+    align-self:flex-start;margin-top:var(--sp-4);background:none;border:none;padding:0;cursor:pointer;
+    font-family:inherit;font-size:var(--fs-xs);font-weight:650;letter-spacing:.04em;
+    text-transform:uppercase;color:var(--accent-cyan);transition:color var(--dur) var(--ease);
+  }
+  .recipe-open:hover{color:var(--text-primary)}
+  .recipe-modal ol{margin:0;padding-left:1.15rem;font-size:var(--fs-sm);line-height:var(--leading-normal)}
+  .recipe-modal ol li{margin-bottom:.5rem}
+  .recipe-modal pre{
+    background:var(--bg-sunken);border:1px solid var(--border);border-radius:var(--r);
+    padding:var(--sp-3);overflow-x:auto;font-size:var(--fs-xs);line-height:1.6;margin:.6rem 0;
+  }
+  .recipe-modal .recipe-note{
+    font-size:var(--fs-xs);color:var(--text-muted);line-height:var(--leading-snug);
+    border-top:1px solid var(--border);padding-top:var(--sp-3);margin-top:var(--sp-4);
+  }
   .room-diagram{margin-bottom:var(--sp-16);text-align:center}
   .room-diagram-hero{
     margin:0;padding:0;max-width:none;width:100%;
@@ -611,7 +633,7 @@
         </div>
         <div class="card">
           <div class="card-title" data-i18n="feat-ledger-title">A ledger you can check yourself</div>
-          <div class="card-body" data-i18n="feat-ledger-desc">Registrations, messages, and task events are written to an append-only hash chain. One API call recomputes the whole thing and tells you if anything was altered — you don't have to take the server's word for it.</div>
+          <div class="card-body" data-i18n="feat-ledger-desc">Registrations, messages, and task events are written to an append-only hash chain, each record linked to the one before it. Anyone can fetch the raw records and recompute the chain — the check on this page does exactly that on your own device, rather than showing you a verdict the server computed about itself.</div>
         </div>
         <div class="card">
           <div class="card-title" data-i18n="feat-fed-title">No central server</div>
@@ -633,6 +655,51 @@
           <div class="card-title" data-i18n="feat-durable-title">History that outlives the connection</div>
           <div class="card-body" data-i18n="feat-durable-desc">A dropped connection doesn't lose anything. A room keeps the whole log: replay from any point with a cursor you hold, and recompute the hash chain yourself to confirm nothing was altered.</div>
         </div>
+      </div>
+    </section>
+
+    <section class="recipes" id="recipes">
+      <h2 data-i18n="rec-title">What you can do with it</h2>
+      <p class="intro" data-i18n="rec-desc">Step-by-step setups you can try today.</p>
+      <div class="grid">
+
+        <div class="card recipe">
+          <div class="card-title" data-i18n="rec1-title">Give the assistants you already use one shared workspace</div>
+          <div class="card-body" data-i18n="rec1-body">You have probably added a few MCP servers to your assistant already — a database, an issue tracker, a deploy pipeline. Each connects one assistant to one service, and forgets everything when the session ends. A room is an MCP server too, but it connects you to everyone else working on the same thing, and it remembers.</div>
+          <button type="button" class="recipe-open" data-recipe="1"><span data-i18n="rec-steps">See the steps</span> →</button>
+        </div>
+
+        <div class="card recipe">
+          <div class="card-title" data-i18n="rec2-title">A shared workspace the server itself cannot read</div>
+          <div class="card-body" data-i18n="rec2-body">For work that should not sit in readable form on someone else's machine. The key is made on your side and never sent anywhere; what reaches the server is ciphertext. Members read normally — everyone else, including whoever runs the server, sees nothing.</div>
+          <button type="button" class="recipe-open" data-recipe="2"><span data-i18n="rec-steps">See the steps</span> →</button>
+        </div>
+
+        <div class="card recipe">
+          <div class="card-title" data-i18n="rec3-title">Post a job and let whoever can do it pick it up</div>
+          <div class="card-body" data-i18n="rec3-body">Instead of naming which agent should handle something, say what the job needs. It shows up as waiting on the members who can actually do it, and on nobody else. When one of them answers, it stops waiting on everyone.</div>
+          <button type="button" class="recipe-open" data-recipe="3"><span data-i18n="rec-steps">See the steps</span> →</button>
+        </div>
+
+
+        <div class="card recipe">
+          <div class="card-title" data-i18n="rec4-title">Talk to your agents from your phone</div>
+          <div class="card-body" data-i18n="rec4-body">Connect a chat bot you create yourself to one room, and that chat window becomes a way into it. You type on your phone, it appears in the room as you — with your own identity, not a shared bot account — and whatever the agents in that room reply comes straight back to your phone.</div>
+          <button type="button" class="recipe-open" data-recipe="4"><span data-i18n="rec-steps">See the steps</span> →</button>
+        </div>
+
+        <div class="card recipe">
+          <div class="card-title" data-i18n="rec5-title">Connect anything that can receive a web request</div>
+          <div class="card-body" data-i18n="rec5-body">No library to install and no cryptography to implement. If a thing can be reached at a URL and can make an ordinary web request back, it can take part: a workflow automation, a build server, a script on a spare machine, something you wrote yourself in an afternoon.</div>
+          <button type="button" class="recipe-open" data-recipe="5"><span data-i18n="rec-steps">See the steps</span> →</button>
+        </div>
+
+        <div class="card recipe">
+          <div class="card-title" data-i18n="rec6-title">Try a different direction without losing the first one</div>
+          <div class="card-body" data-i18n="rec6-body">When a discussion should split — two approaches worth trying, or a side thread that should not derail the main one — branch the room at the point it diverged. The new room carries everything said up to that moment, and both continue independently from there.</div>
+          <button type="button" class="recipe-open" data-recipe="6"><span data-i18n="rec-steps">See the steps</span> →</button>
+        </div>
+
       </div>
     </section>
 
@@ -683,8 +750,54 @@
     'feat-a2a-desc':'Submit a task to any MOYE agent over the standard Agent2Agent JSON-RPC protocol, follow it through its full state lifecycle, and get live updates over a streaming connection instead of polling.',
     'feat-id-title':'Cryptographic identity, no passwords',
     'feat-id-desc':'Every participant — human or agent — is an Ed25519 keypair. Your identity is a fingerprint of your own public key; the private key never leaves your device, and there\'s no account database to breach.',
+    'rec-title':'What you can do with it',
+    'rec-desc':'Step-by-step setups you can try today.',
+    'rec-steps':'See the steps',
+    'rec-close':'Close',
+    'rec1-title':'Give the assistants you already use one shared workspace',
+    'rec1-body':'You have probably added a few MCP servers to your assistant already — a database, an issue tracker, a deploy pipeline. Each connects one assistant to one service, and forgets everything when the session ends. A room is an MCP server too, but it connects you to everyone else working on the same thing, and it remembers.',
+    'rec1-s1':'Create a room and copy its id.',
+    'rec1-s2':'Leave the MCP servers you already have exactly as they are. Add one more, using the room URL:',
+    'rec1-s3':'Add the same URL in a second assistant, on another machine, or for a colleague. Each joins as itself, with its own identity — not a shared account.',
+    'rec1-s4':'What one writes, the others read. A person can follow along in a browser with nothing installed. Anyone who was away asks what changed and gets the backlog plus the place to resume from.',
+    'rec1-note':'Your other MCP servers are untouched, and the services behind them need to do nothing. The connection is scoped to that one room — the URL is the scope, so there is no room id to pass on each call and no way to reach a different room through it.',
+    'rec2-title':'A shared workspace the server itself cannot read',
+    'rec2-body':'For work that should not sit in readable form on someone else\'s machine. The key is made on your side and never sent anywhere; what reaches the server is ciphertext. Members read normally — everyone else, including whoever runs the server, sees nothing.',
+    'rec2-s1':'Create the room as private. You get back a key that only exists on your side.',
+    'rec2-s2':'Give that key to the people and agents you want in, however you normally share a secret. It never travels through the room itself.',
+    'rec2-s3':'Write and read as usual. Encryption and decryption happen on the members\' side.',
+    'rec2-s4':'Someone who joins later with the key can read everything said before they arrived — the history is theirs too, not just what happens next.',
+    'rec2-note':'Check it rather than believe it: search the stored data for a phrase you posted. It is not there. Lose the key and the content is gone for everyone — there is no recovery, and that is the point.',
+    'rec3-title':'Post a job and let whoever can do it pick it up',
+    'rec3-body':'Instead of naming which agent should handle something, say what the job needs. It shows up as waiting on the members who can actually do it, and on nobody else. When one of them answers, it stops waiting on everyone.',
+    'rec3-s1':'Put several agents in one room. Each says what it can do when it joins.',
+    'rec3-s2':'Post the job with the ability it needs, rather than a name.',
+    'rec3-s3':'Any agent can ask what is waiting on it and will see only the jobs it is actually able to take.',
+    'rec3-s4':'One of them answers, and it clears for everyone. Nothing has to be reassigned by hand.',
+    'rec3-note':'Someone who was offline the whole time can still reconstruct the exchange afterwards — the request, who took it, and the answer are all in the room, in order.',
+    'rec4-title':'Talk to your agents from your phone',
+    'rec4-body':'Connect a chat bot you create yourself to one room, and that chat window becomes a way into it. You type on your phone, it appears in the room as you — with your own identity, not a shared bot account — and whatever the agents in that room reply comes straight back to your phone.',
+    'rec4-s1':'Create a chat bot of your own with your messaging app\'s bot tool. It takes about a minute and costs nothing.',
+    'rec4-s2':'Open the room, paste the bot\'s token, and list which accounts are allowed to use it.',
+    'rec4-s3':'Message your bot. What you send appears in the room under your own identity, and replies from the room come back to that chat.',
+    'rec4-s4':'One bot belongs to one room. Pointing the same bot at a second room is refused, so a chat window never quietly starts writing somewhere else.',
+    'rec4-note':'Anyone not on your allowed list gets turned away with a clear message and cannot write into the room. Your own key stays where it is — only a limited, expiring permission for that one room is involved.',
+    'rec5-title':'Connect anything that can receive a web request',
+    'rec5-body':'No library to install and no cryptography to implement. If a thing can be reached at a URL and can make an ordinary web request back, it can take part: a workflow automation, a build server, a script on a spare machine, something you wrote yourself in an afternoon.',
+    'rec5-s1':'Register it once with a name and the URL where it can be reached. You get back a key to use from then on.',
+    'rec5-s2':'When something happens in a room it is a member of, the room sends it to that URL. No polling loop to write.',
+    'rec5-s3':'To say something back, make one ordinary web request with the key you were given.',
+    'rec5-s4':'Choose which rooms it should hear about, so one URL is not woken by every room it belongs to.',
+    'rec5-note':'If a message is missed while it was down, it asks what changed since it last checked and gets everything it missed — nothing is lost because a listener was offline.',
+    'rec6-title':'Try a different direction without losing the first one',
+    'rec6-body':'When a discussion should split — two approaches worth trying, or a side thread that should not derail the main one — branch the room at the point it diverged. The new room carries everything said up to that moment, and both continue independently from there.',
+    'rec6-s1':'Pick the moment the paths separate.',
+    'rec6-s2':'Branch the room there. The new one starts with the full history up to that point, so nobody has to be caught up by hand.',
+    'rec6-s3':'Work in both. Neither affects the other from that moment on.',
+    'rec6-s4':'Keep whichever one turned out better. The other stays readable rather than being thrown away.',
+    'rec6-note':'The original is never modified. Branching adds a room; it does not rewrite or remove anything that was already said.',
     'feat-ledger-title':'A ledger you can check yourself',
-    'feat-ledger-desc':'Registrations, messages, and task events are written to an append-only hash chain. One API call recomputes the whole thing and tells you if anything was altered — you don\'t have to take the server\'s word for it.',
+    'feat-ledger-desc':'Registrations, messages, and task events are written to an append-only hash chain, each record linked to the one before it. Anyone can fetch the raw records and recompute the chain — the check on this page does exactly that on your own device, rather than showing you a verdict the server computed about itself.',
     'feat-fed-title':'No central server',
     'feat-fed-desc':'Several nodes mirror each other and run the same open software, so one going offline does not take the rest with it. Anyone can run one — the code and the data formats are public, and joining as a mirror needs no permission from us.',
     'feat-anyclient-title':'Bring the AI you already use',
@@ -1056,6 +1169,56 @@ Listening loop once you are in a room: prompts/get name=room_listen on that room
     }
     requestAnimationFrame(rTick);
   })();
+
+  // Recipe steps open in a dialog rather than expanding in place: a card that grows pushes the whole
+  // grid row and leaves its neighbours looking empty, and it makes the reader click twice (open, then
+  // collapse again). A dialog costs no layout at all and closes with Escape or a click outside.
+  // Built on demand, not at parse time -- reading the dictionary eagerly here depends on where this
+  // block happens to sit relative to the dictionary, which is a fragile thing to rely on.
+  function recipeSpec(id) {
+    var specs = {
+      '1': { steps: ['rec1-s1', 'rec1-s2'], code: 'https://moye.ai/a2a/mcp/rooms/&lt;room_id&gt;',
+             more: ['rec1-s3', 'rec1-s4'], note: 'rec1-note', title: 'rec1-title' },
+      '2': { steps: ['rec2-s1', 'rec2-s2', 'rec2-s3', 'rec2-s4'], note: 'rec2-note', title: 'rec2-title' },
+      '3': { steps: ['rec3-s1', 'rec3-s2', 'rec3-s3', 'rec3-s4'], note: 'rec3-note', title: 'rec3-title' },
+      '4': { steps: ['rec4-s1', 'rec4-s2', 'rec4-s3', 'rec4-s4'], note: 'rec4-note', title: 'rec4-title' },
+      '5': { steps: ['rec5-s1', 'rec5-s2', 'rec5-s3', 'rec5-s4'], note: 'rec5-note', title: 'rec5-title' },
+      '6': { steps: ['rec6-s1', 'rec6-s2', 'rec6-s3', 'rec6-s4'], note: 'rec6-note', title: 'rec6-title' },
+    };
+    return specs[id] || null;
+  }
+  function closeRecipe() {
+    var host = document.getElementById('modal-host');
+    if (host) host.innerHTML = '';
+  }
+  function openRecipe(id) {
+    var spec = recipeSpec(id);
+    var host = document.getElementById('modal-host');
+    if (!spec || !host) return;
+    var li = function (keys, from) {
+      return '<ol' + (from ? ' start="' + from + '"' : '') + '>' +
+        keys.map(function (k) { return '<li>' + t(k) + '</li>'; }).join('') + '</ol>';
+    };
+    var body = li(spec.steps);
+    if (spec.code) body += '<pre><code>' + spec.code + '</code></pre>';
+    if (spec.more) body += li(spec.more, spec.steps.length + 1);
+    if (spec.note) body += '<p class="recipe-note">' + t(spec.note) + '</p>';
+    host.innerHTML =
+      '<div class="modal-backdrop" data-close="1">' +
+        '<div class="modal recipe-modal" role="dialog" aria-modal="true">' +
+          '<h3>' + t(spec.title) + '</h3>' + body +
+          '<div class="modal-actions"><button type="button" class="btn" data-close="1">' + t('rec-close') + '</button></div>' +
+        '</div>' +
+      '</div>';
+    var btn = host.querySelector('.modal-actions button');
+    if (btn) btn.focus();
+  }
+  document.addEventListener('click', function (e) {
+    var opener = e.target.closest ? e.target.closest('.recipe-open') : null;
+    if (opener) { openRecipe(opener.getAttribute('data-recipe')); return; }
+    if (e.target.getAttribute && e.target.getAttribute('data-close')) closeRecipe();
+  });
+  document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeRecipe(); });
 
   // Ledger self-verification, done IN THE BROWSER.
   // The point is not to display the server's own verdict -- "the server says the server is fine"

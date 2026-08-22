@@ -6,10 +6,15 @@
  */
 const { Agent } = require('../sdk/node/moye-agent-sdk');
 
+// Overridable so this relay can be exercised end to end against a stand-in Telegram API. Without
+// it the whole path is untestable without a real BotFather token, which is why it had never been
+// run. Default is the real endpoint, so production behaviour is unchanged.
+const TELEGRAM_API_BASE = process.env.TELEGRAM_API_BASE || 'https://api.telegram.org';
+
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 async function tg(token, method, body) {
-  const r = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
+  const r = await fetch(`${TELEGRAM_API_BASE}/bot${token}/${method}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body || {}),

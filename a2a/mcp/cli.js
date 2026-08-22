@@ -34,7 +34,13 @@ import { fileURLToPath } from 'url';
 
 const require = createRequire(import.meta.url);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const tgBind = require('../connectors/telegram_room_bind.js');
+// Loaded on demand, not at startup. This lives outside mcp/, so an installed copy (which only
+// ever receives files from mcp-dist) does not have it -- requiring it eagerly made every single
+// command, including `docs` and `whoami`, die with MODULE_NOT_FOUND on a fresh install.
+function tgBindModule() {
+  try { return require('../connectors/telegram_room_bind.js'); }
+  catch { fail('room-telegram-* commands need the full repo checkout; this installed copy does not include them'); }
+}
 
 function out(obj) { process.stdout.write(JSON.stringify(obj) + '\n'); }
 function fail(msg, extra) { process.stderr.write(JSON.stringify({ error: msg, ...(extra || {}) }) + '\n'); process.exit(1); }
@@ -375,7 +381,7 @@ async function main() {
       const roomId = flag('room', rest[0]);
       const token = flag('token', null);
       if (!roomId || !token) return fail('usage: room-telegram-bind --room <room_id> --token <BotFatherToken> [--allow-from <tgUserId>] [--bot-username <name>]');
-      const r = tgBind.bindRoom({
+      const r = tgBindModule().bindRoom({
         roomId,
         botToken: token,
         allowFrom: csv(flag('allow-from', '')),
@@ -393,20 +399,20 @@ async function main() {
     case 'room-telegram-unbind': {
       const roomId = flag('room', rest[0]);
       if (!roomId) return fail('usage: room-telegram-unbind --room <room_id>');
-      const r = tgBind.unbindRoom(roomId);
+      const r = tgBindModule().unbindRoom(roomId);
       if (!r.ok) return fail(r.error);
       return out(r);
     }
 
     case 'room-telegram-status': {
-      return out({ agent_id: agent.agentId || null, ...tgBind.listBinds() });
+      return out({ agent_id: agent.agentId || null, ...tgBindModule().listBinds() });
     }
 
     case 'room-telegram-run': {
       if (!agent.agentId) return fail('not registered yet — run: register --name <name>');
       const roomId = flag('room', rest[0]);
       if (!roomId) return fail('usage: room-telegram-run --room <room_id> [--secret <s>] [--allow-from <id>]');
-      const { bind } = tgBind.getBindForRoom(roomId);
+      const { bind } = tgBindModule().getBindForRoom(roomId);
       if (!bind) return fail(`no bot bound for ${roomId} — run room-telegram-bind first`);
       const bridge = path.join(__dirname, '..', 'connectors', 'telegram_room_bridge.js');
       const args = [bridge, '--room', roomId];
