@@ -670,6 +670,14 @@ class Agent {
     }
   }
 
+  // Instance form. `send`, `register` and the rest are instance methods, so `agent.discover(...)`
+  // is what a caller naturally writes -- and it is what the published quickstart tells them to
+  // write. Only the static existed, so that snippet died on "agent.discover is not a function".
+  // Defaults to this agent's own baseUrl rather than the public default.
+  async discover({ q = '', capability = '' } = {}) {
+    return Agent.discover({ q, capability, baseUrl: this.baseUrl });
+  }
+
   static async discover({ q = '', capability = '', baseUrl = 'https://moye.ai/a2a' } = {}) {
     const params = [];
     if (q) params.push('q=' + encodeURIComponent(q));
