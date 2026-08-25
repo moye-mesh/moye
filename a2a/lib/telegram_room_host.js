@@ -3,6 +3,11 @@
  * ADR-0045 hosted relay: after a member pastes their BotFather token in the room UI,
  * the node runs getUpdates in-process and posts as their session key.
  * One bot token ↔ one room (enforced by token_fingerprint UNIQUE).
+ *
+ * Room → Telegram delivery must NOT rely on /ws alone: fanoutRoomMessage only runs on the
+ * node that accepted the POST. Federated CRDT merges do not re-fanout, so a reply posted via
+ * origin/another peer never reaches this host's WebSocket. Poll changes?since= (catchup) as
+ * the reliable path; keep watchRoom as a same-node low-latency hint.
  */
 const { Agent } = require('../sdk/node/moye-agent-sdk');
 
@@ -10,6 +15,7 @@ const { Agent } = require('../sdk/node/moye-agent-sdk');
 // it the whole path is untestable without a real BotFather token, which is why it had never been
 // run. Default is the real endpoint, so production behaviour is unchanged.
 const TELEGRAM_API_BASE = process.env.TELEGRAM_API_BASE || 'https://api.telegram.org';
+const POLL_MS = Math.max(1000, parseInt(process.env.TELEGRAM_ROOM_POLL_MS || '2000', 10));
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
@@ -38,6 +44,8 @@ function bindRev(b) {
 
 function startTelegramRoomHost({ listBinds, baseUrl }) {
   const running = new Map(); // id -> { stop, rev }
+  // Survive bind rev churn / respawn within this process (DM chat_id ≈ tg user id).
+  const chatMemory = new Map(); // bind.id -> Set<chatId>
 
   function sync() {
     let binds = [];
@@ -62,7 +70,7 @@ function startTelegramRoomHost({ listBinds, baseUrl }) {
       }
       try {
         const rev = bindRev(b);
-        const handle = spawnOne(b, baseUrl, () => {
+        const handle = spawnOne(b, baseUrl, chatMemory, () => {
           const cur = running.get(b.id);
           if (cur && cur.rev === rev) running.delete(b.id);
         });
@@ -83,12 +91,25 @@ function startTelegramRoomHost({ listBinds, baseUrl }) {
   };
 }
 
-function spawnOne(bind, baseUrl, onEnd) {
+function textForTelegram(m) {
+  if (!m) return '';
+  if (m.decrypted != null && m.decrypted !== '') return String(m.decrypted);
+  // Never push raw ciphertext into Telegram — looks like "nothing useful arrived".
+  if (m.encrypted) return '';
+  return m.content != null ? String(m.content) : '';
+}
+
+function spawnOne(bind, baseUrl, chatMemory, onEnd) {
   let stopped = false;
   let offset = 0;
   const allowFrom = Array.isArray(bind.allow_from) ? bind.allow_from.map(String) : [];
   let allow = allowFrom.slice();
-  const activeChats = new Set();
+  const activeChats = chatMemory.get(bind.id) || new Set();
+  for (const id of allow) activeChats.add(String(id));
+  chatMemory.set(bind.id, activeChats);
+
+  const seen = new Set();
+  let cursor = Date.now(); // only forward new room traffic after this host start
 
   const agent = Agent.fromSession({
     masterDid: bind.master_did,
@@ -99,21 +120,61 @@ function spawnOne(bind, baseUrl, onEnd) {
   });
   if (bind.room_secret) agent.rememberRoomSecret(bind.room_id, bind.room_secret);
 
-  const sub = agent.watchRoom(bind.room_id, {
-    onMessage: async (m) => {
-      if (stopped) return;
-      const text = m.decrypted || m.content;
-      if (!text) return;
-      for (const chatId of activeChats) {
-        try {
-          await tg(bind.bot_token, 'sendMessage', { chat_id: chatId, text: String(text).slice(0, 4000) });
-        } catch (e) {
-          console.error(`[telegram-host] deliver ${bind.id} -> ${chatId}:`, e.message);
-        }
+  async function deliverToChats(m) {
+    if (stopped || !m || !m.id) return;
+    if (seen.has(m.id)) return;
+    // User already sees their own TG→room text in the bot chat.
+    if (m.from_agent && m.from_agent === bind.agent_id) {
+      seen.add(m.id);
+      if ((m.ts || 0) > cursor) cursor = m.ts;
+      return;
+    }
+    const text = textForTelegram(m);
+    if (!text) {
+      seen.add(m.id);
+      if ((m.ts || 0) > cursor) cursor = m.ts;
+      return;
+    }
+    if (!activeChats.size) return; // keep unseen so a later first DM can still get backlog? no — drop
+    seen.add(m.id);
+    if ((m.ts || 0) > cursor) cursor = m.ts;
+    if (seen.size > 5000) {
+      const drop = [...seen].slice(0, seen.size - 4000);
+      for (const id of drop) seen.delete(id);
+    }
+    const body = String(text).slice(0, 4000);
+    for (const chatId of activeChats) {
+      try {
+        await tg(bind.bot_token, 'sendMessage', { chat_id: chatId, text: body });
+      } catch (e) {
+        console.error(`[telegram-host] deliver ${bind.id} -> ${chatId}:`, e.message);
       }
-    },
+    }
+  }
+
+  // Best-effort same-node push; federation-safe path is the poll loop below.
+  const sub = agent.watchRoom(bind.room_id, {
+    since: cursor,
+    onMessage: (m) => { deliverToChats(m).catch(() => {}); },
     onError: (e) => console.error(`[telegram-host] watchRoom ${bind.id}:`, e.message || e),
   });
+
+  (async function pollRoom() {
+    while (!stopped) {
+      try {
+        if (activeChats.size) {
+          const r = await agent.roomChanges(bind.room_id, cursor);
+          const msgs = (r.messages || []).slice().sort(
+            (a, b) => (a.ts - b.ts) || String(a.id).localeCompare(String(b.id)),
+          );
+          for (const m of msgs) await deliverToChats(m);
+        }
+      } catch (e) {
+        if (!stopped) console.error(`[telegram-host] roomChanges ${bind.id}:`, e.message || e);
+      }
+      await sleep(POLL_MS);
+    }
+  })();
 
   (async () => {
     while (!stopped) {
@@ -146,7 +207,7 @@ function spawnOne(bind, baseUrl, onEnd) {
             try {
               await tg(bind.bot_token, 'sendMessage', {
                 chat_id: chatId,
-                text: `Connected to MOYE room ${bind.room_id}. Messages here go to the room as your linked identity.`,
+                text: `Connected to MOYE room ${bind.room_id}. Messages here go to the room as your linked identity. Room replies are polled onto this chat (catchup), not WS-only.`,
               });
             } catch { /* ignore */ }
             continue;
@@ -176,4 +237,4 @@ function spawnOne(bind, baseUrl, onEnd) {
   };
 }
 
-module.exports = { startTelegramRoomHost };
+module.exports = { startTelegramRoomHost, textForTelegram };

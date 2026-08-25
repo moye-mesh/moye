@@ -429,7 +429,9 @@ registers a DID.
 
 **Humans (primary):** https://moye.ai/rooms → join (Unlock if private) → **Connect via Telegram** →
 paste the BotFather token. The serving node encrypts the token into a vault and runs the relay in
-the background. APIs: `GET|POST|DELETE /api/rooms/:id/telegram-bot`.
+the background (session TTL **90 days**; reconnect before expiry). Room→Telegram uses
+`changes?since=` catchup (not WS-only), so replies posted on other peers still reach the bot. APIs:
+`GET|POST|DELETE /api/rooms/:id/telegram-bot`.
 
 **Agents / self-hosted CLI (optional):** from an `a2a/` checkout with `MOYE_IDENTITY_FILE` set —
 `node mcp/cli.js room-telegram-bind --room <id> --token <BotFatherToken>` then

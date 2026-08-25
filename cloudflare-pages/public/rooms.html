@@ -218,7 +218,7 @@ const I18N={
   rotate_go:'Rotate now',rotate_ok:'Room key rotated',rotate_failed_wraps:'Rotated, but some sealed invites failed',
   rotate_done_sub:'Save this key. Members you wrapped can use Accept invite; others need this key out of band (or Unlock).',
   tg_btn:'📱 Connect via Telegram',tg_title:'Connect via Telegram',
-  tg_sub:'Paste the BotFather token for YOUR bot. This room is locked to that bot (1 bot ↔ 1 room). After you connect, this MOYE node runs the relay in the background — open your bot in Telegram and chat.',
+  tg_sub:'Paste the BotFather token for YOUR bot. This room is locked to that bot (1 bot ↔ 1 room). After you connect, this MOYE node runs the relay in the background for up to 90 days — open your bot in Telegram and chat. Reconnect before expiry if you want it to keep posting.',
   tg_token_label:'BotFather token',
   tg_token_ph:'123456:ABC-DEF…',
   tg_allow_label:'Your Telegram user id (optional allowlist)',
@@ -617,9 +617,10 @@ async function openTelegramConnect(){
   try{ status=await Moye.api('/api/rooms/'+encodeURIComponent(CUR.id)+'/telegram-bot',{auth:true}); }catch{}
   if(status.connected){
     const link=status.bot_username?`https://t.me/${status.bot_username}`:'';
+    const exp=status.session_expires_at?new Date(status.session_expires_at).toISOString().slice(0,10):'';
     modal(`<h3>${T('tg_title')}</h3>
       <p class="modal-sub">${T('tg_connected')}${status.bot_username?': @'+esc(status.bot_username):''}</p>
-      <p class="muted" style="font-size:var(--fs-sm)">${T('tg_sub')}</p>
+      <p class="muted" style="font-size:var(--fs-sm)">${T('tg_sub')}${exp?` Session ends ~${esc(exp)}.` :''}</p>
       <div class="modal-actions" style="flex-wrap:wrap;gap:.4rem">
         ${link?`<a class="btn btn-primary" href="${esc(link)}" target="_blank" rel="noopener">${T('tg_open_bot')}</a>`:''}
         <button class="btn btn-ghost" id="tg-dis">${T('tg_disconnect')}</button>
@@ -654,7 +655,9 @@ async function doTelegramConnect(){
   const btn=document.getElementById('tg-go');
   if(btn){ btn.disabled=true; btn.innerHTML='<span class="spinner"></span> '+T('tg_connecting'); }
   try{
-    const session=await Moye.createSession({scope:['room.read','room.post']});
+    // Telegram relay lives on the node; 90d beats the default 7d session so the bind does not
+    // silently die after a week (host skips expired session_expires_at).
+    const session=await Moye.createSession({scope:['room.read','room.post'],expiresInMs:90*24*3600*1000});
     const body={
       bot_token:String(token).trim(),
       master_did:session.master_did,

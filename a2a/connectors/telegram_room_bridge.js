@@ -78,21 +78,53 @@ async function main() {
     console.log('[telegram-room] allowFrom empty — first human DM will be recorded as the sole allowed Telegram user id');
   }
 
+  // Same federation issue as lib/telegram_room_host.js: WS fanout is node-local. Poll catchup.
+  const { textForTelegram } = require('../lib/telegram_room_host');
   const activeChats = new Set();
-  agent.watchRoom(roomId, {
-    onMessage: async (m) => {
-      const text = m.decrypted || m.content;
-      if (!text) return;
-      for (const chatId of activeChats) {
-        try {
-          await tg(bind.botToken, 'sendMessage', { chat_id: chatId, text: String(text).slice(0, 4000) });
-        } catch (e) {
-          console.error(`[telegram-room] deliver to ${chatId} failed: ${e.message}`);
-        }
+  for (const id of allowFrom) activeChats.add(String(id));
+  const seen = new Set();
+  let cursor = Date.now();
+
+  async function deliverToChats(m) {
+    if (!m || !m.id || seen.has(m.id)) return;
+    if (m.from_agent && m.from_agent === agent.agentId) {
+      seen.add(m.id);
+      if ((m.ts || 0) > cursor) cursor = m.ts;
+      return;
+    }
+    const text = textForTelegram(m);
+    if (!text || !activeChats.size) return;
+    seen.add(m.id);
+    if ((m.ts || 0) > cursor) cursor = m.ts;
+    const body = String(text).slice(0, 4000);
+    for (const chatId of activeChats) {
+      try {
+        await tg(bind.botToken, 'sendMessage', { chat_id: chatId, text: body });
+      } catch (e) {
+        console.error(`[telegram-room] deliver to ${chatId} failed: ${e.message}`);
       }
-    },
+    }
+  }
+
+  agent.watchRoom(roomId, {
+    since: cursor,
+    onMessage: (m) => { deliverToChats(m).catch(() => {}); },
     onError: (e) => console.error(`[telegram-room] watchRoom: ${e.message || e}`),
   });
+
+  (async function pollRoom() {
+    for (;;) {
+      try {
+        if (activeChats.size) {
+          const r = await agent.roomChanges(roomId, cursor);
+          for (const m of (r.messages || [])) await deliverToChats(m);
+        }
+      } catch (e) {
+        console.error(`[telegram-room] roomChanges: ${e.message || e}`);
+      }
+      await sleep(2000);
+    }
+  })();
 
   let offset = 0;
   for (;;) {
