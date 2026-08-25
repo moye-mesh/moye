@@ -971,14 +971,29 @@ function sessionForbiddenPath(req) {
 const REPLAY_WINDOW_MS = 5 * 60 * 1000;
 const ALLOW_UNSIGNED_TS = process.env.ALLOW_UNSIGNED_TS === '1';
 const seenSigs = new Map(); // sig -> expiry ms
-function replayOk(sig, body) {
+/**
+ * @param {string} sig
+ * @param {{ts?: number}} body
+ * @param {{idempotent?: boolean}} [opts]  When idempotent (bodyless GET header auth), the same
+ *   signature may arrive twice because Cloudflare/proxies retry GETs with identical headers.
+ *   Spending once then rejecting the retry made authAgent() return null and private-room reads
+ *   surface as "membership required" — breaking long-lived room watchers. Allow the same sig
+ *   again while it is still inside the freshness window.
+ */
+function replayOk(sig, body, opts = {}) {
   const now = Date.now();
   // opportunistic sweep so the map only ever holds ~one freshness window of signatures
   if (seenSigs.size > 5000) for (const [s, exp] of seenSigs) if (exp < now) seenSigs.delete(s);
   const ts = Number(body && body.ts);
   if (!Number.isFinite(ts)) return ALLOW_UNSIGNED_TS;      // no signed ts: only allowed in migration mode
   if (Math.abs(now - ts) > REPLAY_WINDOW_MS) return false; // stale (or too far in the future)
-  if (seenSigs.has(sig)) return false;                     // exact signature already spent
+  if (seenSigs.has(sig)) {
+    if (opts.idempotent) {
+      const exp = seenSigs.get(sig);
+      return Number.isFinite(exp) && exp >= now;
+    }
+    return false; // exact signature already spent (POST / mutating)
+  }
   seenSigs.set(sig, ts + REPLAY_WINDOW_MS);
   return true;
 }
@@ -1025,7 +1040,8 @@ async function authAgent(req) {
         console.error('[session-auth] verify failed for', sessionDid);
         return null;
       }
-      if (!replayOk(sig, replayBody)) {
+      // Header GET auth is idempotent under proxy retries; body/POST stays one-spend.
+      if (!replayOk(sig, replayBody, { idempotent: tsHeader !== undefined })) {
         console.error('[session-auth] replay/stale rejected for', sessionDid);
         return null;
       }
@@ -1053,7 +1069,10 @@ async function authAgent(req) {
         replayBody = req.body;
       }
       if (verified) {
-        if (!replayOk(sig, replayBody)) { console.error('[did-auth] replay/stale rejected for', did); return null; }
+        if (!replayOk(sig, replayBody, { idempotent: tsHeader !== undefined })) {
+          console.error('[did-auth] replay/stale rejected for', did);
+          return null;
+        }
         if (isRevoked(a)) return null;
         return { id: a.id, name: a.id, did: true };
       }
