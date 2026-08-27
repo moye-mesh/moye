@@ -74,11 +74,12 @@ if [ -n "$P2P_HOSTNAME" ]; then
   DROPIN_DIR=/etc/systemd/system/moye-a2a.service.d
   DROPIN_FILE="$DROPIN_DIR/10-p2p-relay.conf"
   DROPIN_CONTENT="$(printf '[Service]\nEnvironment="ENABLE_P2P=1"\nEnvironment="P2P_PUBLIC_HOSTNAME=%s"\n' "$P2P_HOSTNAME")"
-  if mkdir -p "$DROPIN_DIR" 2>/dev/null; then
-    printf '%s' "$DROPIN_CONTENT" > "$DROPIN_FILE"
-  else
-    sudo mkdir -p "$DROPIN_DIR" && printf '%s' "$DROPIN_CONTENT" | sudo tee "$DROPIN_FILE" >/dev/null
-  fi
+  # Every step here is best-effort (`|| true`): this whole block is a convenience so ops doesn't
+  # have to log in and hand-edit a unit file, NOT allowed to ever abort the script under `set -e` --
+  # a permission failure here must never block the git update / npm install / restart below it.
+  ( mkdir -p "$DROPIN_DIR" && printf '%s' "$DROPIN_CONTENT" > "$DROPIN_FILE" ) 2>/dev/null \
+    || ( sudo mkdir -p "$DROPIN_DIR" && printf '%s' "$DROPIN_CONTENT" | sudo tee "$DROPIN_FILE" >/dev/null ) 2>/dev/null \
+    || echo "[self-update] WARNING: could not write $DROPIN_FILE (insufficient privilege?) -- ENABLE_P2P not applied this cycle"
   systemctl daemon-reload 2>/dev/null || sudo systemctl daemon-reload 2>/dev/null || true
   echo "[self-update] node ${NODE_ID_ON_DISK}: applied ENABLE_P2P=1, P2P_PUBLIC_HOSTNAME=${P2P_HOSTNAME}"
 fi
