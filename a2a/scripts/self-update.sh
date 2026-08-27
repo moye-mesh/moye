@@ -57,6 +57,20 @@ if systemctl list-unit-files yggdrasil.service >/dev/null 2>&1; then
   fi
 fi
 
+# --- Ops decision 2026-08-26: stop advertising OVERLAY_ADDR now that Yggdrasil is off above --
+# otherwise GET /api/network keeps showing a dead-but-still-moye.ai-linked overlay address
+# indefinitely, which defeats half the point of stopping the daemon. A later-loaded drop-in's
+# `Environment=` overrides a same-named `Environment=` from the main unit file (systemd.exec(5):
+# last assignment for a given variable wins), so this doesn't require touching moye-a2a.service
+# itself -- runs on all three nodes unconditionally, same best-effort/non-aborting write pattern as
+# the p2p drop-in below.
+OVERLAY_DROPIN_DIR=/etc/systemd/system/moye-a2a.service.d
+OVERLAY_DROPIN_FILE="$OVERLAY_DROPIN_DIR/20-clear-overlay-addr.conf"
+( mkdir -p "$OVERLAY_DROPIN_DIR" && printf '[Service]\nEnvironment="OVERLAY_ADDR="\n' > "$OVERLAY_DROPIN_FILE" ) 2>/dev/null \
+  || ( sudo mkdir -p "$OVERLAY_DROPIN_DIR" && printf '[Service]\nEnvironment="OVERLAY_ADDR="\n' | sudo tee "$OVERLAY_DROPIN_FILE" >/dev/null ) 2>/dev/null \
+  || echo "[self-update] WARNING: could not write $OVERLAY_DROPIN_FILE (insufficient privilege?) -- overlay_addr still advertised this cycle"
+systemctl daemon-reload 2>/dev/null || sudo systemctl daemon-reload 2>/dev/null || true
+
 # --- Ops decision 2026-08-26: enable the libp2p relay (ENABLE_P2P) on node2/node3, using the same
 # Cloudflare-Tunnel-fronted pattern seed1 already runs (P2P_PUBLIC_HOSTNAME, never a raw port/IP --
 # see the P2P_PUBLIC_HOSTNAME comment in lib/p2p_relay.js). Reads NODE_ID from this node's own
