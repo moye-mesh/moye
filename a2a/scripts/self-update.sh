@@ -44,6 +44,45 @@ if [ "$updated" -ne 1 ]; then
   exit 1
 fi
 
+# --- Ops decision 2026-08-26: stop Yggdrasil on every node. It peers with the public Yggdrasil
+# network by design (scripts/setup-yggdrasil.sh), and GET /api/network publishes each node's
+# overlay_addr under the moye.ai domain -- combined, anyone who peers with a node can map its
+# published overlay address back to the node's real IP. Applied here (not by hand per box) so it
+# lands uniformly on the same pull cycle as everything else. Idempotent; no-ops where yggdrasil was
+# never installed. See DEPLOY.md 四-D.
+if systemctl list-unit-files yggdrasil.service >/dev/null 2>&1; then
+  if systemctl is-active --quiet yggdrasil 2>/dev/null || systemctl is-enabled --quiet yggdrasil 2>/dev/null; then
+    echo "[self-update] stopping+disabling yggdrasil"
+    systemctl disable --now yggdrasil 2>/dev/null || sudo systemctl disable --now yggdrasil 2>/dev/null || true
+  fi
+fi
+
+# --- Ops decision 2026-08-26: enable the libp2p relay (ENABLE_P2P) on node2/node3, using the same
+# Cloudflare-Tunnel-fronted pattern seed1 already runs (P2P_PUBLIC_HOSTNAME, never a raw port/IP --
+# see the P2P_PUBLIC_HOSTNAME comment in lib/p2p_relay.js). Reads NODE_ID from this node's own
+# moye-a2a.service unit rather than needing a new env var passed into this script. The matching
+# Cloudflare Tunnel Public Hostname (p2p-node2.moye.ai / p2p-node3.moye.ai -> localhost:4100, WS)
+# still has to be added by the domain holder in the Cloudflare dashboard -- same division of labor as
+# every other Tunnel hostname in this project (DEPLOY.md 四-E); this script can't reach that account.
+NODE_ID_ON_DISK="$(grep -oP 'Environment=NODE_ID=\K\S+' /etc/systemd/system/moye-a2a.service 2>/dev/null || true)"
+P2P_HOSTNAME=""
+case "${NODE_ID_ON_DISK:-}" in
+  node2) P2P_HOSTNAME="p2p-node2.moye.ai" ;;
+  node3) P2P_HOSTNAME="p2p-node3.moye.ai" ;;
+esac
+if [ -n "$P2P_HOSTNAME" ]; then
+  DROPIN_DIR=/etc/systemd/system/moye-a2a.service.d
+  DROPIN_FILE="$DROPIN_DIR/10-p2p-relay.conf"
+  DROPIN_CONTENT="$(printf '[Service]\nEnvironment="ENABLE_P2P=1"\nEnvironment="P2P_PUBLIC_HOSTNAME=%s"\n' "$P2P_HOSTNAME")"
+  if mkdir -p "$DROPIN_DIR" 2>/dev/null; then
+    printf '%s' "$DROPIN_CONTENT" > "$DROPIN_FILE"
+  else
+    sudo mkdir -p "$DROPIN_DIR" && printf '%s' "$DROPIN_CONTENT" | sudo tee "$DROPIN_FILE" >/dev/null
+  fi
+  systemctl daemon-reload 2>/dev/null || sudo systemctl daemon-reload 2>/dev/null || true
+  echo "[self-update] node ${NODE_ID_ON_DISK}: applied ENABLE_P2P=1, P2P_PUBLIC_HOSTNAME=${P2P_HOSTNAME}"
+fi
+
 cd a2a
 npm install --omit=dev
 sudo systemctl restart moye-a2a 2>/dev/null || systemctl restart moye-a2a
