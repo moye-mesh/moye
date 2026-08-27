@@ -57,18 +57,22 @@ if systemctl list-unit-files yggdrasil.service >/dev/null 2>&1; then
   fi
 fi
 
-# --- Ops decision 2026-08-26: stop advertising OVERLAY_ADDR now that Yggdrasil is off above --
-# otherwise GET /api/network keeps showing a dead-but-still-moye.ai-linked overlay address
-# indefinitely, which defeats half the point of stopping the daemon. A later-loaded drop-in's
-# `Environment=` overrides a same-named `Environment=` from the main unit file (systemd.exec(5):
-# last assignment for a given variable wins), so this doesn't require touching moye-a2a.service
-# itself -- runs on all three nodes unconditionally, same best-effort/non-aborting write pattern as
-# the p2p drop-in below.
-OVERLAY_DROPIN_DIR=/etc/systemd/system/moye-a2a.service.d
-OVERLAY_DROPIN_FILE="$OVERLAY_DROPIN_DIR/20-clear-overlay-addr.conf"
-( mkdir -p "$OVERLAY_DROPIN_DIR" && printf '[Service]\nEnvironment="OVERLAY_ADDR="\n' > "$OVERLAY_DROPIN_FILE" ) 2>/dev/null \
-  || ( sudo mkdir -p "$OVERLAY_DROPIN_DIR" && printf '[Service]\nEnvironment="OVERLAY_ADDR="\n' | sudo tee "$OVERLAY_DROPIN_FILE" >/dev/null ) 2>/dev/null \
-  || echo "[self-update] WARNING: could not write $OVERLAY_DROPIN_FILE (insufficient privilege?) -- overlay_addr still advertised this cycle"
+# --- Ops decision 2026-08-26 (revised after the drop-in attempt below was observed NOT taking
+# effect across all 3 nodes over multiple pull cycles): stop advertising OVERLAY_ADDR now that
+# Yggdrasil is off above, otherwise GET /api/network keeps showing a dead-but-still-moye.ai-linked
+# overlay address indefinitely. First tried as a later-loaded drop-in (`Environment=OVERLAY_ADDR=`
+# in a .conf under moye-a2a.service.d/), on the theory that a later `Environment=` overrides a
+# same-named one from the main unit (systemd.exec(5)) -- confirmed that mechanism DOES work for
+# adding a brand-new variable (see ENABLE_P2P below), but empirically did NOT override this
+# EXISTING one in practice here, so don't repeat that pattern for an override case. Edits the actual
+# line in moye-a2a.service directly instead: anchored sed match on the exact prefix
+# `Environment=OVERLAY_ADDR=`, no-ops harmlessly (sed exits 0 on zero matches) if the line isn't in
+# that exact form. Also removes the now-dead drop-in file from the earlier attempt.
+rm -f /etc/systemd/system/moye-a2a.service.d/20-clear-overlay-addr.conf 2>/dev/null \
+  || sudo rm -f /etc/systemd/system/moye-a2a.service.d/20-clear-overlay-addr.conf 2>/dev/null || true
+sed -i -E 's/^Environment=OVERLAY_ADDR=.*/Environment=OVERLAY_ADDR=/' /etc/systemd/system/moye-a2a.service 2>/dev/null \
+  || sudo sed -i -E 's/^Environment=OVERLAY_ADDR=.*/Environment=OVERLAY_ADDR=/' /etc/systemd/system/moye-a2a.service 2>/dev/null \
+  || echo "[self-update] WARNING: could not edit moye-a2a.service to clear OVERLAY_ADDR (insufficient privilege?)"
 systemctl daemon-reload 2>/dev/null || sudo systemctl daemon-reload 2>/dev/null || true
 
 # --- Ops decision 2026-08-26: enable the libp2p relay (ENABLE_P2P) on node2/node3, using the same
